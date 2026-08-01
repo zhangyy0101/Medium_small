@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mip-gap", type=float, default=0.01)
     parser.add_argument("--misplaced-bay-exclusion-ratio", type=float, default=DEFAULT_MISPLACED_BAY_EXCLUSION_RATIO)
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--no-scip", action="store_true", help="Use the built-in fallback instead of SCIP.")
+    parser.add_argument("--no-gurobi", action="store_true", help="Use the built-in fallback instead of Gurobi.")
     return parser.parse_args()
 
 
@@ -74,7 +74,7 @@ def main() -> None:
         mip_time_limit=args.mip_time_limit,
         mip_gap=args.mip_gap,
         verbose=not args.quiet,
-        use_scip=not args.no_scip,
+        use_gurobi=not args.no_gurobi,
     )
     result = ColumnGenerationPlanner(inputs.problem, config).solve()
 

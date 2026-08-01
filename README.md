@@ -20,6 +20,8 @@ python -m pip install -r requirements.txt
 python -X utf8 -B run_medium_small.py --run-name example_full
 ```
 
+默认使用 Gurobi，需要可用的 Gurobi 许可证；可用 `--no-gurobi` 运行内置启发式回退流程。
+
 主要输出：
 
 - `export_row_plan.csv`：出口资料箱排级分配结果；

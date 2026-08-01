@@ -21,6 +21,90 @@ SIZE_NO_MIX_ATTRS = frozenset({"IYC_CSZ_CSIZECD", "SIZE", "SIZE_MODE"})
 HEIGHT_NO_MIX_ATTRS = frozenset({"IYC_CHEIGHTCD", "HEIGHT"})
 
 
+class _GurobiModelAdapter:
+    """Small compatibility layer around :class:`gurobipy.Model`.
+
+    Keeping model construction behind this adapter lets the mathematical
+    constraints remain unchanged while the optimization backend is Gurobi.
+    Variables, expressions, constraints, LP duals, and bounds are all native
+    Gurobi objects.
+    """
+
+    def __init__(self, name: str) -> None:
+        import gurobipy as gp
+
+        self._gp = gp
+        self._model = gp.Model(name)
+
+    def addVar(self, **kwargs):
+        return self._model.addVar(**kwargs)
+
+    def addCons(self, expression, name: str | None = None):
+        return self._model.addConstr(expression, name=name or "")
+
+    def getVars(self):
+        return self._model.getVars()
+
+    def setMinimize(self) -> None:
+        self._model.ModelSense = self._gp.GRB.MINIMIZE
+
+    def setParam(self, name: str, value: object) -> None:
+        self._model.setParam(name, value)
+
+    def hideOutput(self) -> None:
+        self._model.Params.OutputFlag = 0
+
+    def optimize(self) -> None:
+        self._model.optimize()
+
+    def getStatus(self) -> str:
+        status_names = {
+            self._gp.GRB.LOADED: "loaded",
+            self._gp.GRB.OPTIMAL: "optimal",
+            self._gp.GRB.INFEASIBLE: "infeasible",
+            self._gp.GRB.INF_OR_UNBD: "inforunbd",
+            self._gp.GRB.UNBOUNDED: "unbounded",
+            self._gp.GRB.CUTOFF: "cutoff",
+            self._gp.GRB.ITERATION_LIMIT: "iterationlimit",
+            self._gp.GRB.NODE_LIMIT: "nodelimit",
+            self._gp.GRB.TIME_LIMIT: "timelimit",
+            self._gp.GRB.SOLUTION_LIMIT: "solutionlimit",
+            self._gp.GRB.INTERRUPTED: "interrupted",
+            self._gp.GRB.NUMERIC: "numeric",
+            self._gp.GRB.SUBOPTIMAL: "suboptimal",
+        }
+        return status_names.get(self._model.Status, str(self._model.Status))
+
+    def getNSols(self) -> int:
+        return int(self._model.SolCount)
+
+    def getBestSol(self):
+        return object() if self._model.SolCount > 0 else None
+
+    def getObjVal(self) -> float:
+        return float(self._model.ObjVal)
+
+    def getGap(self) -> float:
+        return float(self._model.MIPGap) if self._model.IsMIP else 0.0
+
+    def getPrimalbound(self) -> float:
+        return float(self._model.ObjVal)
+
+    def getDualbound(self) -> float:
+        return float(self._model.ObjBound)
+
+    @staticmethod
+    def getVal(var) -> float:
+        return float(var.X)
+
+    @staticmethod
+    def getDualsolLinear(constr) -> float:
+        return float(constr.Pi)
+
+    def freeProb(self) -> None:
+        self._model.dispose()
+
+
 class _ReverseSortKey:
     __slots__ = ("value",)
 
@@ -109,8 +193,7 @@ class ColumnGenerationConfig:
     post_repair_area_relayout_enabled: bool = True
     post_repair_area_relayout_max_patterns: int = 1
     verbose: bool = True
-    use_scip: bool = True
-    scip_disable_symmetry: bool = True
+    use_gurobi: bool = True
     full_column_pool: bool = False
     medium_plan_quota: dict[tuple[str, str, str, str, str], int] | None = None
     medium_plan_bay_quota: dict[tuple[str, str, str, str, str, str], int] | None = None
@@ -777,7 +860,7 @@ class ColumnGenerationPlanner:
             "full_pool_added_columns": full_pool_added_columns,
             **seed_stats,
             "pricing_iterations": [],
-            "scip_available": False,
+            "gurobi_available": False,
             "used_greedy_fallback": False,
             "concentration_penalties": {
                 "operational_group_area": self.config.small_plan_group_area_split_penalty,
@@ -808,13 +891,13 @@ class ColumnGenerationPlanner:
         selected: Counter[int]
         unplaced: Counter[str]
         try:
-            if not self.config.use_scip:
-                raise RuntimeError("SCIP disabled by config")
+            if not self.config.use_gurobi:
+                raise RuntimeError("Gurobi disabled by config")
             selected, unplaced, master_stats = self._solve_by_column_generation()
             diagnostics.update(master_stats)
         except Exception as exc:
             diagnostics["used_greedy_fallback"] = True
-            diagnostics["scip_failure"] = f"{type(exc).__name__}: {exc}"
+            diagnostics["gurobi_failure"] = f"{type(exc).__name__}: {exc}"
             selected, unplaced = self._greedy_fallback()
 
         diagnostics.update(
@@ -1667,7 +1750,9 @@ class ColumnGenerationPlanner:
         }
 
     def _solve_by_column_generation(self) -> tuple[Counter[int], Counter[str], dict]:
-        from pyscipopt import Model, quicksum
+        from gurobipy import quicksum
+
+        Model = _GurobiModelAdapter
 
         solve_start = perf_counter()
         total_time_limit = max(0.0, float(getattr(self.config, "total_time_limit", 0.0) or 0.0))
@@ -1721,7 +1806,7 @@ class ColumnGenerationPlanner:
         no_improve_iterations = 0
 
         stats = {
-            "scip_available": True,
+            "gurobi_available": True,
             "pricing_iterations": [],
             "pricing_stop_reason": "",
             "pricing_iterations_run": 0,
@@ -1785,7 +1870,7 @@ class ColumnGenerationPlanner:
             iteration_start = perf_counter()
             if self.config.verbose:
                 print(
-                    f"[column-generation-scip] building LP iter={iteration} columns={len(self._columns)}",
+                    f"[column-generation-gurobi] building LP iter={iteration} columns={len(self._columns)}",
                     flush=True,
                 )
             lp_model, lp_vars, lp_constraints = self._build_restricted_master(Model, quicksum, relax=True)
@@ -1797,25 +1882,25 @@ class ColumnGenerationPlanner:
                     stats["pricing_stop_reason"] = "total_time_limit"
                     stats["pricing_skipped_lp_iteration"] = iteration
                     stats["pricing_skipped_lp_available_seconds"] = round(max(0.0, available_lp_time), 3)
-                    self._free_scip_model(lp_model)
+                    self._free_gurobi_model(lp_model)
                     break
                 lp_time_limit = min(lp_time_limit, available_lp_time)
-            self._set_scip_param(lp_model, "limits/time", lp_time_limit)
+            self._set_gurobi_param(lp_model, "TimeLimit", lp_time_limit)
             if self.config.verbose:
-                print(f"[column-generation-scip] solving LP iter={iteration} time_limit={lp_time_limit:.1f}s", flush=True)
+                print(f"[column-generation-gurobi] solving LP iter={iteration} time_limit={lp_time_limit:.1f}s", flush=True)
             lp_model.optimize()
-            lp_status = self._scip_status_name(lp_model)
+            lp_status = self._gurobi_status_name(lp_model)
             if lp_status not in {"optimal"}:
                 stats["pricing_stop_reason"] = "lp_" + lp_status.replace(" ", "_")
                 stats["pricing_interrupted_iteration"] = iteration
                 stats["pricing_interrupted_lp_status"] = lp_status
-                self._free_scip_model(lp_model)
+                self._free_gurobi_model(lp_model)
                 break
-            lp_objective = self._scip_objective_value(lp_model)
+            lp_objective = self._gurobi_objective_value(lp_model)
             final_lp_bound = lp_objective
-            lp_unplaced = self._scip_unplaced_values(lp_model, lp_vars)
+            lp_unplaced = self._gurobi_unplaced_values(lp_model, lp_vars)
             last_lp_unplaced = Counter(lp_unplaced)
-            lp_column_values = self._scip_column_values(lp_model, lp_vars)
+            lp_column_values = self._gurobi_column_values(lp_model, lp_vars)
             lp_repair_selected, lp_repair_unplaced = self._repair_from_column_priority(
                 lp_column_values
             )
@@ -1900,11 +1985,11 @@ class ColumnGenerationPlanner:
             )
             if self.config.verbose:
                 print(
-                    f"[column-generation-scip] iter={iteration} lp={lp_objective:.3f} "
+                    f"[column-generation-gurobi] iter={iteration} lp={lp_objective:.3f} "
                     f"columns={len(self._columns)} new={new_count} elapsed={perf_counter() - iteration_start:.1f}s",
                     flush=True,
                 )
-            self._free_scip_model(lp_model)
+            self._free_gurobi_model(lp_model)
             stats["pricing_iterations_run"] = iteration + 1
             if total_time_low(max(5.0, staged_repair_reserve)):
                 stats["pricing_stop_reason"] = "total_time_limit"
@@ -1937,7 +2022,7 @@ class ColumnGenerationPlanner:
                     )
                 if self.config.verbose:
                     print(
-                        "[column-generation-scip] feasibility check "
+                        "[column-generation-gurobi] feasibility check "
                         f"iter={iteration} source_unplaced={sum(qty for qty in early_source_unplaced.values() if qty > 0)} "
                         f"columns={len(self._columns)}",
                         flush=True,
@@ -1968,7 +2053,7 @@ class ColumnGenerationPlanner:
                 )
                 if self.config.verbose:
                     print(
-                        "[column-generation-scip] feasibility check "
+                        "[column-generation-gurobi] feasibility check "
                         f"iter={iteration} unplaced={early_unplaced_boxes} "
                         f"added={early_record['closure_added_columns']} "
                         f"elapsed={early_record['staged_repair_seconds']:.1f}s",
@@ -2023,7 +2108,7 @@ class ColumnGenerationPlanner:
 
         if self.config.verbose:
             print(
-                "[column-generation-scip] final staged repair "
+                "[column-generation-gurobi] final staged repair "
                 f"source={repair_start_source} "
                 f"input_unplaced={sum(repair_start_unplaced.values())} "
                 f"columns={len(self._columns)}",
@@ -2191,7 +2276,7 @@ class ColumnGenerationPlanner:
         )
         if self.config.verbose:
             print(
-                "[column-generation-scip] final staged repair "
+                "[column-generation-gurobi] final staged repair "
                 f"status={final_status} unplaced={final_unplaced_boxes} "
                 f"elapsed={stats['post_pricing_repair_elapsed_seconds']:.1f}s",
                 flush=True,
@@ -2257,72 +2342,49 @@ class ColumnGenerationPlanner:
             values.update(qty for qty in range(15, max_qty + 1, 5))
         return sorted(qty for qty in values if 0 < qty <= max_qty)
 
-    def _scip_unplaced_values(self, model, lp_vars) -> Counter[str]:
+    def _gurobi_unplaced_values(self, model, lp_vars) -> Counter[str]:
         return Counter(
             {
-                group_id: int(round(self._scip_value(model, var)))
+                group_id: int(round(self._gurobi_value(model, var)))
                 for group_id, var in lp_vars["unplaced"].items()
-                if self._scip_value(model, var) > 1e-6
+                if self._gurobi_value(model, var) > 1e-6
             }
         )
 
-    def _scip_column_values(self, model, lp_vars) -> dict[int, float]:
+    def _gurobi_column_values(self, model, lp_vars) -> dict[int, float]:
         return {
-            idx: self._scip_value(model, var)
+            idx: self._gurobi_value(model, var)
             for idx, var in lp_vars["column"].items()
-            if self._scip_value(model, var) > 1e-6
+            if self._gurobi_value(model, var) > 1e-6
         }
 
-    def _configure_scip_output(self, model) -> None:
-        self._configure_scip_stability(model)
+    def _configure_gurobi_output(self, model) -> None:
         if not self.config.verbose:
             try:
                 model.hideOutput()
                 return
             except Exception:
                 pass
-            self._try_set_scip_param(model, "display/verblevel", 0)
-
-    def _configure_scip_stability(self, model) -> None:
-        if not getattr(self.config, "scip_disable_symmetry", True):
-            return
-        for name, value in (
-            ("misc/usesymmetry", 0),
-            ("propagating/symmetry/maxgenerators", 0),
-            ("propagating/symmetry/symtiming", 0),
-            ("propagating/symmetry/ofsymcomptiming", 0),
-        ):
-            self._try_set_scip_param(model, name, value)
+            self._try_set_gurobi_param(model, "OutputFlag", 0)
 
     @staticmethod
-    def _try_set_scip_param(model, name: str, value: object) -> bool:
+    def _try_set_gurobi_param(model, name: str, value: object) -> bool:
         try:
-            ColumnGenerationPlanner._set_scip_param(model, name, value)
+            ColumnGenerationPlanner._set_gurobi_param(model, name, value)
             return True
         except Exception:
             return False
 
     @staticmethod
-    def _set_scip_param(model, name: str, value: object) -> None:
-        setters = (getattr(model, "setParam", None), getattr(model, "setRealParam", None), getattr(model, "setIntParam", None))
-        last_error: Exception | None = None
-        for setter in setters:
-            if setter is None:
-                continue
-            try:
-                setter(name, value)
-                return
-            except Exception as exc:
-                last_error = exc
-        if last_error is not None:
-            raise last_error
+    def _set_gurobi_param(model, name: str, value: object) -> None:
+        model.setParam(name, value)
 
     @staticmethod
-    def _scip_status_name(model) -> str:
+    def _gurobi_status_name(model) -> str:
         return str(model.getStatus()).lower()
 
     @staticmethod
-    def _scip_solution_count(model) -> int:
+    def _gurobi_solution_count(model) -> int:
         try:
             return int(model.getNSols())
         except Exception:
@@ -2332,21 +2394,21 @@ class ColumnGenerationPlanner:
                 return 0
 
     @staticmethod
-    def _scip_objective_value(model) -> float:
+    def _gurobi_objective_value(model) -> float:
         try:
             return float(model.getObjVal())
         except Exception:
             return float("nan")
 
     @staticmethod
-    def _scip_gap(model) -> float:
+    def _gurobi_gap(model) -> float:
         try:
             return float(model.getGap())
         except Exception:
             return 0.0
 
     @staticmethod
-    def _scip_primal_bound(model) -> float:
+    def _gurobi_primal_bound(model) -> float:
         for method_name in ("getPrimalbound", "getPrimalBound"):
             method = getattr(model, method_name, None)
             if method is None:
@@ -2358,7 +2420,7 @@ class ColumnGenerationPlanner:
         return float("nan")
 
     @staticmethod
-    def _scip_dual_bound(model) -> float:
+    def _gurobi_dual_bound(model) -> float:
         for method_name in ("getDualbound", "getDualBound"):
             method = getattr(model, method_name, None)
             if method is None:
@@ -2383,11 +2445,11 @@ class ColumnGenerationPlanner:
         return max(0.0, (primal_value - bound_value) / max(1.0, abs(primal_value)))
 
     @staticmethod
-    def _scip_value(model, var) -> float:
+    def _gurobi_value(model, var) -> float:
         return float(model.getVal(var))
 
     @staticmethod
-    def _scip_dual(model, constr) -> float:
+    def _gurobi_dual(model, constr) -> float:
         for method_name in ("getDualsolLinear", "getDualsol"):
             method = getattr(model, method_name, None)
             if method is None:
@@ -2399,7 +2461,7 @@ class ColumnGenerationPlanner:
         return 0.0
 
     @staticmethod
-    def _free_scip_model(model) -> None:
+    def _free_gurobi_model(model) -> None:
         for method_name in ("freeTransform", "freeProb"):
             method = getattr(model, method_name, None)
             if method is None:
@@ -2445,8 +2507,8 @@ class ColumnGenerationPlanner:
         relax: bool,
         objective_mode: str = "full",
     ):
-        model = Model("yard_small_plan_column_generation_scip")
-        self._configure_scip_output(model)
+        model = Model("yard_export_row_column_generation_gurobi")
+        self._configure_gurobi_output(model)
         try:
             model.setMinimize()
         except Exception:
@@ -3262,33 +3324,33 @@ class ColumnGenerationPlanner:
         lp_unplaced: Counter[str] | None = None,
         lp_column_values: dict[int, float] | None = None,
     ) -> dict:
-        group_dual = {group_id: self._scip_dual(lp_model, constr) for group_id, constr in lp_constraints["group_cover"].items()}
+        group_dual = {group_id: self._gurobi_dual(lp_model, constr) for group_id, constr in lp_constraints["group_cover"].items()}
         group_dual = self._effective_group_duals(group_dual, lp_unplaced or Counter())
-        bay_capacity_dual = {bay_key: self._scip_dual(lp_model, constr) for bay_key, constr in lp_constraints["bay_capacity_limit"].items()}
-        bay_size_dual = {key: self._scip_dual(lp_model, constr) for key, constr in lp_constraints["bay_size_limit"].items()}
+        bay_capacity_dual = {bay_key: self._gurobi_dual(lp_model, constr) for bay_key, constr in lp_constraints["bay_capacity_limit"].items()}
+        bay_size_dual = {key: self._gurobi_dual(lp_model, constr) for key, constr in lp_constraints["bay_size_limit"].items()}
         twenty_run_bay_use_dual = {
-            bay_key: self._scip_dual(lp_model, constr)
+            bay_key: self._gurobi_dual(lp_model, constr)
             for bay_key, constr in lp_constraints.get("twenty_run_bay_use_link", {}).items()
         }
         bay_port_stack_dual = {
-            key: self._scip_dual(lp_model, constr)
+            key: self._gurobi_dual(lp_model, constr)
             for key, constr in lp_constraints.get("bay_port_stack_link", {}).items()
         }
-        group_bay_dual = {key: self._scip_dual(lp_model, constr) for key, constr in lp_constraints["group_bay_limit"].items()}
+        group_bay_dual = {key: self._gurobi_dual(lp_model, constr) for key, constr in lp_constraints["group_bay_limit"].items()}
         quota_dual = {
-            key: self._scip_dual(lp_model, constr)
+            key: self._gurobi_dual(lp_model, constr)
             for key, constr in lp_constraints.get("quota_limit", {}).items()
         }
         medium_plan_quota_dual = {
-            key: self._scip_dual(lp_model, constr)
+            key: self._gurobi_dual(lp_model, constr)
             for key, constr in lp_constraints.get("medium_plan_quota_limit", {}).items()
         }
         area_guidance_dual = {
-            key: self._scip_dual(lp_model, constr)
+            key: self._gurobi_dual(lp_model, constr)
             for key, constr in lp_constraints.get("area_guidance_balance", {}).items()
         }
         fixed_use_dual = {
-            key: self._scip_dual(lp_model, constr)
+            key: self._gurobi_dual(lp_model, constr)
             for key, constr in lp_constraints.get("fixed_use_objective_limit", {}).items()
         }
         lp_column_values = lp_column_values or {}

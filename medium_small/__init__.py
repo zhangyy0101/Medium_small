@@ -1,1 +1,1 @@
-"""SCIP column-generation medium/small planning algorithm."""
+"""Gurobi column-generation export row-allocation algorithm."""
