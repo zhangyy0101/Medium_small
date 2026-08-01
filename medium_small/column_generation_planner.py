@@ -16,8 +16,9 @@ from block_bay_planning.models import EXPORT_VOYAGE_ROW_NO_MIX_ATTR, Bay, Proble
 
 SIZE_ORDER = {"45": 0, "20": 1, "40": 2}
 EXPORT_FLOWS = frozenset({"OF"})
-MANDATORY_BAY_NO_MIX_ATTRS = ("IYC_CSZ_CSIZECD",)
+MANDATORY_BAY_NO_MIX_ATTRS = ("IYC_CSZ_CSIZECD", "IYC_CHEIGHTCD")
 SIZE_NO_MIX_ATTRS = frozenset({"IYC_CSZ_CSIZECD", "SIZE", "SIZE_MODE"})
+HEIGHT_NO_MIX_ATTRS = frozenset({"IYC_CHEIGHTCD", "HEIGHT"})
 
 
 class _ReverseSortKey:
@@ -111,48 +112,48 @@ class ColumnGenerationConfig:
     use_scip: bool = True
     scip_disable_symmetry: bool = True
     full_column_pool: bool = False
-    demand_mode: str = "original"
+    demand_mode: str = "doc-only"
     medium_plan_quota: dict[tuple[str, str, str, str, str], int] | None = None
     medium_plan_bay_quota: dict[tuple[str, str, str, str, str, str], int] | None = None
     repair_can_exceed_medium_plan_quota: bool = False
     unplaced_penalty: float = 100_000.0
     document_unplaced_penalty_multiplier: float = 10.0
     forecast_unplaced_penalty_multiplier: float = 1.0
-    required_area_reward: float = 1_000.0
+    required_area_reward: float = 0.0
     existing_coarse_bay_reward: float = 48.0
     existing_coarse_neighbor_bay_reward: float = 24.0
-    existing_other_coarse_bay_penalty: float = 48.0
-    existing_other_coarse_neighbor_bay_penalty: float = 12.0
+    existing_other_coarse_bay_penalty: float = 0.0
+    existing_other_coarse_neighbor_bay_penalty: float = 0.0
     existing_coarse_neighbor_max_bay_distance: int = 12
     twenty_isolated_bay_reward: float = 80.0
     twenty_large_segment_loss_penalty: float = 220.0
     twenty_large_segment_fresh_loss_penalty: float = 240.0
     twenty_large_segment_used_zero_loss_reward: float = 160.0
-    twenty_max_consecutive_bays: int = 2
-    twenty_consecutive_violation_penalty: float = 50_000.0
-    group_area_balance_penalty: float = 36.0
-    medium_concentrated_group_threshold: int = 26
-    medium_small_group_area_split_penalty: float = 2400.0
-    medium_small_group_fragment_penalty: float = 90.0
-    medium_large_group_min_area_boxes: int = 10
-    medium_large_group_small_area_penalty: float = 900.0
+    twenty_max_consecutive_bays: int = 0
+    twenty_consecutive_violation_penalty: float = 0.0
+    group_area_balance_penalty: float = 0.0
+    medium_concentrated_group_threshold: int = 0
+    medium_small_group_area_split_penalty: float = 0.0
+    medium_small_group_fragment_penalty: float = 0.0
+    medium_large_group_min_area_boxes: int = 0
+    medium_large_group_small_area_penalty: float = 0.0
     medium_large_group_area_open_penalty: float = 0.0
-    medium_large_group_target_area_boxes: int = 60
-    medium_large_group_area_excess_penalty: float = 4.0
+    medium_large_group_target_area_boxes: int = 0
+    medium_large_group_area_excess_penalty: float = 0.0
     big_plan_area_deviation_penalty: float = 3.0
-    big_plan_fallback_tier_penalty: float = 20.0
-    export_e_area_max_bays_per_voyage_area: int = 2
-    export_e_area_non_40_penalty: float = 300.0
+    big_plan_fallback_tier_penalty: float = 0.0
+    export_e_area_max_bays_per_voyage_area: int = -1
+    export_e_area_non_40_penalty: float = 0.0
     small_plan_group_area_split_penalty: float = 80.0
-    small_plan_group_block_split_penalty: float = 35.0
+    small_plan_group_block_split_penalty: float = 0.0
     small_plan_group_bay_split_penalty: float = 8.0
-    small_plan_coarse_area_block_split_penalty: float = 24.0
-    small_plan_coarse_area_bay_split_penalty: float = 2.5
+    small_plan_coarse_area_block_split_penalty: float = 0.0
+    small_plan_coarse_area_bay_split_penalty: float = 0.0
     berth_distance_penalty: float = 0.02
     active_loading_area_penalty: float = 16.0
-    post_window_loading_area_reward: float = 5.0
-    fallback_bay_penalty: float = 4.0
-    non_preferred_block_penalty: float = 6.0
+    post_window_loading_area_reward: float = 0.0
+    fallback_bay_penalty: float = 0.0
+    non_preferred_block_penalty: float = 0.0
 
 
 @dataclass
@@ -199,6 +200,12 @@ class ColumnGenerationPlanner:
         self.area_group_cap: Counter[tuple[str, str]] = Counter()
         self._area_group_cap_computed: set[tuple[str, str]] = set()
         self.quota_by_key: Counter[tuple[str, str, str, str]] = Counter()
+        self.import_area_size_reservation: Counter[tuple[str, str]] = Counter(
+            getattr(problem, "import_area_size_reservation", {}) or {}
+        )
+        self.export_area_size_reservation: Counter[tuple[str, str]] = Counter(
+            getattr(problem, "export_area_size_reservation", {}) or {}
+        )
         self.existing_coarse_area_load: Counter[tuple[str, ...]] = Counter(
             {
                 tuple(key): int(value)
@@ -691,6 +698,8 @@ class ColumnGenerationPlanner:
             full_pool_added_columns = 0
         diagnostics: dict = {
             "algorithm": "small_plan_first_column_generation",
+            "model_scope": "export_declared_containers_row_allocation",
+            "detailed_allocation_direction": "export_only",
             "target_voyages": self.problem.target_voyages,
             "user_area_constraints": getattr(self.problem, "user_area_constraint_summary", {}),
             "attribute_rules": self.attribute_rules.as_dict() if hasattr(self.attribute_rules, "as_dict") else {},
@@ -702,6 +711,19 @@ class ColumnGenerationPlanner:
             "berth_by_voyage": self.problem.berth_by_voyage,
             "demand_mode": self.config.demand_mode,
             "demand_alignment": self.demand_stats,
+            "aggregate_capacity_reservations": {
+                "source_quantity_field": "new_qty",
+                "import_boxes": int(sum(self.import_area_size_reservation.values())),
+                "export_forecast_residual_boxes": int(sum(self.export_area_size_reservation.values())),
+                "import_by_area_size": {
+                    f"{area}|{size}": int(qty)
+                    for (area, size), qty in sorted(self.import_area_size_reservation.items())
+                },
+                "export_forecast_residual_by_area_size": {
+                    f"{area}|{size}": int(qty)
+                    for (area, size), qty in sorted(self.export_area_size_reservation.items())
+                },
+            },
             "medium_doc_floor_added_boxes": getattr(self.problem, "medium_doc_floor_added_boxes", 0),
             "medium_doc_floor_added_groups": getattr(self.problem, "medium_doc_floor_added_groups", 0),
             "medium_doc_floor_shifted_boxes": getattr(self.problem, "medium_doc_floor_shifted_boxes", 0),
@@ -2402,6 +2424,7 @@ class ColumnGenerationPlanner:
 
         group_cols: defaultdict[str, list[tuple[int, PlacementColumn]]] = defaultdict(list)
         bay_capacity_cols: defaultdict[str, list[tuple[int, PlacementColumn]]] = defaultdict(list)
+        area_physical_cols: defaultdict[str, list[tuple[int, PlacementColumn, int]]] = defaultdict(list)
         bay_size_capacity_cols: defaultdict[tuple[str, str], list[tuple[int, PlacementColumn]]] = defaultdict(list)
         bay_port_size_cols: defaultdict[tuple[str, str, str], list[tuple[int, PlacementColumn]]] = defaultdict(list)
         row_capacity_cols: defaultdict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
@@ -2430,6 +2453,8 @@ class ColumnGenerationPlanner:
                 for attr in self._bay_no_mix_attrs_for_column(col):
                     scope = self._attr_voyage_scope(attr, col.voyage_id)
                     bay_attr_choice_cols[(footprint_key, attr, scope, self._column_attr_value(col, attr))].append(idx)
+            footprint_units = len(self._placement_footprint_keys(col.bay_key, col.size))
+            area_physical_cols[col.area_no].append((idx, col, footprint_units))
             for footprint_key, row_no, qty in col.row_allocation:
                 row_capacity_cols[(footprint_key, row_no)].append((idx, int(qty)))
                 row_size_capacity_cols[(footprint_key, row_no, col.size)].append((idx, int(qty)))
@@ -2488,6 +2513,29 @@ class ColumnGenerationPlanner:
             bay_capacity_limit[bay_key] = model.addCons(
                 quicksum(col.quantity * columns[idx] for idx, col in items) <= self.bays[bay_key].physical_capacity,
                 name=f"bay_cap_{bay_key}",
+            )
+        area_reservation_limit = {}
+        reservation_keys = set(self.import_area_size_reservation) | set(self.export_area_size_reservation)
+        for area_no in sorted({area for area, _size in reservation_keys}):
+            physical_capacity = sum(
+                int(bay.physical_capacity)
+                for bay in self.bays.values()
+                if bay.area_no == area_no
+            )
+            reserved_slot_units = 0
+            for (reserved_area, size), qty in self.import_area_size_reservation.items():
+                if reserved_area == area_no:
+                    reserved_slot_units += int(qty) * (2 if size in {"40", "45"} else 1)
+            for (reserved_area, size), qty in self.export_area_size_reservation.items():
+                if reserved_area == area_no:
+                    reserved_slot_units += int(qty) * (2 if size in {"40", "45"} else 1)
+            available_for_detail = max(0, physical_capacity - reserved_slot_units)
+            area_reservation_limit[area_no] = model.addCons(
+                quicksum(
+                    col.quantity * footprint_units * columns[idx]
+                    for idx, col, footprint_units in area_physical_cols.get(area_no, [])
+                ) <= available_for_detail,
+                name=f"area_after_aggregate_reservation_{area_no}",
             )
         bay_size_limit = {}
         for key, items in bay_size_capacity_cols.items():
@@ -2560,16 +2608,11 @@ class ColumnGenerationPlanner:
             relax=relax,
             objective_mode=objective_mode,
         )
+        # Big-plan allocations are soft inheritance targets. Hard upper bounds
+        # are intentionally omitted so detailed declared boxes can recover from
+        # stale or physically incompatible upstream allocations.
         quota_limit = {}
         medium_plan_quota_limit = {}
-        for key, items in area_size_cols.items():
-            cap = int(self.quota_by_key.get(key, 0))
-            if cap <= 0:
-                continue
-            quota_limit[key] = model.addCons(
-                quicksum(col.quantity * columns[idx] for idx, col in items) <= cap,
-                name=f"big_quota_{len(quota_limit)}",
-            )
         if self.config.medium_plan_quota is not None:
             for key, items in medium_coarse_area_cols.items():
                 cap = int(self._medium_plan_quota.get(key, 0))
@@ -2627,6 +2670,7 @@ class ColumnGenerationPlanner:
         return model, {"column": columns, "unplaced": unplaced}, {
             "group_cover": group_cover,
             "bay_capacity_limit": bay_capacity_limit,
+            "area_reservation_limit": area_reservation_limit,
             "bay_size_limit": bay_size_limit,
             "row_capacity_limit": row_capacity_limit,
             "row_size_limit": row_size_limit,
@@ -2777,15 +2821,10 @@ class ColumnGenerationPlanner:
         for key, indices in group_area_cols.items():
             use = model.addVar(lb=0.0, ub=1.0, obj=self.config.small_plan_group_area_split_penalty)
             fixed_use_constraints[("group_area",) + key] = model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
-        for key, indices in group_block_cols.items():
-            use = model.addVar(lb=0.0, ub=1.0, obj=self.config.small_plan_group_block_split_penalty)
-            fixed_use_constraints[("group_block",) + key] = model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
-        for key, indices in coarse_area_block_cols.items():
-            use = model.addVar(lb=0.0, ub=1.0, obj=self.config.small_plan_coarse_area_block_split_penalty)
-            fixed_use_constraints[("coarse_area_block",) + key] = model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
-        for key, indices in coarse_area_bay_cols.items():
-            use = model.addVar(lb=0.0, ub=1.0, obj=self.config.small_plan_coarse_area_bay_split_penalty)
-            fixed_use_constraints[("coarse_area_bay",) + key] = model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
+        if self.config.small_plan_group_block_split_penalty > 0:
+            for key, indices in group_block_cols.items():
+                use = model.addVar(lb=0.0, ub=1.0, obj=self.config.small_plan_group_block_split_penalty)
+                fixed_use_constraints[("group_block",) + key] = model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
         for (voyage_id, area_no), indices in voyage_area_cols.items():
             cost = self._voyage_area_cost(voyage_id, area_no)
             if abs(cost) <= 1e-9:
@@ -2817,8 +2856,19 @@ class ColumnGenerationPlanner:
         bay_attr_choice_cols,
         row_attr_choice_cols,
     ) -> None:
-        coarse_area_keys = set(coarse_area_cols)
-        self._add_coarse_group_area_objectives(quicksum, model, columns, coarse_area_keys, coarse_area_cols)
+        if any(
+            value > 0
+            for value in (
+                self.config.medium_small_group_area_split_penalty,
+                self.config.medium_small_group_fragment_penalty,
+                self.config.medium_large_group_small_area_penalty,
+                self.config.medium_large_group_area_open_penalty,
+                self.config.medium_large_group_area_excess_penalty,
+                self.config.group_area_balance_penalty,
+            )
+        ):
+            coarse_area_keys = set(coarse_area_cols)
+            self._add_coarse_group_area_objectives(quicksum, model, columns, coarse_area_keys, coarse_area_cols)
 
         area_size_keys = set(area_size_cols)
         for key, qty in self.quota_by_key.items():
@@ -2837,29 +2887,10 @@ class ColumnGenerationPlanner:
         for (fine_key, area_no), indices in group_area_cols.items():
             use = model.addVar(vtype="B", obj=self.config.small_plan_group_area_split_penalty, name=f"use_ga_{self._key_name(fine_key)}_{area_no}")
             model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
-        for (fine_key, block_id), indices in group_block_cols.items():
-            use = model.addVar(vtype="B", obj=self.config.small_plan_group_block_split_penalty, name=f"use_gb_{self._key_name(fine_key)}_{block_id}")
-            model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
-        for key, indices in coarse_area_block_cols.items():
-            coarse_key = tuple(key[:-2])
-            area_no, block_id = key[-2], key[-1]
-            name_key = self._key_name(coarse_key)
-            use = model.addVar(
-                vtype="B",
-                obj=self.config.small_plan_coarse_area_block_split_penalty,
-                name=f"use_cab_{name_key}_{area_no}_{block_id}",
-            )
-            model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
-        for key, indices in coarse_area_bay_cols.items():
-            coarse_key = tuple(key[:-2])
-            area_no, bay_key = key[-2], key[-1]
-            name_key = self._key_name(coarse_key)
-            use = model.addVar(
-                vtype="B",
-                obj=self.config.small_plan_coarse_area_bay_split_penalty,
-                name=f"use_cay_{name_key}_{area_no}_{bay_key}",
-            )
-            model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
+        if self.config.small_plan_group_block_split_penalty > 0:
+            for (fine_key, block_id), indices in group_block_cols.items():
+                use = model.addVar(vtype="B", obj=self.config.small_plan_group_block_split_penalty, name=f"use_gb_{self._key_name(fine_key)}_{block_id}")
+                model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
 
         for (voyage_id, area_no), indices in voyage_area_cols.items():
             cost = self._voyage_area_cost(voyage_id, area_no)
@@ -3565,7 +3596,8 @@ class ColumnGenerationPlanner:
         )
 
     def _attr_voyage_scope(self, attr: str, voyage_id: object) -> str:
-        return "" if self._is_global_row_no_mix_attr(attr) else str(voyage_id)
+        is_height = str(attr).strip().upper() in HEIGHT_NO_MIX_ATTRS
+        return "" if self._is_global_row_no_mix_attr(attr) or is_height else str(voyage_id)
 
     def _bay_state_attr_key(self, bay_key: str, attr: str, voyage_id: object) -> tuple[str, str, str]:
         return (bay_key, attr, self._attr_voyage_scope(attr, voyage_id))
@@ -3577,6 +3609,8 @@ class ColumnGenerationPlanner:
         if self._is_size_no_mix_attr(attr):
             values = set(getattr(bay, "existing_attrs", {}).get(attr, set()))
             return values or set(getattr(bay, "existing_size_modes", set()))
+        if str(attr).strip().upper() in HEIGHT_NO_MIX_ATTRS:
+            return set(getattr(bay, "existing_heights", set()))
         by_voyage = getattr(bay, "existing_attrs_by_voyage", {}) or {}
         return set(by_voyage.get(str(voyage_id), {}).get(attr, set()))
 
@@ -4185,6 +4219,7 @@ class ColumnGenerationPlanner:
             "bay_stack_used": Counter(),
             "row_load": Counter(),
             "row_size_load": Counter(),
+            "area_slot_load": Counter(),
             "row_used_attrs": {},
             "bay_used_size": {},
             "bay_used_attrs": {},
@@ -4512,10 +4547,18 @@ class ColumnGenerationPlanner:
             capacity = min(capacity, self.bays[key].physical_capacity - state["bay_load"][key])
         capacity = min(capacity, bay.cap_by_size.get(group.size, 0) - state["bay_size_load"][(bay_key, group.size)])
         capacity = min(capacity, self._row_capacity_for_column(group, bay_key, state=state))
-        quota_key = self._quota_key(group, bay.area_no)
-        quota = self.quota_by_key.get(quota_key, 0)
-        if enforce_quota and quota > 0:
-            capacity = min(capacity, quota - state["big_plan_quota_used"][quota_key])
+        area_physical_capacity = sum(
+            int(item.physical_capacity) for item in self.bays.values() if item.area_no == bay.area_no
+        )
+        reserved_units = sum(
+            int(qty) * (2 if size in {"40", "45"} else 1)
+            for (area_no, size), qty in (
+                self.import_area_size_reservation + self.export_area_size_reservation
+            ).items()
+            if area_no == bay.area_no
+        )
+        area_remaining_units = max(0, area_physical_capacity - reserved_units - state["area_slot_load"][bay.area_no])
+        capacity = min(capacity, area_remaining_units // max(1, len(footprint)))
         if enforce_medium_plan_quota and self.config.medium_plan_quota is not None:
             coarse_area_key = self._coarse_key(group) + (bay.area_no,)
             capacity = min(
@@ -4533,6 +4576,7 @@ class ColumnGenerationPlanner:
 
     def _apply_column_to_state(self, col: PlacementColumn, state: dict) -> None:
         footprint = self._placement_footprint_keys(col.bay_key, col.size)
+        state["area_slot_load"][col.area_no] += col.quantity * len(footprint)
         for key in footprint:
             state["bay_load"][key] += col.quantity
             state["bay_used_size"][key] = col.size
@@ -4948,8 +4992,6 @@ class ColumnGenerationPlanner:
                 other_distance = self._existing_other_coarse_bay_distance(group, bay_key)
                 if other_distance is not None:
                     cost += self._existing_other_neighbor_penalty(other_distance)
-        if group.special_stow or group.pre_stow:
-            cost -= 1.0
         cost += self._twenty_bay_static_cost(group, bay_key)
         return cost
 
@@ -4967,7 +5009,7 @@ class ColumnGenerationPlanner:
         return False
 
     def _is_any_big_plan_area(self, area_no: str) -> bool:
-        return any(row.area_no == area_no and row.planned_boxes > 0 for row in self.problem.big_plan)
+        return any(row.area_no == area_no and row.new_boxes > 0 for row in self.problem.big_plan)
 
     def _area_fallback_tier_for_group(self, group: SmallBoxGroup, area_no: str) -> int:
         return self._area_fallback_tier_for_attrs(
@@ -5349,7 +5391,7 @@ class ColumnGenerationPlanner:
                     and row.flow in compatible
                     and (row_size == big_size or row.size_mode == "ALL")
                 ):
-                    self.quota_by_key[(voyage_id, flow, row.area_no, big_size)] += row.planned_boxes
+                    self.quota_by_key[(voyage_id, flow, row.area_no, big_size)] += row.new_boxes
 
     def _area_weights(self, group: SmallBoxGroup) -> Counter[str]:
         weights: Counter[str] = Counter()

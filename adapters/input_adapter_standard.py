@@ -55,7 +55,7 @@ DEFAULT_TARGET_VOYAGES = ()
 DEFAULT_TARGET_BIG_PLAN_FLOWS = frozenset({"OF", "IF", "IZ", "T", "OZ"})
 KNOWN_EXPORT_SNAPSHOT_FLOWS = {"OF", "OZ", "T"}
 UNKNOWN_EXPORT_SNAPSHOT_FLOW_FALLBACK = "OF"
-DEFAULT_MISPLACED_BAY_EXCLUSION_RATIO = 2.0 / 3.0
+DEFAULT_MISPLACED_BAY_EXCLUSION_RATIO = 0.0
 SIZE_MODES = ("20", "40", "45")
 WEIGHT_ATTRIBUTE_NAMES = {"weight", "weight_class", "IYC_CWEIGHT"}
 
@@ -265,9 +265,14 @@ class BigPlanRow:
     voyage_id: str
     flow: str
     area_no: str
-    planned_boxes: int
+    new_boxes: int
     size_mode: str = "ALL"
     plan_date: str = ""
+
+    @property
+    def planned_boxes(self) -> int:
+        """Backward-compatible alias; this field is populated from new_qty."""
+        return self.new_boxes
 
 
 @dataclass(frozen=True)
@@ -322,6 +327,8 @@ class ProblemData:
     area_operations: dict[str, list[AreaOperation]]
     target_voyages: list[str]
     export_voyages: set[str] | None = None
+    import_area_size_reservation: dict[tuple[str, str], int] = field(default_factory=dict)
+    export_area_size_reservation: dict[tuple[str, str], int] = field(default_factory=dict)
     existing_coarse_area_load: dict[tuple[str, ...], int] = field(default_factory=dict)
     existing_coarse_bay_load: dict[tuple[str, ...], int] = field(default_factory=dict)
     berth_distances: dict[tuple[str, str], float] = field(default_factory=dict)
@@ -843,8 +850,11 @@ def read_attribute_rules(input_guandong: InputAdapterGd, voyages: Sequence[str])
             canonical_attribute_tuple,
             fill_missing=False,
         ),
-        weight_levels_by_voyage=weight_levels_by_voyage,
-        weight_group_voyages=frozenset(weight_levels_by_voyage),
+        # Weight is deliberately excluded from the paper model. The raw value
+        # may remain in input records but never defines a demand group or a
+        # compatibility constraint.
+        weight_levels_by_voyage={},
+        weight_group_voyages=frozenset(),
         import_shared_fine_group_attributes=import_shared_fine_group_attributes,
     )
 
@@ -2874,14 +2884,17 @@ def calculate_medium_demands(
         stage, ratio = planning_stage(receive_start, planning_time, horizon_hours)
         docs = read_doc_by_port_size(input_guandong, voyage_id)
         yard_counts = yard_by_voyage.get(voyage_id, Counter())
-        if voyage_id not in export_voyages:
-            predicted = Counter()
-            ratio_targets = Counter()
-            planned_source = Counter(docs)
-        else:
+        if voyage_id in export_voyages:
             predicted = read_predicted_by_port_size(input_guandong, voyage_id)
             ratio_targets = ratio_targets_by_port(predicted, ratio)
-            planned_source = choose_planned_source(net_prediction_targets(ratio_targets, yard_counts), docs)
+        else:
+            predicted = Counter()
+            ratio_targets = Counter()
+        # The detailed model plans declared, not-yet-arrived containers only.
+        # Forecast demand is already represented by unused new_qty in the
+        # upstream big-plan allocation and must not become synthetic bay-level
+        # container groups here.
+        planned_source = Counter(docs)
         for flow, size_mode, port in sorted(planned_source):
             yard_boxes = yard_counts.get((flow, size_mode, port), 0)
             planned = max(0, planned_source[(flow, size_mode, port)])
@@ -3127,9 +3140,9 @@ def medium_demand_caps_from_big_plan(
         if row.plan_date and row.plan_date != plan_date:
             continue
         if row.size_mode == "ALL":
-            all_size_pool[(row.voyage_id, row_flow)] += row.planned_boxes
+            all_size_pool[(row.voyage_id, row_flow)] += row.new_boxes
         else:
-            size_pool[(row.voyage_id, row_flow, "40" if row.size_mode == "45" else row.size_mode)] += row.planned_boxes
+            size_pool[(row.voyage_id, row_flow, "40" if row.size_mode == "45" else row.size_mode)] += row.new_boxes
 
     caps: dict[tuple[str, str, str], int] = {}
     for (voyage_id, flow, size_mode), qty in size_pool.items():
@@ -3312,10 +3325,11 @@ def read_big_plan(large_plan: pd.DataFrame) -> list[BigPlanRow]:
                 boxes = int(round(float(row.get(field_name, 0) or 0)))
                 if boxes > 0:
                     counter[(voyage_id, flow, area_no, size_mode, plan_date)] += boxes
-    elif {"voy_id", "area_no"}.issubset(fieldnames) and (
-        "new_qty" in fieldnames or "planned_qty" in fieldnames
-    ):
-        qty_field = "new_qty" if "new_qty" in fieldnames else "planned_qty"
+    elif {"voy_id", "area_no", "new_qty"}.issubset(fieldnames):
+        # new_qty is the allocation for containers that have not entered the
+        # yard. planned_qty includes snapshot occupancy and must never be used
+        # as downstream demand or reservation.
+        qty_field = "new_qty"
         date_field = _first_existing(fieldnames, ["plan_date", "date", "work_date", "planning_date", "day"])
         flow_field = _first_existing(fieldnames, ["flow", "cntr_type", "status"])
         for row in reader:
@@ -3331,13 +3345,13 @@ def read_big_plan(large_plan: pd.DataFrame) -> list[BigPlanRow]:
                         date_key(normalize_text(row.get(date_field))) if date_field else "",
                     )
                 ] += boxes
-    elif {"voyage_id", "area_no", "planned_boxes"}.issubset(fieldnames):
+    elif {"voyage_id", "area_no", "new_boxes"}.issubset(fieldnames):
         size_field = "size_mode" if "size_mode" in fieldnames else "size"
         date_field = _first_existing(fieldnames, ["plan_date", "date", "work_date", "planning_date", "day"])
         flow_field = _first_existing(fieldnames, ["flow", "cntr_type", "status"])
         for row in reader:
             flow = normalize_medium_small_flow(row.get(flow_field), default="OF") if flow_field else "OF"
-            boxes = int(round(float(row["planned_boxes"])))
+            boxes = int(round(float(row["new_boxes"])))
             if boxes > 0:
                 counter[
                     (
@@ -3572,7 +3586,7 @@ def load_small_doc_groups(
                 port_label,
                 normalize_text(row.get("IYC_CHEIGHTCD"), "UNK"),
                 row_weight_class,
-                explicit_special_stow_code(row),
+                "",
                 "0",
             )
             values = dynamic_attributes_from_row(normalized_record, group_columns, levels=levels)
@@ -4249,9 +4263,8 @@ def existing_bay_attributes(
                 attrs["ports"].add(port)
             row_no = normalize_row(row.get("YST_ROWNO"))
             row_attrs = attrs["attributes_by_row"].setdefault(row_no, {}) if row_no else {}
-            export_voyage = normalize_voyage(row.get("IYC_EVOY_ID"))
-            if export_voyage and row_no:
-                row_attrs.setdefault(EXPORT_VOYAGE_ROW_NO_MIX_ATTR, set()).add(export_voyage)
+            if row_no and row_voyages:
+                row_attrs.setdefault(EXPORT_VOYAGE_ROW_NO_MIX_ATTR, set()).update(row_voyages)
             for attr in dynamic_attrs:
                 value = dynamic_attribute_value(row, attr)
                 if value:
@@ -4334,38 +4347,25 @@ def build_problem(
     assigned_areas: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
     cleaned_plan: list[BigPlanRow] = []
     target_voyages = [normalize_voyage(v) for v in target_voyages]
-    attribute_rules = read_attribute_rules(input_guandong, target_voyages)
-    (
-        large_allowed_areas_by_voyage,
-        _required_areas_by_voyage,
-        _priority_areas_by_voyage,
-        _area_control_diagnostics,
-    ) = build_large_area_controls(
-        vessels=target_voyages,
-        areas=sorted(function_areas),
-        user_design=getattr(input_guandong, "user_design", False),
-        user_design_large_plan_area=getattr(input_guandong, "user_design_large_plan_area", []),
-        voyage_limit_areas=getattr(input_guandong, "voyage_limit_areas", {}),
-        voyage_priority_areas=getattr(input_guandong, "voyage_priority_areas", {}),
-        adjust_plan_info=getattr(input_guandong, "adjust_plan_info", {}),
+    # Fixed, publication-oriented grouping and compatibility rules. Terminal
+    # configuration cannot silently reintroduce weight or special-container
+    # dimensions into the mathematical model.
+    attribute_rules = AttributeRules(
+        coarse_group_attributes=("IYC_CSZ_CSIZECD", "IYC_POT_UNLDPORT"),
+        fine_group_attributes=("IYC_CSZ_CSIZECD", "IYC_POT_UNLDPORT", "IYC_CHEIGHTCD"),
+        bay_no_mix_attributes=("IYC_CHEIGHTCD",),
+        row_no_mix_attributes=("IYC_POT_UNLDPORT",),
+        weight_levels=(),
+        weight_group_voyages=frozenset(),
     )
-    strict_allowed_areas_by_voyage, priority_areas_by_voyage, user_area_constraint_summary = build_medium_small_area_controls(
-        vessels=target_voyages,
-        areas=sorted(function_areas),
-        user_design_large_plan_area=getattr(input_guandong, "user_design_large_plan_area", {}),
-        voyage_limit_areas=getattr(input_guandong, "voyage_limit_areas", {}),
-        voyage_priority_areas=getattr(input_guandong, "voyage_priority_areas", {}),
-    )
-    user_area_constraint_summary["large_area_controls"] = _area_control_diagnostics
-    allowed_areas_by_voyage: dict[str, set[str]] = {}
-    for voyage_id in target_voyages:
-        strict_entry = user_area_constraint_summary["area_controls_by_voyage"].get(voyage_id, {})
-        if strict_entry.get("strict_boundary"):
-            allowed_areas_by_voyage[voyage_id] = set(strict_allowed_areas_by_voyage.get(voyage_id, set()))
-        else:
-            allowed_areas_by_voyage[voyage_id] = set(
-                large_allowed_areas_by_voyage.get(voyage_id, sorted(function_areas))
-            )
+    # Paper model: remove terminal-specific manual allow/block/required-area
+    # controls. Feasibility is defined by yard functions and the upstream big
+    # plan; operator overrides remain outside the mathematical model.
+    allowed_areas_by_voyage = {voyage_id: set(function_areas) for voyage_id in target_voyages}
+    priority_areas_by_voyage: dict[str, set[str]] = {}
+    user_area_constraint_summary: dict[str, Any] = {
+        "mode": "paper_model_no_manual_area_overrides",
+    }
     vessel_schedules = read_target_vessel_schedules(input_guandong, target_voyages, planning_time, horizon_hours)
     plan_date = planning_time.date().isoformat()
     target_big_plan_flows = {medium_small_area_flow(flow) for flow in DEFAULT_TARGET_BIG_PLAN_FLOWS}
@@ -4378,20 +4378,22 @@ def build_problem(
     skipped_flow_function: Counter[tuple[str, str]] = Counter()
     for row in input_plan:
         if row.area_no not in allowed_areas_by_voyage.get(row.voyage_id, set(function_areas)):
-            skipped_outside_user_scope[(row.voyage_id, row.area_no)] += row.planned_boxes
+            skipped_outside_user_scope[(row.voyage_id, row.area_no)] += row.new_boxes
             continue
         if row.area_no in closed:
-            skipped_closed_area[(row.voyage_id, row.area_no)] += row.planned_boxes
+            skipped_closed_area[(row.voyage_id, row.area_no)] += row.new_boxes
             continue
         plan_flow = medium_small_area_flow(row.flow)
         if plan_flow not in target_big_plan_flows:
             continue
         if not area_allows_flow(row.area_no, plan_flow, area_functions):
-            skipped_flow_function[(row.voyage_id, row.area_no)] += row.planned_boxes
+            skipped_flow_function[(row.voyage_id, row.area_no)] += row.new_boxes
             continue
         cleaned_plan.append(row)
         assigned_areas[(row.voyage_id, plan_flow)].add(row.area_no)
     # Medium/small demand uses actual demand; big-plan rows below remain area inheritance targets.
+    target_voyage_set = set(target_voyages)
+    export_voyages = classified_export_voyages(input_guandong) & target_voyage_set
     groups, _demand_rows = load_port_demand_groups(
         input_guandong,
         target_voyages,
@@ -4408,6 +4410,10 @@ def build_problem(
         planning_time,
         big_plan_caps=None,
     )
+    # Only declared export containers receive detailed row-level decisions.
+    groups = [group for group in groups if group.voyage_id in export_voyages]
+    small_groups = [group for group in small_groups if group.voyage_id in export_voyages]
+
     demand_by_voyage_size: Counter[tuple[str, str, str]] = Counter()
     for group in groups:
         demand_by_voyage_size[(group.voyage_id, group.status, group.big_plan_size_mode)] += group.demand
@@ -4417,11 +4423,35 @@ def build_problem(
     missing_big_plan_area_pattern: Counter[tuple[str, str, str]] = Counter()
     for row in cleaned_plan:
         plan_flow = medium_small_area_flow(row.flow)
-        raw_area_quota[(row.voyage_id, plan_flow, row.area_no)] += row.planned_boxes
+        raw_area_quota[(row.voyage_id, plan_flow, row.area_no)] += row.new_boxes
         if row.size_mode == "ALL":
-            raw_all_size_area_quota[(row.voyage_id, plan_flow, row.area_no)] += row.planned_boxes
+            raw_all_size_area_quota[(row.voyage_id, plan_flow, row.area_no)] += row.new_boxes
         else:
-            raw_area_size_quota[(row.voyage_id, plan_flow, row.area_no, row.size_mode)] += row.planned_boxes
+            raw_area_size_quota[(row.voyage_id, plan_flow, row.area_no, row.size_mode)] += row.new_boxes
+
+    # Big-plan new_qty is an upstream allocation for not-yet-arrived boxes.
+    # Import new_qty is reserved in aggregate. For exports, only the excess of
+    # big-plan new_qty over declared detailed demand is reserved; the declared
+    # portion is assigned to rows by this model.
+    import_area_size_reservation: Counter[tuple[str, str]] = Counter()
+    export_area_size_reservation: Counter[tuple[str, str]] = Counter()
+    for row in cleaned_plan:
+        if row.voyage_id not in export_voyages:
+            import_area_size_reservation[(row.area_no, row.size_mode)] += row.new_boxes
+
+    export_plan_by_bucket: defaultdict[tuple[str, str, str], Counter[str]] = defaultdict(Counter)
+    for row in cleaned_plan:
+        if row.voyage_id in export_voyages:
+            export_plan_by_bucket[(row.voyage_id, medium_small_area_flow(row.flow), row.size_mode)][row.area_no] += row.new_boxes
+    for bucket, area_weights in export_plan_by_bucket.items():
+        voyage_id, flow, size_mode = bucket
+        planned_total = sum(area_weights.values())
+        declared_total = demand_by_voyage_size.get((voyage_id, flow, size_mode), 0)
+        reserve_total = max(0, planned_total - declared_total)
+        if reserve_total <= 0:
+            continue
+        for area_no, qty in allocate_by_weights(dict(area_weights), reserve_total).items():
+            export_area_size_reservation[(area_no, size_mode)] += qty
     for voyage_id in target_voyages:
         flows = sorted({flow for (v, flow, _size), qty in demand_by_voyage_size.items() if v == voyage_id and qty > 0})
         for flow in flows:
@@ -4494,14 +4524,11 @@ def build_problem(
         set(bays),
         attribute_rules,
     )
-    bay_requirements, bay_blocklist, bay_adjust_rules, bay_constraint_summary = build_medium_small_bay_controls(
-        input_guandong,
-        groups,
-        small_groups,
-        bays,
-    )
-    voyage_bay_allowlist, voyage_bay_summary = build_user_design_area_bay_allowlist(input_guandong, bays)
-    bay_constraint_summary["user_design_area_bay"] = voyage_bay_summary
+    bay_requirements: dict[str, set[str]] = {}
+    bay_blocklist: dict[str, set[str]] = {}
+    bay_adjust_rules: list[dict[str, object]] = []
+    bay_constraint_summary: dict[str, Any] = {"mode": "paper_model_no_manual_bay_overrides"}
+    voyage_bay_allowlist: dict[str, set[str]] = {}
     user_area_constraint_summary.update(
         {
             "allowed_areas_by_voyage": {
@@ -4540,8 +4567,6 @@ def build_problem(
         for voyage_id in target_voyages
         if voyage_id in vessel_schedules and vessel_schedules[voyage_id].berth_no
     }
-    target_voyage_set = set(target_voyages)
-    export_voyages = classified_export_voyages(input_guandong) & target_voyage_set
     return ProblemData(
         groups=groups,
         small_groups=small_groups,
@@ -4558,6 +4583,8 @@ def build_problem(
         area_operations=area_operations,
         target_voyages=target_voyages,
         export_voyages=export_voyages,
+        import_area_size_reservation=dict(import_area_size_reservation),
+        export_area_size_reservation=dict(export_area_size_reservation),
         existing_coarse_area_load=dict(existing_coarse_area_load),
         existing_coarse_bay_load=dict(existing_coarse_bay_load),
         berth_distances=berth_distances,
@@ -4578,10 +4605,7 @@ def build_problem(
             voyage_id: set(priority_areas_by_voyage.get(voyage_id, set()))
             for voyage_id in target_voyages
         },
-        user_voyage_area_requirements={
-            voyage_id: set(_required_areas_by_voyage.get(voyage_id, []))
-            for voyage_id in target_voyages
-        },
+        user_voyage_area_requirements={},
         user_voyage_bay_allowlist=voyage_bay_allowlist,
         user_group_bay_requirements=bay_requirements,
         user_group_bay_blocklist=bay_blocklist,

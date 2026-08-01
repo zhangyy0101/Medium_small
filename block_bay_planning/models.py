@@ -185,9 +185,14 @@ class BigPlanRow:
     voyage_id: str
     flow: str
     area_no: str
-    planned_boxes: int
+    new_boxes: int
     size_mode: str = "ALL"
     plan_date: str = ""
+
+    @property
+    def planned_boxes(self) -> int:
+        """Backward-compatible alias; the value is always the big plan's new_qty."""
+        return self.new_boxes
 
 
 @dataclass(frozen=True)
@@ -248,6 +253,8 @@ class ProblemData:
     area_operations: dict[str, list[AreaOperation]]
     target_voyages: list[str]
     export_voyages: set[str] | None = None
+    import_area_size_reservation: dict[tuple[str, str], int] = field(default_factory=dict)
+    export_area_size_reservation: dict[tuple[str, str], int] = field(default_factory=dict)
     existing_coarse_area_load: dict[tuple[str, ...], int] = field(default_factory=dict)
     existing_coarse_bay_load: dict[tuple[str, ...], int] = field(default_factory=dict)
     berth_distances: dict[tuple[str, str], float] = field(default_factory=dict)
