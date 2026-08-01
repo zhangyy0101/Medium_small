@@ -33,6 +33,14 @@ Every placement column contains a row allocation. The mathematical decisions
 therefore remain row-level even though medium output can also be aggregated for
 reporting.
 
+There is one operational group definition throughout the model:
+
+`(voyage, flow, destination port, size, height)`.
+
+The former coarse/fine grouping distinction has no mathematical effect in this
+branch. Legacy internal field names are retained only to avoid coupling model
+changes to the column-generation implementation.
+
 ## Core hard constraints
 
 - declared export demand balance, with penalized unplaced quantity;
@@ -51,8 +59,9 @@ reporting.
 - unplaced declared containers;
 - deviation from the upstream big-plan area-size pattern;
 - berth-to-yard distance and concurrent-operation conflict;
-- fine-group area and bay dispersion;
-- proximity to incumbent containers of the same coarse group;
+- operational-group area dispersion;
+- operational-group row dispersion;
+- proximity to incumbent containers of the exact same operational group;
 - opportunity loss caused by assigning 20 ft containers to space that can
   support future 40/45 ft placements.
 
@@ -65,9 +74,10 @@ reporting.
 - manual required/allowed/blocked area or bay overrides;
 - E-area naming rules;
 - six-bay-block objective terms;
+- coarse/fine group-specific dispersion and balancing terms;
+- bay-count dispersion (replaced by row-count dispersion);
 - fixed maximum run length for consecutive 20 ft bays;
 - tiered fallback-area penalties;
 - misplaced-bay exclusion ratio;
 - post-window loading rewards;
 - document-floor and forecast-fallback demand construction.
-

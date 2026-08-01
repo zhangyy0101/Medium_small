@@ -146,7 +146,7 @@ class ColumnGenerationConfig:
     export_e_area_non_40_penalty: float = 0.0
     small_plan_group_area_split_penalty: float = 80.0
     small_plan_group_block_split_penalty: float = 0.0
-    small_plan_group_bay_split_penalty: float = 8.0
+    small_plan_group_row_split_penalty: float = 8.0
     small_plan_coarse_area_block_split_penalty: float = 0.0
     small_plan_coarse_area_bay_split_penalty: float = 0.0
     berth_distance_penalty: float = 0.02
@@ -748,29 +748,15 @@ class ColumnGenerationPlanner:
             "scip_available": False,
             "used_greedy_fallback": False,
             "concentration_penalties": {
-                "fine_group_area": self.config.small_plan_group_area_split_penalty,
-                "fine_group_block": self.config.small_plan_group_block_split_penalty,
-                "fine_group_bay": self.config.small_plan_group_bay_split_penalty,
-                "coarse_area_block": self.config.small_plan_coarse_area_block_split_penalty,
-                "coarse_area_bay": self.config.small_plan_coarse_area_bay_split_penalty,
-                "medium_concentrated_group_threshold": self.config.medium_concentrated_group_threshold,
-                "medium_small_group_area_split": self.config.medium_small_group_area_split_penalty,
-                "medium_small_group_fragment": self.config.medium_small_group_fragment_penalty,
-                "medium_large_group_min_area_boxes": self.config.medium_large_group_min_area_boxes,
-                "medium_large_group_small_area": self.config.medium_large_group_small_area_penalty,
-                "medium_large_group_area_open": self.config.medium_large_group_area_open_penalty,
-                "medium_large_group_target_area_boxes": self.config.medium_large_group_target_area_boxes,
-                "medium_large_group_area_excess": self.config.medium_large_group_area_excess_penalty,
-                "existing_same_coarse_bay_reward": self.config.existing_coarse_bay_reward,
-                "existing_same_coarse_neighbor_bay_reward": self.config.existing_coarse_neighbor_bay_reward,
-                "existing_other_coarse_bay_penalty": self.config.existing_other_coarse_bay_penalty,
-                "existing_other_coarse_neighbor_bay_penalty": self.config.existing_other_coarse_neighbor_bay_penalty,
-                "existing_coarse_neighbor_max_bay_distance": self.config.existing_coarse_neighbor_max_bay_distance,
-                "twenty_max_consecutive_bays": self.config.twenty_max_consecutive_bays,
-                "twenty_consecutive_violation_penalty": self.config.twenty_consecutive_violation_penalty,
+                "operational_group_area": self.config.small_plan_group_area_split_penalty,
+                "operational_group_row": self.config.small_plan_group_row_split_penalty,
+                "existing_exact_group_bay_reward": self.config.existing_coarse_bay_reward,
+                "existing_exact_group_neighbor_reward": self.config.existing_coarse_neighbor_bay_reward,
+                "existing_exact_group_neighbor_max_bay_distance": self.config.existing_coarse_neighbor_max_bay_distance,
+                "twenty_large_segment_loss_penalty": self.config.twenty_large_segment_loss_penalty,
             },
-            "existing_coarse_anchors": {
-                "mode": "stage_scope_bay_proximity",
+            "existing_operational_group_anchors": {
+                "mode": "exact_group_bay_proximity",
                 "area_key_count": len(self.existing_coarse_area_load),
                 "bay_key_count": len(self.existing_coarse_bay_load),
                 "box_count": int(sum(self.existing_coarse_bay_load.values())),
@@ -822,6 +808,7 @@ class ColumnGenerationPlanner:
         consistency_stats = self._small_medium_consistency_stats(small_rows, medium_rows)
         bay_consistency_stats = self._small_medium_bay_consistency_stats(small_rows, medium_rows)
         medium_fragmentation = self._medium_fragmentation_stats(medium_rows)
+        operational_group_dispersion = self._operational_group_dispersion_stats(small_rows)
         diagnostics.update(
             {
                 "final_column_count": len(self._columns),
@@ -835,6 +822,7 @@ class ColumnGenerationPlanner:
                 "planned_medium_by_source": self._planned_medium_by_source(medium_rows),
                 "medium_area_rows_below_min_boxes": self._count_medium_area_rows_below_min(medium_rows),
                 "medium_fragmentation": medium_fragmentation,
+                "operational_group_dispersion": operational_group_dispersion,
                 "medium_big_plan_inheritance": self._medium_big_plan_inheritance_stats(medium_rows),
                 "final_medium_inheritance_energy_components": self._medium_inheritance_energy_components(medium_rows),
                 "export_e_area_usage": self._export_e_area_usage(selected),
@@ -856,6 +844,39 @@ class ColumnGenerationPlanner:
             unplaced_rows=unplaced_rows,
             columns=self._columns,
         )
+
+    @staticmethod
+    def _operational_group_dispersion_stats(rows: list[dict]) -> dict[str, int | float | str]:
+        areas_by_group: defaultdict[tuple[str, ...], set[str]] = defaultdict(set)
+        rows_by_group: defaultdict[tuple[str, ...], set[tuple[str, str, str]]] = defaultdict(set)
+        for row in rows:
+            group_key = (
+                str(row.get("voyage_id", "")),
+                str(row.get("flow", "")),
+                str(row.get("port", "")),
+                str(row.get("size", "")),
+                str(row.get("height", "")),
+            )
+            area_no = str(row.get("area_no", ""))
+            bay_no = str(row.get("bay_no", ""))
+            row_no = str(row.get("row_no", ""))
+            if area_no:
+                areas_by_group[group_key].add(area_no)
+            if area_no and bay_no and row_no:
+                rows_by_group[group_key].add((area_no, bay_no, row_no))
+        group_count = len(set(areas_by_group) | set(rows_by_group))
+        area_counts = [len(areas_by_group[key]) for key in set(areas_by_group) | set(rows_by_group)]
+        row_counts = [len(rows_by_group[key]) for key in set(areas_by_group) | set(rows_by_group)]
+        return {
+            "group_definition": "voyage|flow|destination_port|size|height",
+            "group_count": group_count,
+            "total_used_areas": sum(area_counts),
+            "total_used_rows": sum(row_counts),
+            "max_areas_per_group": max(area_counts, default=0),
+            "max_rows_per_group": max(row_counts, default=0),
+            "average_areas_per_group": round(sum(area_counts) / group_count, 3) if group_count else 0.0,
+            "average_rows_per_group": round(sum(row_counts) / group_count, 3) if group_count else 0.0,
+        }
 
     def _repair_or_replace_unplaced_solution(
         self,
@@ -1316,7 +1337,7 @@ class ColumnGenerationPlanner:
                 continue
             col = self._columns[idx]
             multiplier = int(chosen)
-            energy += (col.intrinsic_cost + self.config.small_plan_group_bay_split_penalty) * multiplier
+            energy += col.intrinsic_cost * multiplier
             qty = col.quantity * multiplier
             actual_quota[col.quota_key] += qty
             actual_coarse_area[col.coarse_cluster_key + (col.area_no,)] += qty
@@ -2406,7 +2427,7 @@ class ColumnGenerationPlanner:
                 lb=0.0,
                 ub=1.0,
                 vtype=column_vtype,
-                obj=0.0 if objective_mode == "min_unplaced" else col.intrinsic_cost + self.config.small_plan_group_bay_split_penalty,
+                obj=0.0 if objective_mode == "min_unplaced" else col.intrinsic_cost,
                 name=f"col_{idx}",
             )
             for idx, col in enumerate(self._columns)
@@ -3240,7 +3261,7 @@ class ColumnGenerationPlanner:
                     voyage_area_key = ("voyage_area", group.voyage_id, area_no)
                     reduced = (
                         base_cost
-                        + self.config.small_plan_group_bay_split_penalty
+                        + self.config.small_plan_group_row_split_penalty
                         - group_dual.get(group.group_id, 0.0) * qty
                         - bay_capacity_dual.get(bay_key, 0.0) * qty
                         - bay_size_dual.get((bay_key, group.size), 0.0) * qty
@@ -3897,6 +3918,14 @@ class ColumnGenerationPlanner:
             if key in self._column_keys:
                 continue
             column_id = f"C{len(self._columns) + 1:07d}"
+            used_rows = {
+                str(row_no)
+                for footprint_key, row_no, qty in allocation
+                if footprint_key == bay_key and int(qty) > 0
+            }
+            if not used_rows:
+                used_rows = {str(row_no) for _footprint_key, row_no, qty in allocation if int(qty) > 0}
+            row_dispersion_cost = self.config.small_plan_group_row_split_penalty * len(used_rows)
             col = PlacementColumn(
                 column_id=column_id,
                 group_id=group.group_id,
@@ -3923,7 +3952,7 @@ class ColumnGenerationPlanner:
                 fine_key=self._fine_key(group),
                 coarse_cluster_key=self._coarse_cluster_key(group),
                 fine_cluster_key=self._fine_cluster_key(group),
-                intrinsic_cost=base_cost,
+                intrinsic_cost=base_cost + row_dispersion_cost,
             )
             idx = len(self._columns)
             self._columns.append(col)
@@ -4367,7 +4396,7 @@ class ColumnGenerationPlanner:
 
         score = (
             base_cost
-            + self.config.small_plan_group_bay_split_penalty
+            + self.config.small_plan_group_row_split_penalty
         )
 
         if (fine_key, area_no) not in state["used_group_area"]:
@@ -5451,11 +5480,19 @@ class ColumnGenerationPlanner:
         return tuple(attrs)
 
     def _attribute_group_key(self, group: SmallBoxGroup, attrs: tuple[str, ...]) -> tuple[str, ...]:
-        return (str(group.voyage_id), *(f"{attr}={self._group_attr_value(group, attr)}" for attr in attrs))
+        return (
+            str(group.voyage_id),
+            f"flow={group.status}",
+            *(f"{attr}={self._group_attr_value(group, attr)}" for attr in attrs),
+        )
 
     def _attribute_cluster_key(self, group: SmallBoxGroup, attrs: tuple[str, ...]) -> tuple[str, ...]:
         scope = str(group.voyage_id) if self._is_export_voyage(group.voyage_id) else "IMPORT"
-        return (scope, *(f"{attr}={self._group_attr_value(group, attr)}" for attr in attrs))
+        return (
+            scope,
+            f"flow={group.status}",
+            *(f"{attr}={self._group_attr_value(group, attr)}" for attr in attrs),
+        )
 
     def _coarse_key(self, group: SmallBoxGroup) -> tuple[str, ...]:
         return self._attribute_group_key(group, self._configured_coarse_attrs_for_group(group))

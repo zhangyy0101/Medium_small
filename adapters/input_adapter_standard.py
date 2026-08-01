@@ -3107,7 +3107,7 @@ def configured_coarse_anchor_key(
         levels=attribute_rules.weight_levels_for(voyage_id),
     )
     scope = str(voyage_id) if voyage_id in export_voyages else "IMPORT"
-    return (scope, *(f"{attr}={values.get(attr, 'MIXED')}" for attr in attrs))
+    return (scope, f"flow={flow}", *(f"{attr}={values.get(attr, 'MIXED')}" for attr in attrs))
 
 
 def container_identity(row: pd.Series, index: object) -> str:
@@ -4351,7 +4351,7 @@ def build_problem(
     # configuration cannot silently reintroduce weight or special-container
     # dimensions into the mathematical model.
     attribute_rules = AttributeRules(
-        coarse_group_attributes=("IYC_CSZ_CSIZECD", "IYC_POT_UNLDPORT"),
+        coarse_group_attributes=("IYC_CSZ_CSIZECD", "IYC_POT_UNLDPORT", "IYC_CHEIGHTCD"),
         fine_group_attributes=("IYC_CSZ_CSIZECD", "IYC_POT_UNLDPORT", "IYC_CHEIGHTCD"),
         bay_no_mix_attributes=("IYC_CHEIGHTCD",),
         row_no_mix_attributes=("IYC_POT_UNLDPORT",),
