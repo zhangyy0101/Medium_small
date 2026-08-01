@@ -202,18 +202,17 @@ class SmallBoxGroup:
 
 @dataclass
 class ProblemData:
-    """中计划和小计划共用的求解输入。
+    """Export row-allocation model input.
 
-    `area_quota` and `area_size_quota` keep the big-plan area pattern used as
-    medium-plan soft targets. Hard feasibility is checked against yard capacity.
+    `area_guidance_target` is the normalized upstream area pattern for the
+    declared export demand. It is a soft target, never a demand or reservation.
     """
 
     small_groups: list[SmallBoxGroup]
     bays: dict[str, Bay]
     big_plan: list[BigPlanRow]
     assigned_areas: dict[tuple[str, str], set[str]]
-    area_quota: dict[tuple[str, str, str], int]
-    area_size_quota: dict[tuple[str, str, str, str], int]
+    area_guidance_target: dict[tuple[str, str, str, str], int]
     area_functions: dict[str, set[str]]
     planning_time: datetime
     horizon_hours: float
@@ -222,7 +221,6 @@ class ProblemData:
     target_voyages: list[str]
     export_voyages: set[str] | None = None
     import_area_size_reservation: dict[tuple[str, str], int] = field(default_factory=dict)
-    export_area_size_reservation: dict[tuple[str, str], int] = field(default_factory=dict)
     existing_coarse_area_load: dict[tuple[str, ...], int] = field(default_factory=dict)
     existing_coarse_bay_load: dict[tuple[str, ...], int] = field(default_factory=dict)
     berth_distances: dict[tuple[str, str], float] = field(default_factory=dict)

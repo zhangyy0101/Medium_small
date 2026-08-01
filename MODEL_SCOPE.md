@@ -15,17 +15,19 @@ yard rows. Import containers do not receive bay or row decisions.
 ## Demand and reservations
 
 - Export detailed demand: declared containers (`doc_cntrs`) only.
-- Export aggregate reservation: the positive residual between export big-plan
-  `new_qty` and declared export demand, distributed according to the big-plan
-  area-size pattern.
+- Export big-plan guidance: export `new_qty` is normalized by voyage and size
+  and rescaled to the declared export demand. It supplies a soft area target
+  only; forecast-only export quantity is neither allocated nor reserved.
 - Import aggregate reservation: import big-plan `new_qty`, by area and size.
 - Incumbent import and export containers: already reflected in available bay
   and row capacity derived from the yard snapshot.
 - Incumbent import containers are conservatively assumed not to leave during
   the planning horizon because release-time data are unavailable.
 
-Aggregate reservations consume area capacity but are not assigned to a
-specific bay or row.
+Import reservations consume aggregate area capacity but are not assigned to a
+specific bay or row. Known 40/45-ft import quantities additionally require
+sufficient usable large-container pair capacity. `ALL` quantities remain
+slot-equivalent reservations because their size composition is unavailable.
 
 ## Detailed decision level
 
@@ -50,22 +52,26 @@ All active grouping rules resolve to the single operational group above.
 - different voyages cannot share a row, including conflicts with incumbent
   containers;
 - destination-port row compatibility;
-- aggregate import and export-residual capacity reservations.
+- aggregate import capacity reservation and large-pair preservation.
 
 ## Retained objectives
 
-- unplaced declared containers;
-- deviation from the upstream big-plan area-size pattern;
+Solutions are compared lexicographically: the number of unplaced declared
+containers is minimized first. The following operational criteria are then
+evaluated for solutions with the same unplaced quantity:
+
+- deviation from the normalized upstream area-size guidance target;
 - berth-to-yard distance and concurrent-operation conflict;
 - operational-group area dispersion;
 - operational-group row dispersion;
 - proximity to incumbent containers of the exact same operational group;
-- opportunity loss caused by assigning 20 ft containers to space that can
-  support future 40/45 ft placements.
+- exact loss of usable 40/45-ft pair capacity caused by assigning 20-ft
+  containers to a pair member.
 
 ## Removed from the paper model
 
 - detailed placement of forecast export containers;
+- aggregate reservation of forecast-only export containers;
 - detailed placement of import containers;
 - weight classes;
 - reefer, dangerous, over-limit, and other special-container rules;

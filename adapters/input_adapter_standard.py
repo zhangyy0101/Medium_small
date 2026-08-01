@@ -316,8 +316,7 @@ class ProblemData:
     bays: dict[str, Bay]
     big_plan: list[BigPlanRow]
     assigned_areas: dict[tuple[str, str], set[str]]
-    area_quota: dict[tuple[str, str, str], int]
-    area_size_quota: dict[tuple[str, str, str, str], int]
+    area_guidance_target: dict[tuple[str, str, str, str], int]
     area_functions: dict[str, set[str]]
     planning_time: datetime
     horizon_hours: float
@@ -326,7 +325,6 @@ class ProblemData:
     target_voyages: list[str]
     export_voyages: set[str] | None = None
     import_area_size_reservation: dict[tuple[str, str], int] = field(default_factory=dict)
-    export_area_size_reservation: dict[tuple[str, str], int] = field(default_factory=dict)
     existing_coarse_area_load: dict[tuple[str, ...], int] = field(default_factory=dict)
     existing_coarse_bay_load: dict[tuple[str, ...], int] = field(default_factory=dict)
     berth_distances: dict[tuple[str, str], float] = field(default_factory=dict)
@@ -4250,8 +4248,7 @@ def build_problem(
     closed = read_closed_areas(input_guandong)
     area_functions = read_area_functions(input_guandong)
     function_areas = set(area_functions)
-    area_quota: dict[tuple[str, str, str], int] = {}
-    area_size_quota: dict[tuple[str, str, str, str], int] = {}
+    area_guidance_target: dict[tuple[str, str, str, str], int] = {}
     assigned_areas: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
     cleaned_plan: list[BigPlanRow] = []
     target_voyages = [normalize_voyage(v) for v in target_voyages]
@@ -4307,41 +4304,22 @@ def build_problem(
     for group in small_groups:
         big_size = "40" if group.size == "45" else group.size
         demand_by_voyage_size[(group.voyage_id, group.status, big_size)] += group.demand
-    raw_area_quota: Counter[tuple[str, str, str]] = Counter()
-    raw_area_size_quota: Counter[tuple[str, str, str, str]] = Counter()
-    raw_all_size_area_quota: Counter[tuple[str, str, str]] = Counter()
-    missing_big_plan_area_pattern: Counter[tuple[str, str, str]] = Counter()
+    upstream_area_size_weights: Counter[tuple[str, str, str, str]] = Counter()
+    upstream_all_size_area_weights: Counter[tuple[str, str, str]] = Counter()
     for row in cleaned_plan:
         plan_flow = medium_small_area_flow(row.flow)
-        raw_area_quota[(row.voyage_id, plan_flow, row.area_no)] += row.new_boxes
         if row.size_mode == "ALL":
-            raw_all_size_area_quota[(row.voyage_id, plan_flow, row.area_no)] += row.new_boxes
+            upstream_all_size_area_weights[(row.voyage_id, plan_flow, row.area_no)] += row.new_boxes
         else:
-            raw_area_size_quota[(row.voyage_id, plan_flow, row.area_no, row.size_mode)] += row.new_boxes
+            upstream_area_size_weights[(row.voyage_id, plan_flow, row.area_no, row.size_mode)] += row.new_boxes
 
-    # Big-plan new_qty is an upstream allocation for not-yet-arrived boxes.
-    # Import new_qty is reserved in aggregate. For exports, only the excess of
-    # big-plan new_qty over declared detailed demand is reserved; the declared
-    # portion is assigned to rows by this model.
+    # Import new_qty is reserved in aggregate. Export new_qty is not a demand
+    # or reservation in this model; it supplies only an area-distribution
+    # pattern for the declared export containers.
     import_area_size_reservation: Counter[tuple[str, str]] = Counter()
-    export_area_size_reservation: Counter[tuple[str, str]] = Counter()
     for row in cleaned_plan:
         if row.voyage_id not in export_voyages:
             import_area_size_reservation[(row.area_no, row.size_mode)] += row.new_boxes
-
-    export_plan_by_bucket: defaultdict[tuple[str, str, str], Counter[str]] = defaultdict(Counter)
-    for row in cleaned_plan:
-        if row.voyage_id in export_voyages:
-            export_plan_by_bucket[(row.voyage_id, medium_small_area_flow(row.flow), row.size_mode)][row.area_no] += row.new_boxes
-    for bucket, area_weights in export_plan_by_bucket.items():
-        voyage_id, flow, size_mode = bucket
-        planned_total = sum(area_weights.values())
-        declared_total = demand_by_voyage_size.get((voyage_id, flow, size_mode), 0)
-        reserve_total = max(0, planned_total - declared_total)
-        if reserve_total <= 0:
-            continue
-        for area_no, qty in allocate_by_weights(dict(area_weights), reserve_total).items():
-            export_area_size_reservation[(area_no, size_mode)] += qty
     for voyage_id in target_voyages:
         flows = sorted({flow for (v, flow, _size), qty in demand_by_voyage_size.items() if v == voyage_id and qty > 0})
         for flow in flows:
@@ -4354,39 +4332,33 @@ def build_problem(
                 exact_upper = Counter(
                     {
                         area_no: qty
-                        for (v, f, area_no, size), qty in raw_area_size_quota.items()
+                        for (v, f, area_no, size), qty in upstream_area_size_weights.items()
                         if v == voyage_id and f in compatible_plan_flows and size == size_mode and qty > 0
                     }
                 )
                 if exact_upper:
-                    # if sum(exact_upper.values()) < target_qty:
-                    #     raise ValueError(
-                    #         f"medium demand exceeds big-plan strict upper bound for "
-                    #         f"voyage={voyage_id}, flow={flow}, size={size_mode}: "
-                    #         f"demand={target_qty}, big_plan_upper={sum(exact_upper.values())}"
-                    #     )
-                    for area_no, qty in exact_upper.items():
-                        area_quota[(voyage_id, flow, area_no)] = raw_area_quota[(voyage_id, source_flow, area_no)]
-                        area_size_quota[(voyage_id, flow, area_no, size_mode)] = qty
+                    # Normalize the upstream distribution to the declared
+                    # export demand. No forecast-only quantity survives as a
+                    # downstream target or capacity reservation.
+                    allocations = allocate_by_weights(dict(exact_upper), target_qty)
+                    for area_no, qty in allocations.items():
+                        area_guidance_target[(voyage_id, flow, area_no, size_mode)] = qty
                         assigned_areas[(voyage_id, flow)].add(area_no)
                     continue
                 all_size_weights = Counter(
                     {
                         area_no: qty
-                        for (v, f, area_no), qty in raw_all_size_area_quota.items()
+                        for (v, f, area_no), qty in upstream_all_size_area_weights.items()
                         if v == voyage_id and f in compatible_plan_flows and qty > 0
                     }
                 )
                 if not all_size_weights:
-                    missing_big_plan_area_pattern[(voyage_id, flow, size_mode)] += target_qty
                     continue
-                big_plan_total = sum(all_size_weights.values())
-                allocations = Counter(all_size_weights) if big_plan_total <= target_qty else allocate_by_weights(dict(all_size_weights), target_qty)
+                allocations = allocate_by_weights(dict(all_size_weights), target_qty)
                 for area_no, qty in allocations.items():
                     if qty <= 0:
                         continue
-                    area_quota[(voyage_id, flow, area_no)] = raw_area_quota[(voyage_id, source_flow, area_no)]
-                    area_size_quota[(voyage_id, flow, area_no, size_mode)] = qty
+                    area_guidance_target[(voyage_id, flow, area_no, size_mode)] = qty
                     assigned_areas[(voyage_id, flow)].add(area_no)
     voyage_windows = {
         voyage_id: (
@@ -4426,8 +4398,7 @@ def build_problem(
         bays=bays,
         big_plan=cleaned_plan,
         assigned_areas=dict(assigned_areas),
-        area_quota=area_quota,
-        area_size_quota=area_size_quota,
+        area_guidance_target=area_guidance_target,
         area_functions=area_functions,
         planning_time=planning_time,
         horizon_hours=horizon_hours,
@@ -4436,7 +4407,6 @@ def build_problem(
         target_voyages=target_voyages,
         export_voyages=export_voyages,
         import_area_size_reservation=dict(import_area_size_reservation),
-        export_area_size_reservation=dict(export_area_size_reservation),
         existing_coarse_area_load=dict(existing_coarse_area_load),
         existing_coarse_bay_load=dict(existing_coarse_bay_load),
         berth_distances=berth_distances,
