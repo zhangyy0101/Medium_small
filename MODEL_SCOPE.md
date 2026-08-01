@@ -30,16 +30,14 @@ specific bay or row.
 ## Detailed decision level
 
 Every placement column contains a row allocation. The mathematical decisions
-therefore remain row-level even though medium output can also be aggregated for
-reporting.
+therefore remain row-level; an area-bay summary is derived only for reporting.
 
 There is one operational group definition throughout the model:
 
 `(voyage, flow, destination port, size, height)`.
 
-The former coarse/fine grouping distinction has no mathematical effect in this
-branch. Legacy internal field names are retained only to avoid coupling model
-changes to the column-generation implementation.
+The former coarse/fine grouping distinction is removed from the model input.
+All active grouping rules resolve to the single operational group above.
 
 ## Core hard constraints
 

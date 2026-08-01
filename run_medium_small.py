@@ -26,7 +26,7 @@ DEFAULT_LARGE_PLAN = ROOT / "example" / "large_plan.csv"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the standalone 1.5 medium/small yard planner.")
+    parser = argparse.ArgumentParser(description="Run the export container row-allocation model.")
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT, help="Full InputAdapterGd JSON input.")
     parser.add_argument("--large-plan", type=Path, default=DEFAULT_LARGE_PLAN, help="Large-plan allocation CSV.")
     parser.add_argument("--output-root", type=Path, default=ROOT / "outputs")
@@ -78,11 +78,11 @@ def main() -> None:
     )
     result = ColumnGenerationPlanner(inputs.problem, config).solve()
 
-    write_rows(output_dir / "medium_plan.csv", result.medium_rows)
-    write_rows(output_dir / "small_plan.csv", result.small_rows)
+    write_rows(output_dir / "area_bay_summary.csv", result.medium_rows)
+    write_rows(output_dir / "export_row_plan.csv", result.small_rows)
     write_rows(output_dir / "unplaced_boxes.csv", result.unplaced_rows)
     write_columns(output_dir / "generated_columns.csv", result.columns)
-    write_rows(output_dir / "medium_demand_by_port.csv", [asdict(row) for row in inputs.demand_rows])
+    write_rows(output_dir / "declared_export_demand.csv", [asdict(row) for row in inputs.demand_rows])
     large_plan.to_csv(output_dir / "large_plan_used.csv", index=False, encoding="utf-8-sig")
     write_json(output_dir / "diagnostics.json", result.diagnostics)
     write_json(
@@ -92,16 +92,16 @@ def main() -> None:
             "large_plan": str(large_plan_path),
             "planning_time": planning_time.isoformat(),
             "voyages": voyages,
-            "medium_row_count": len(result.medium_rows),
-            "small_row_count": len(result.small_rows),
+            "area_bay_summary_row_count": len(result.medium_rows),
+            "export_row_plan_row_count": len(result.small_rows),
             "unplaced_row_count": len(result.unplaced_rows),
             "unplaced_boxes": result.diagnostics.get("unplaced_boxes"),
             "algorithm": result.diagnostics.get("algorithm"),
             "master_status": result.diagnostics.get("master_status"),
         },
     )
-    print(f"medium_plan: {output_dir / 'medium_plan.csv'}")
-    print(f"small_plan: {output_dir / 'small_plan.csv'}")
+    print(f"area_bay_summary: {output_dir / 'area_bay_summary.csv'}")
+    print(f"export_row_plan: {output_dir / 'export_row_plan.csv'}")
     print(f"unplaced_boxes: {output_dir / 'unplaced_boxes.csv'}")
     print(f"diagnostics: {output_dir / 'diagnostics.json'}")
 

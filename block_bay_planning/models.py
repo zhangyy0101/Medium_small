@@ -4,72 +4,42 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 
-DEFAULT_COARSE_GROUP_ATTRIBUTES = ("IYC_CSZ_CSIZECD", "IYC_POT_UNLDPORT")
-DEFAULT_FINE_GROUP_ATTRIBUTES = ("IYC_CSZ_CSIZECD", "IYC_POT_UNLDPORT", "IYC_CHEIGHTCD")
+DEFAULT_GROUP_ATTRIBUTES = ("IYC_CSZ_CSIZECD", "IYC_POT_UNLDPORT", "IYC_CHEIGHTCD")
 DEFAULT_BAY_NO_MIX_ATTRIBUTES = ("IYC_CHEIGHTCD",)
 DEFAULT_ROW_NO_MIX_ATTRIBUTES = ("IYC_POT_UNLDPORT",)
 EXPORT_VOYAGE_ROW_NO_MIX_ATTR = "__EXPORT_VOYAGE_ID"
-DEFAULT_WEIGHT_LEVELS = (0, 10, 15, 20, 25, 30)
 
 
 @dataclass(frozen=True)
 class AttributeRules:
-    coarse_group_attributes: tuple[str, ...] = DEFAULT_COARSE_GROUP_ATTRIBUTES
-    fine_group_attributes: tuple[str, ...] = DEFAULT_FINE_GROUP_ATTRIBUTES
+    group_attributes: tuple[str, ...] = DEFAULT_GROUP_ATTRIBUTES
     bay_no_mix_attributes: tuple[str, ...] = DEFAULT_BAY_NO_MIX_ATTRIBUTES
     row_no_mix_attributes: tuple[str, ...] = DEFAULT_ROW_NO_MIX_ATTRIBUTES
-    weight_levels: tuple[int, ...] = DEFAULT_WEIGHT_LEVELS
-    coarse_group_attributes_by_voyage: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    fine_group_attributes_by_voyage: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    bay_no_mix_attributes_by_voyage: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    row_no_mix_attributes_by_voyage: dict[str, tuple[str, ...]] = field(default_factory=dict)
-    weight_levels_by_voyage: dict[str, tuple[int, ...]] = field(default_factory=dict)
-    weight_group_voyages: frozenset[str] = frozenset()
-    import_shared_fine_group_attributes: tuple[str, ...] = ()
 
     def as_dict(self) -> dict[str, list[str]]:
         return {
-            "coarse_group_attributes": list(self.coarse_group_attributes),
-            "fine_group_attributes": list(self.fine_group_attributes),
+            "group_attributes": list(self.group_attributes),
             "bay_no_mix_attributes": list(self.bay_no_mix_attributes),
             "row_no_mix_attributes": list(self.row_no_mix_attributes),
-            "weight_levels": list(self.weight_levels),
-            "coarse_group_attributes_by_voyage": {
-                voyage: list(values) for voyage, values in sorted(self.coarse_group_attributes_by_voyage.items())
-            },
-            "fine_group_attributes_by_voyage": {
-                voyage: list(values) for voyage, values in sorted(self.fine_group_attributes_by_voyage.items())
-            },
-            "bay_no_mix_attributes_by_voyage": {
-                voyage: list(values) for voyage, values in sorted(self.bay_no_mix_attributes_by_voyage.items())
-            },
-            "row_no_mix_attributes_by_voyage": {
-                voyage: list(values) for voyage, values in sorted(self.row_no_mix_attributes_by_voyage.items())
-            },
-            "weight_levels_by_voyage": {
-                voyage: list(values) for voyage, values in sorted(self.weight_levels_by_voyage.items())
-            },
-            "weight_group_voyages": sorted(self.weight_group_voyages),
-            "import_shared_fine_group_attributes": list(self.import_shared_fine_group_attributes),
         }
 
     def coarse_for(self, voyage_id: object) -> tuple[str, ...]:
-        return self.coarse_group_attributes_by_voyage.get(_voyage_key(voyage_id), self.coarse_group_attributes)
+        return self.group_attributes
 
     def fine_for(self, voyage_id: object) -> tuple[str, ...]:
-        return self.fine_group_attributes_by_voyage.get(_voyage_key(voyage_id), self.fine_group_attributes)
+        return self.group_attributes
 
     def bay_no_mix_for(self, voyage_id: object) -> tuple[str, ...]:
-        return self.bay_no_mix_attributes_by_voyage.get(_voyage_key(voyage_id), self.bay_no_mix_attributes)
+        return self.bay_no_mix_attributes
 
     def row_no_mix_for(self, voyage_id: object) -> tuple[str, ...]:
-        return self.row_no_mix_attributes_by_voyage.get(_voyage_key(voyage_id), self.row_no_mix_attributes)
+        return self.row_no_mix_attributes
 
     def weight_levels_for(self, voyage_id: object) -> tuple[int, ...]:
-        return self.weight_levels_by_voyage.get(_voyage_key(voyage_id), self.weight_levels)
+        return ()
 
     def weight_group_enabled_for(self, voyage_id: object) -> bool:
-        return _voyage_key(voyage_id) in self.weight_group_voyages
+        return False
 
 
 def _voyage_key(value: object) -> str:
@@ -238,7 +208,6 @@ class ProblemData:
     medium-plan soft targets. Hard feasibility is checked against yard capacity.
     """
 
-    groups: list[BoxGroup]
     small_groups: list[SmallBoxGroup]
     bays: dict[str, Bay]
     big_plan: list[BigPlanRow]
@@ -246,7 +215,6 @@ class ProblemData:
     area_quota: dict[tuple[str, str, str], int]
     area_size_quota: dict[tuple[str, str, str, str], int]
     area_functions: dict[str, set[str]]
-    business_special_codes: set[str]
     planning_time: datetime
     horizon_hours: float
     voyage_windows: dict[str, tuple[datetime, datetime]]
@@ -263,22 +231,6 @@ class ProblemData:
     tops_closed_bay_count: int = 0
     misplaced_bay_exclusion_ratio: float = 0.0
     misplaced_excluded_bay_count: int = 0
-    medium_doc_floor_added_boxes: int = 0
-    medium_doc_floor_added_groups: int = 0
-    medium_doc_floor_shifted_boxes: int = 0
-    medium_doc_floor_shifted_groups: int = 0
-    medium_doc_floor_by_coarse_group: dict[str, int] = field(default_factory=dict)
-    medium_doc_floor_added_by_coarse_group: dict[str, int] = field(default_factory=dict)
-    medium_doc_floor_shifted_by_coarse_group: dict[str, int] = field(default_factory=dict)
-    user_voyage_area_allowlist: dict[str, set[str]] = field(default_factory=dict)
-    user_voyage_area_blocklist: dict[str, set[str]] = field(default_factory=dict)
-    user_voyage_area_requirements: dict[str, set[str]] = field(default_factory=dict)
-    user_area_constraint_summary: dict[str, dict[str, list[str]]] = field(default_factory=dict)
-    user_voyage_bay_allowlist: dict[str, set[str]] = field(default_factory=dict)
-    user_group_bay_requirements: dict[str, set[str]] = field(default_factory=dict)
-    user_group_bay_blocklist: dict[str, set[str]] = field(default_factory=dict)
-    user_bay_adjust_rules: list[dict[str, object]] = field(default_factory=list)
-    user_bay_constraint_summary: dict[str, object] = field(default_factory=dict)
     attribute_rules: AttributeRules = field(default_factory=AttributeRules)
 
 

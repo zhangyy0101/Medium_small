@@ -312,7 +312,6 @@ class SmallBoxGroup:
 
 @dataclass
 class ProblemData:
-    groups: list[BoxGroup]
     small_groups: list[SmallBoxGroup]
     bays: dict[str, Bay]
     big_plan: list[BigPlanRow]
@@ -320,7 +319,6 @@ class ProblemData:
     area_quota: dict[tuple[str, str, str], int]
     area_size_quota: dict[tuple[str, str, str, str], int]
     area_functions: dict[str, set[str]]
-    business_special_codes: set[str]
     planning_time: datetime
     horizon_hours: float
     voyage_windows: dict[str, tuple[datetime, datetime]]
@@ -334,16 +332,6 @@ class ProblemData:
     berth_distances: dict[tuple[str, str], float] = field(default_factory=dict)
     berth_by_voyage: dict[str, str] = field(default_factory=dict)
     allowed_areas_by_voyage: dict[str, set[str]] = field(default_factory=dict)
-    user_voyage_area_allowlist: dict[str, set[str]] = field(default_factory=dict)
-    user_voyage_area_blocklist: dict[str, set[str]] = field(default_factory=dict)
-    user_voyage_area_priority: dict[str, set[str]] = field(default_factory=dict)
-    user_voyage_area_requirements: dict[str, set[str]] = field(default_factory=dict)
-    user_voyage_bay_allowlist: dict[str, set[str]] = field(default_factory=dict)
-    user_group_bay_requirements: dict[str, set[str]] = field(default_factory=dict)
-    user_group_bay_blocklist: dict[str, set[str]] = field(default_factory=dict)
-    user_bay_adjust_rules: list[dict[str, Any]] = field(default_factory=list)
-    user_area_constraint_summary: dict[str, Any] = field(default_factory=dict)
-    user_bay_constraint_summary: dict[str, Any] = field(default_factory=dict)
     tops_reserved_slot_count: int = 0
     tops_closed_bay_count: int = 0
     misplaced_bay_exclusion_ratio: float = 0.0
@@ -798,64 +786,10 @@ def voyage_rule_map(
 
 
 def read_attribute_rules(input_guandong: InputAdapterGd, voyages: Sequence[str]) -> AttributeRules:
-    raw_weight_level = getattr(input_guandong, "weight_level", None)
-    weight_levels_by_voyage = voyage_rule_map(
-        raw_weight_level,
-        voyages,
-        DEFAULT_WEIGHT_LEVEL,
-        canonical_weight_levels,
-        fill_missing=False,
-    )
-    coarse_group_attributes_by_voyage = voyage_rule_map(
-        getattr(input_guandong, "rough_attr", None),
-        voyages,
-        DEFAULT_ROUGH_ATTR,
-        canonical_attribute_tuple,
-    )
-    fine_group_attributes_by_voyage = voyage_rule_map(
-        getattr(input_guandong, "detail_attr", None),
-        voyages,
-        DEFAULT_DETAIL_ATTR,
-        canonical_attribute_tuple,
-    )
-    export_voyages = classified_export_voyages(input_guandong)
-    import_voyages = [
-        normalize_voyage(voyage)
-        for voyage in voyages
-        if normalize_voyage(voyage) and normalize_voyage(voyage) not in export_voyages
-    ]
-    import_shared_fine_group_attributes = common_attribute_intersection(
-        fine_group_attributes_by_voyage.get(voyage, canonical_attribute_tuple(DEFAULT_DETAIL_ATTR, AttributeRules().fine_group_attributes))
-        for voyage in import_voyages
-    )
     return AttributeRules(
-        coarse_group_attributes=canonical_attribute_tuple(DEFAULT_ROUGH_ATTR, AttributeRules().coarse_group_attributes),
-        fine_group_attributes=canonical_attribute_tuple(DEFAULT_DETAIL_ATTR, AttributeRules().fine_group_attributes),
-        bay_no_mix_attributes=(),
-        row_no_mix_attributes=(),
-        weight_levels=canonical_weight_levels(DEFAULT_WEIGHT_LEVEL),
-        coarse_group_attributes_by_voyage=coarse_group_attributes_by_voyage,
-        fine_group_attributes_by_voyage=fine_group_attributes_by_voyage,
-        bay_no_mix_attributes_by_voyage=voyage_rule_map(
-            getattr(input_guandong, "bay_rules", None),
-            voyages,
-            (),
-            canonical_attribute_tuple,
-            fill_missing=False,
-        ),
-        row_no_mix_attributes_by_voyage=voyage_rule_map(
-            getattr(input_guandong, "row_rules", None),
-            voyages,
-            (),
-            canonical_attribute_tuple,
-            fill_missing=False,
-        ),
-        # Weight is deliberately excluded from the paper model. The raw value
-        # may remain in input records but never defines a demand group or a
-        # compatibility constraint.
-        weight_levels_by_voyage={},
-        weight_group_voyages=frozenset(),
-        import_shared_fine_group_attributes=import_shared_fine_group_attributes,
+        group_attributes=("IYC_CSZ_CSIZECD", "IYC_POT_UNLDPORT", "IYC_CHEIGHTCD"),
+        bay_no_mix_attributes=("IYC_CHEIGHTCD",),
+        row_no_mix_attributes=("IYC_POT_UNLDPORT",),
     )
 
 
@@ -3400,6 +3334,8 @@ def load_port_demand_groups(
     doc_frames: dict[str, pd.DataFrame] = {}
     export_voyages = classified_export_voyages(input_guandong)
     for voyage_id in voyage_ids:
+        if voyage_id not in export_voyages:
+            continue
         frame = input_guandong.vessel_containers.get(voyage_id, {}).get("doc_cntrs", None)
         if not isinstance(frame, pd.DataFrame) or frame.empty:
             continue
@@ -3558,13 +3494,13 @@ def load_small_doc_groups(
 ) -> list[SmallBoxGroup]:
     planning_time = planning_time or parse_datetime(DEFAULT_PLANNING_TIME) or datetime(2026, 5, 19, 9, 30)
     groups: list[SmallBoxGroup] = []
-    port_sail_area = read_port_sail_area(input_guandong)
     export_voyages = classified_export_voyages(input_guandong)
     for voyage_id in voyage_ids:
+        if voyage_id not in export_voyages:
+            continue
         frame = input_guandong.vessel_containers.get(voyage_id, {}).get("doc_cntrs", None)
         if not isinstance(frame, pd.DataFrame) or frame.empty:
             continue
-        export_voyage = voyage_id in export_voyages
         levels = attribute_rules.weight_levels_for(voyage_id)
         group_by_weight = getattr(attribute_rules, "weight_group_enabled_for", lambda _voyage_id: False)(voyage_id)
         counter: Counter[tuple] = Counter()
@@ -3573,12 +3509,8 @@ def load_small_doc_groups(
             size = normalize_size_small(row.get("IYC_CSZ_CSIZECD"))
             port = normalize_text(row.get("IYC_POT_UNLDPORT"), "UNK")
             normalized_record = normalized_doc_record(row, flow, size, port)
-            if export_voyage:
-                group_columns = small_groupby_columns(attribute_rules, voyage_id)
-                port_label = port
-            else:
-                group_columns = import_small_groupby_columns(attribute_rules, voyage_id, normalized_record, size, port)
-                _base_attrs, _base_values, port_label = import_base_group_attributes(normalized_record, size, port)
+            group_columns = small_groupby_columns(attribute_rules, voyage_id)
+            port_label = port
             row_weight_class = weight_class(row.get("IYC_CWEIGHT"), levels) if group_by_weight else "MIXED"
             core = (
                 flow,
@@ -3590,33 +3522,11 @@ def load_small_doc_groups(
                 "0",
             )
             values = dynamic_attributes_from_row(normalized_record, group_columns, levels=levels)
-            constraint_port = port if not export_voyage and port in port_sail_area else ""
+            constraint_port = ""
             counter[(core, group_columns, tuple(values.get(column, "") for column in group_columns), constraint_port)] += 1
         planned_counter: Counter[tuple] = Counter()
-        import_by_cap_key: defaultdict[tuple[str, str, str], list[tuple[tuple, int]]] = defaultdict(list)
         for key, qty in counter.items():
-            core, _group_columns, _dynamic_key, _constraint_port = key
-            flow, size, _port, _height, _weight, _special_code, _pre_stow_value = core
-            if export_voyage:
-                planned_counter[key] += int(qty)
-                continue
-            import_by_cap_key[(voyage_id, medium_small_area_flow(flow), "40" if size == "45" else size)].append((key, int(qty)))
-        for cap_key, items in import_by_cap_key.items():
-            total = sum(qty for _key, qty in items)
-            cap = None
-            if big_plan_caps:
-                cap = big_plan_caps.get(cap_key)
-                if cap is None:
-                    cap = big_plan_caps.get((cap_key[0], cap_key[1], "ALL"))
-                if cap is None:
-                    continue
-            target_total = min(total, int(cap)) if cap is not None else total
-            if target_total <= 0:
-                continue
-            scaled = largest_remainder_scale([qty for _key, qty in items], total, target_total)
-            for (key, _qty), planned_qty in zip(items, scaled):
-                if planned_qty > 0:
-                    planned_counter[key] += int(planned_qty)
+            planned_counter[key] += int(qty)
 
         for index, (key, demand) in enumerate(sorted(planned_counter.items()), start=1):
             core, group_columns, dynamic_key, constraint_port = key
@@ -4207,8 +4117,6 @@ def existing_bay_attributes(
         for attrs in (
             attribute_rules.bay_no_mix_attributes,
             attribute_rules.row_no_mix_attributes,
-            *(attribute_rules.bay_no_mix_attributes_by_voyage.values()),
-            *(attribute_rules.row_no_mix_attributes_by_voyage.values()),
         ):
             for attr in attrs:
                 name = attribute_output_name(attr)
@@ -4351,21 +4259,14 @@ def build_problem(
     # configuration cannot silently reintroduce weight or special-container
     # dimensions into the mathematical model.
     attribute_rules = AttributeRules(
-        coarse_group_attributes=("IYC_CSZ_CSIZECD", "IYC_POT_UNLDPORT", "IYC_CHEIGHTCD"),
-        fine_group_attributes=("IYC_CSZ_CSIZECD", "IYC_POT_UNLDPORT", "IYC_CHEIGHTCD"),
+        group_attributes=("IYC_CSZ_CSIZECD", "IYC_POT_UNLDPORT", "IYC_CHEIGHTCD"),
         bay_no_mix_attributes=("IYC_CHEIGHTCD",),
         row_no_mix_attributes=("IYC_POT_UNLDPORT",),
-        weight_levels=(),
-        weight_group_voyages=frozenset(),
     )
     # Paper model: remove terminal-specific manual allow/block/required-area
     # controls. Feasibility is defined by yard functions and the upstream big
     # plan; operator overrides remain outside the mathematical model.
     allowed_areas_by_voyage = {voyage_id: set(function_areas) for voyage_id in target_voyages}
-    priority_areas_by_voyage: dict[str, set[str]] = {}
-    user_area_constraint_summary: dict[str, Any] = {
-        "mode": "paper_model_no_manual_area_overrides",
-    }
     vessel_schedules = read_target_vessel_schedules(input_guandong, target_voyages, planning_time, horizon_hours)
     plan_date = planning_time.date().isoformat()
     target_big_plan_flows = {medium_small_area_flow(flow) for flow in DEFAULT_TARGET_BIG_PLAN_FLOWS}
@@ -4373,12 +4274,10 @@ def build_problem(
         row for row in big_plan if row.voyage_id in target_voyages and (not row.plan_date or row.plan_date == plan_date)
     ]
     allowed_areas = set().union(*(set(areas) for areas in allowed_areas_by_voyage.values())) if allowed_areas_by_voyage else set(function_areas)
-    skipped_outside_user_scope: Counter[tuple[str, str]] = Counter()
     skipped_closed_area: Counter[tuple[str, str]] = Counter()
     skipped_flow_function: Counter[tuple[str, str]] = Counter()
     for row in input_plan:
         if row.area_no not in allowed_areas_by_voyage.get(row.voyage_id, set(function_areas)):
-            skipped_outside_user_scope[(row.voyage_id, row.area_no)] += row.new_boxes
             continue
         if row.area_no in closed:
             skipped_closed_area[(row.voyage_id, row.area_no)] += row.new_boxes
@@ -4394,15 +4293,6 @@ def build_problem(
     # Medium/small demand uses actual demand; big-plan rows below remain area inheritance targets.
     target_voyage_set = set(target_voyages)
     export_voyages = classified_export_voyages(input_guandong) & target_voyage_set
-    groups, _demand_rows = load_port_demand_groups(
-        input_guandong,
-        target_voyages,
-        planning_time,
-        attribute_rules,
-        big_plan_caps=None,
-        horizon_hours=horizon_hours,
-        demand_rows=demand_rows,
-    )
     small_groups = load_small_doc_groups(
         input_guandong,
         target_voyages,
@@ -4411,12 +4301,12 @@ def build_problem(
         big_plan_caps=None,
     )
     # Only declared export containers receive detailed row-level decisions.
-    groups = [group for group in groups if group.voyage_id in export_voyages]
     small_groups = [group for group in small_groups if group.voyage_id in export_voyages]
 
     demand_by_voyage_size: Counter[tuple[str, str, str]] = Counter()
-    for group in groups:
-        demand_by_voyage_size[(group.voyage_id, group.status, group.big_plan_size_mode)] += group.demand
+    for group in small_groups:
+        big_size = "40" if group.size == "45" else group.size
+        demand_by_voyage_size[(group.voyage_id, group.status, big_size)] += group.demand
     raw_area_quota: Counter[tuple[str, str, str]] = Counter()
     raw_area_size_quota: Counter[tuple[str, str, str, str]] = Counter()
     raw_all_size_area_quota: Counter[tuple[str, str, str]] = Counter()
@@ -4524,42 +4414,6 @@ def build_problem(
         set(bays),
         attribute_rules,
     )
-    bay_requirements: dict[str, set[str]] = {}
-    bay_blocklist: dict[str, set[str]] = {}
-    bay_adjust_rules: list[dict[str, object]] = []
-    bay_constraint_summary: dict[str, Any] = {"mode": "paper_model_no_manual_bay_overrides"}
-    voyage_bay_allowlist: dict[str, set[str]] = {}
-    user_area_constraint_summary.update(
-        {
-            "allowed_areas_by_voyage": {
-                voyage_id: sorted(areas)
-                for voyage_id, areas in sorted(allowed_areas_by_voyage.items())
-            },
-            "effective_yard_areas": sorted(allowed_areas),
-            "input_big_plan_row_count": len(input_plan),
-            "accepted_big_plan_row_count": len(cleaned_plan),
-            "skipped_big_plan_boxes_outside_user_scope": {
-                f"{voyage_id}|{area_no}": int(qty)
-                for (voyage_id, area_no), qty in sorted(skipped_outside_user_scope.items())
-                if qty > 0
-            },
-            "skipped_big_plan_boxes_closed_area": {
-                f"{voyage_id}|{area_no}": int(qty)
-                for (voyage_id, area_no), qty in sorted(skipped_closed_area.items())
-                if qty > 0
-            },
-            "skipped_big_plan_boxes_flow_function": {
-                f"{voyage_id}|{area_no}": int(qty)
-                for (voyage_id, area_no), qty in sorted(skipped_flow_function.items())
-                if qty > 0
-            },
-            "missing_big_plan_area_pattern_boxes": {
-                f"{voyage_id}|{flow}|{size_mode}": int(qty)
-                for (voyage_id, flow, size_mode), qty in sorted(missing_big_plan_area_pattern.items())
-                if qty > 0
-            },
-        }
-    )
     area_operations = build_area_operations(input_guandong, vessel_schedules)
     berth_distances = read_distance_matrix(input_guandong)
     berth_by_voyage = {
@@ -4568,7 +4422,6 @@ def build_problem(
         if voyage_id in vessel_schedules and vessel_schedules[voyage_id].berth_no
     }
     return ProblemData(
-        groups=groups,
         small_groups=small_groups,
         bays=bays,
         big_plan=cleaned_plan,
@@ -4576,7 +4429,6 @@ def build_problem(
         area_quota=area_quota,
         area_size_quota=area_size_quota,
         area_functions=area_functions,
-        business_special_codes=collect_business_special_codes(groups),
         planning_time=planning_time,
         horizon_hours=horizon_hours,
         voyage_windows=voyage_windows,
@@ -4593,25 +4445,6 @@ def build_problem(
             voyage_id: set(allowed_areas_by_voyage.get(voyage_id, set(function_areas)))
             for voyage_id in target_voyages
         },
-        user_voyage_area_allowlist={
-            voyage_id: set(allowed_areas_by_voyage.get(voyage_id, set(function_areas)))
-            for voyage_id in target_voyages
-        },
-        user_voyage_area_blocklist={
-            voyage_id: set(function_areas) - set(allowed_areas_by_voyage.get(voyage_id, set(function_areas)))
-            for voyage_id in target_voyages
-        },
-        user_voyage_area_priority={
-            voyage_id: set(priority_areas_by_voyage.get(voyage_id, set()))
-            for voyage_id in target_voyages
-        },
-        user_voyage_area_requirements={},
-        user_voyage_bay_allowlist=voyage_bay_allowlist,
-        user_group_bay_requirements=bay_requirements,
-        user_group_bay_blocklist=bay_blocklist,
-        user_bay_adjust_rules=bay_adjust_rules,
-        user_area_constraint_summary=user_area_constraint_summary,
-        user_bay_constraint_summary=bay_constraint_summary,
         tops_reserved_slot_count=reserved_count,
         tops_closed_bay_count=closed_bay_count,
         misplaced_bay_exclusion_ratio=misplaced_bay_exclusion_ratio,

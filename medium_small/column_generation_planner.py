@@ -112,7 +112,6 @@ class ColumnGenerationConfig:
     use_scip: bool = True
     scip_disable_symmetry: bool = True
     full_column_pool: bool = False
-    demand_mode: str = "doc-only"
     medium_plan_quota: dict[tuple[str, str, str, str, str], int] | None = None
     medium_plan_bay_quota: dict[tuple[str, str, str, str, str, str], int] | None = None
     repair_can_exceed_medium_plan_quota: bool = False
@@ -188,7 +187,6 @@ class ColumnGenerationPlanner:
         self.import_voyages = self._infer_import_voyages(problem)
         self.groups = sorted(self._build_planning_groups(), key=self._group_sort_key)
         self.groups_by_id = {group.group_id: group for group in self.groups}
-        self._expand_user_bay_adjust_rules()
         self.bays = problem.bays
         self.attribute_rules = getattr(problem, "attribute_rules", None)
         self.bays_by_area: dict[str, list[str]] = defaultdict(list)
@@ -318,7 +316,20 @@ class ColumnGenerationPlanner:
         return True
 
     def _build_planning_groups(self) -> list[SmallBoxGroup]:
-        mode = (self.config.demand_mode or "original").strip().lower().replace("_", "-")
+        # The paper model makes row-level decisions only for declared export
+        # containers. Import demand and undeclared export demand are aggregate
+        # capacity reservations prepared by the input adapter.
+        source_doc_groups = list(self.problem.small_groups)
+        source_doc_boxes = sum(group.demand for group in source_doc_groups)
+        self.group_source = {group.group_id: "declared_export" for group in source_doc_groups}
+        self.demand_stats = {
+            "declared_export_group_count": len(source_doc_groups),
+            "declared_export_box_count": source_doc_boxes,
+            "planned_box_count": source_doc_boxes,
+        }
+        return source_doc_groups
+
+        mode = "doc-only"
         if mode not in {"original", "medium", "medium-with-doc-floor", "doc-only"}:
             raise ValueError(
                 "demand_mode must be one of: original, medium, medium-with-doc-floor, doc-only"
@@ -697,19 +708,17 @@ class ColumnGenerationPlanner:
         else:
             full_pool_added_columns = 0
         diagnostics: dict = {
-            "algorithm": "small_plan_first_column_generation",
+            "algorithm": "export_row_column_generation",
             "model_scope": "export_declared_containers_row_allocation",
             "detailed_allocation_direction": "export_only",
             "target_voyages": self.problem.target_voyages,
-            "user_area_constraints": getattr(self.problem, "user_area_constraint_summary", {}),
             "attribute_rules": self.attribute_rules.as_dict() if hasattr(self.attribute_rules, "as_dict") else {},
-            "small_doc_group_count": int(self.demand_stats.get("source_doc_group_count", 0)),
-            "small_doc_box_count": int(self.demand_stats.get("source_doc_box_count", 0)),
+            "declared_export_group_count": int(self.demand_stats.get("declared_export_group_count", 0)),
+            "declared_export_box_count": int(self.demand_stats.get("declared_export_box_count", 0)),
             "planned_group_count": len(self.groups),
             "planned_box_count": sum(group.demand for group in self.groups),
             "berth_distance_count": len(self.problem.berth_distances),
             "berth_by_voyage": self.problem.berth_by_voyage,
-            "demand_mode": self.config.demand_mode,
             "demand_alignment": self.demand_stats,
             "aggregate_capacity_reservations": {
                 "source_quantity_field": "new_qty",
@@ -724,21 +733,6 @@ class ColumnGenerationPlanner:
                     for (area, size), qty in sorted(self.export_area_size_reservation.items())
                 },
             },
-            "medium_doc_floor_added_boxes": getattr(self.problem, "medium_doc_floor_added_boxes", 0),
-            "medium_doc_floor_added_groups": getattr(self.problem, "medium_doc_floor_added_groups", 0),
-            "medium_doc_floor_shifted_boxes": getattr(self.problem, "medium_doc_floor_shifted_boxes", 0),
-            "medium_doc_floor_shifted_groups": getattr(self.problem, "medium_doc_floor_shifted_groups", 0),
-            "medium_doc_floor_by_coarse_group": getattr(self.problem, "medium_doc_floor_by_coarse_group", {}),
-            "medium_doc_floor_added_by_coarse_group": getattr(
-                self.problem,
-                "medium_doc_floor_added_by_coarse_group",
-                {},
-            ),
-            "medium_doc_floor_shifted_by_coarse_group": getattr(
-                self.problem,
-                "medium_doc_floor_shifted_by_coarse_group",
-                {},
-            ),
             "initial_column_count": len(self._columns),
             "base_initial_column_count": base_initial_column_count,
             "full_column_pool": bool(self.config.full_column_pool),
@@ -813,12 +807,10 @@ class ColumnGenerationPlanner:
             {
                 "final_column_count": len(self._columns),
                 "selected_column_count": sum(1 for qty in selected.values() if qty > 0),
-                "medium_plan_granularity": "bay",
-                "medium_plan_source": "selected_columns",
-                "small_row_count": len(small_rows),
-                "medium_row_count": len(medium_rows),
-                "planned_small_boxes": sum(int(row["planned_boxes"]) for row in small_rows),
-                "planned_medium_boxes": sum(int(row["planned_boxes"]) for row in medium_rows),
+                "summary_granularity": "bay",
+                "export_row_count": len(small_rows),
+                "area_bay_summary_row_count": len(medium_rows),
+                "planned_export_boxes": sum(int(row["planned_boxes"]) for row in small_rows),
                 "planned_medium_by_source": self._planned_medium_by_source(medium_rows),
                 "medium_area_rows_below_min_boxes": self._count_medium_area_rows_below_min(medium_rows),
                 "medium_fragmentation": medium_fragmentation,
@@ -1485,7 +1477,7 @@ class ColumnGenerationPlanner:
         }
 
     def _uses_original_output_scope(self) -> bool:
-        return (self.config.demand_mode or "original").strip().lower().replace("_", "-") == "original"
+        return False
 
     def _count_medium_area_rows_below_min(self, medium_rows: list[dict]) -> int:
         min_boxes = max(0, int(self.config.medium_large_group_min_area_boxes or 0))
@@ -4898,12 +4890,6 @@ class ColumnGenerationPlanner:
         return max(0.0, float(getattr(self.config, "export_e_area_non_40_penalty", 0.0) or 0.0))
 
     def _user_area_policy_allows(self, voyage_id: str, area_no: str) -> bool:
-        allow = getattr(self.problem, "user_voyage_area_allowlist", {}).get(voyage_id, set())
-        block = getattr(self.problem, "user_voyage_area_blocklist", {}).get(voyage_id, set())
-        if area_no in block:
-            return False
-        if allow and area_no not in allow:
-            return False
         return True
 
     def _port_sail_area_policy_allows(self, group: SmallBoxGroup, area_no: str) -> bool:
@@ -4916,15 +4902,10 @@ class ColumnGenerationPlanner:
         return area_code in {str(area or "").strip().upper() for area in allowlist}
 
     def _user_bay_policy_allows(self, group: SmallBoxGroup, bay_key: str) -> bool:
-        voyage_allowlists = getattr(self.problem, "user_voyage_bay_allowlist", {})
-        if group.voyage_id in voyage_allowlists and bay_key not in voyage_allowlists[group.voyage_id]:
-            return False
-        blocked = getattr(self.problem, "user_group_bay_blocklist", {}).get(group.group_id, set())
-        return bay_key not in blocked
+        return True
 
     def _user_bay_policy_requires(self, group: SmallBoxGroup, bay_key: str) -> bool:
-        required = getattr(self.problem, "user_group_bay_requirements", {}).get(group.group_id, set())
-        return bay_key in required
+        return False
 
     def _area_supports_group_flow(self, group: SmallBoxGroup, area_no: str) -> bool:
         if self._is_big_plan_area_for_group(group, area_no):
