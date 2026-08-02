@@ -70,15 +70,17 @@ All active grouping rules resolve to the single operational group above.
 
 ## Retained objectives
 
-Column generation is strict over the explicitly declared finite pattern
-universe. For every feasible group/bay/integer-quantity combination, the
-planner enumerates the model's deterministic row-packing patterns (up to six
-distinct patterns per combination). Pricing reads the exact Gurobi reduced cost of every inactive pattern,
-activates every negative-reduced-cost pattern, and repeats until none remains.
-A time limit cannot silently terminate this certificate phase; failure to
-reach reduced-cost convergence is an error.
+Each column is a feasible operational-group/bay/row unit flow. Its master
+variable is an integer container quantity, so arbitrary feasible integer row
+allocations are represented by combining unit-flow columns; there is no capped
+list of multi-row packing templates. The restricted master contains active
+columns only. In each lexicographic phase, an exact auxiliary pricing LP over
+the complete compatible unit-flow universe identifies the inactive flows used
+by the full relaxation and admits them to the restricted master. Pricing stops
+only when the restricted and oracle objectives agree within numerical
+tolerance. A time limit cannot silently terminate this certificate phase.
 
-The final integer master over the complete declared pattern universe is solved
+The final integer master over the complete unit-flow universe is solved
 in two lexicographic stages. Stage 1
 minimizes the number of unplaced declared containers. Stage 2 fixes that
 minimum exactly and minimizes the following operational criteria:
@@ -102,13 +104,13 @@ units.
 
 The stage-2 integer solution is the final reported allocation. There is no
 post-solve intra-area row relayout or separate heuristic objective; row-level
-placement patterns must belong to the declared pattern universe and are
+row assignments must be combinations of the declared unit flows and are
 selected by the same final master.
 
-The reduced-cost certificate applies to the complete declared finite pattern
-universe. The final two-stage MIP activates that entire universe, so its MIP
-gap is valid for the declared finite pattern formulation. This is not a
-branch-and-price claim for row patterns outside that declared formulation.
+The pricing certificate applies to the complete unit-flow universe. The final
+two-stage MIP activates that universe, so its MIP gap is valid for the complete
+row-flow formulation. This is not a branch-and-price claim beyond the stated
+static planning model.
 
 One pair-state variable is used for both large-container preservation and
 import reservation. Assigning a 20-ft container to either member makes the

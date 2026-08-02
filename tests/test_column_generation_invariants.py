@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 import unittest
+import csv
 from collections import defaultdict
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 
 from block_bay_planning.models import Bay, SmallBoxGroup
 from medium_small.column_generation_planner import ColumnGenerationConfig, ColumnGenerationPlanner
+from medium_small.output_validator import validate_output_files
 
 
 def make_group(size: str) -> SmallBoxGroup:
@@ -20,38 +25,9 @@ def make_group(size: str) -> SmallBoxGroup:
     )
 
 
-class FakeVariable:
-    def __init__(self, reduced_cost: float) -> None:
-        self.RC = reduced_cost
-
-
-class FakeModel:
-    @staticmethod
-    def getReducedCost(variable: FakeVariable) -> float:
-        return variable.RC
-
-
 class ColumnGenerationInvariantTests(unittest.TestCase):
     def test_silent_solver_fallback_is_disabled_by_default(self) -> None:
         self.assertFalse(ColumnGenerationConfig().allow_greedy_fallback)
-
-    def test_exact_pricing_activates_every_negative_reduced_cost_column(self) -> None:
-        planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
-        planner._active_column_indices = {0}
-        variables = {
-            0: FakeVariable(-100.0),  # already active; it is not priced again
-            1: FakeVariable(-0.25),
-            2: FakeVariable(0.0),
-            3: FakeVariable(-1e-9),  # inside numerical tolerance
-        }
-
-        stats = planner._activate_negative_reduced_cost_columns(
-            FakeModel(), {"column": variables}
-        )
-
-        self.assertEqual({0, 1}, planner._active_column_indices)
-        self.assertEqual(1, stats["new_columns"])
-        self.assertTrue(stats["exact_pricing"])
 
     def test_45ft_is_edge_only_without_excluding_other_sizes(self) -> None:
         planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
@@ -103,6 +79,63 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         self.assertEqual(5, planner._max_quantity_in_bay(make_group("20"), "edge"))
         self.assertEqual(0, planner._max_quantity_in_bay(make_group("45"), "middle"))
         self.assertEqual(5, planner._max_quantity_in_bay(make_group("45"), "edge"))
+
+    def test_unit_flows_cover_every_feasible_row_without_pattern_cap(self) -> None:
+        planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
+        planner.groups = [make_group("20")]
+        planner.config = ColumnGenerationConfig(initial_columns_per_group=1)
+        planner.bays = {
+            "A|01": Bay(
+                area_no="A", bay_no="01", bay_key="A|01", block_id="",
+                block_bays=(), block_bay_count=0, block_boundary_adjusted=False,
+                bay_order=0, cap_by_size={"20": 9}, physical_capacity=9,
+            )
+        }
+        planner._columns = []
+        planner._column_keys = set()
+        planner._column_indices_by_triplet = defaultdict(list)
+        planner._active_column_indices = set()
+        planner._candidate_bays_for_group = lambda group: [("A|01", 9, 0.0)]
+        planner._placement_footprint_keys = lambda bay_key, size: (bay_key,)
+        planner._row_capacity_items_for_group = lambda bay_key, size, group: [(str(i), 3) for i in range(1, 10)]
+        planner._quota_key = lambda group, area: (group.voyage_id, group.status, area, group.size)
+        planner._operational_group_key = lambda group: (group.voyage_id, group.status, group.port, group.size, group.height)
+        planner._berth_distance_cost = lambda voyage, area, qty: 0.0
+
+        planner._build_unit_flow_column_universe()
+
+        self.assertEqual(9, len(planner._columns))
+        self.assertTrue(all(column.quantity == 1 for column in planner._columns))
+        self.assertEqual(set(range(9)), planner._active_column_indices)
+
+    def test_written_output_is_validated_independently(self) -> None:
+        group = make_group("20")
+        bay = Bay(
+            area_no="A", bay_no="01", bay_key="A|01", block_id="",
+            block_bays=(), block_bay_count=0, block_boundary_adjusted=False,
+            bay_order=0, cap_by_size={"20": 4}, physical_capacity=4,
+            row_cap_by_size={"20": {"1": 4}}, row_physical_capacity={"1": 4},
+        )
+        problem = SimpleNamespace(
+            small_groups=[group], bays={"A|01": bay}, import_area_size_reservation={}
+        )
+        with TemporaryDirectory() as directory:
+            plan_path = Path(directory) / "plan.csv"
+            unplaced_path = Path(directory) / "unplaced.csv"
+            with plan_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=[
+                    "group_id", "planned_boxes", "area_no", "bay_no", "row_no",
+                    "size", "height", "voyage_id", "port",
+                ])
+                writer.writeheader()
+                writer.writerow({
+                    "group_id": group.group_id, "planned_boxes": 5, "area_no": "A",
+                    "bay_no": "01", "row_no": "1", "size": "20", "height": "96",
+                    "voyage_id": "V1", "port": "P1",
+                })
+            unplaced_path.touch()
+            with self.assertRaisesRegex(ValueError, "capacity"):
+                validate_output_files(problem, plan_path, unplaced_path)
 
 
 if __name__ == "__main__":

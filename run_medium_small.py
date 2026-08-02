@@ -18,6 +18,7 @@ from medium_small.column_generation_planner import (
     write_json,
     write_rows,
 )
+from medium_small.output_validator import validate_output_files
 
 
 ROOT = Path(__file__).resolve().parent
@@ -85,6 +86,12 @@ def main() -> None:
     write_rows(output_dir / "declared_export_demand.csv", [asdict(row) for row in inputs.demand_rows])
     large_plan.to_csv(output_dir / "large_plan_used.csv", index=False, encoding="utf-8-sig")
     write_json(output_dir / "diagnostics.json", result.diagnostics)
+    output_validation = validate_output_files(
+        inputs.problem,
+        output_dir / "export_row_plan.csv",
+        output_dir / "unplaced_boxes.csv",
+    )
+    write_json(output_dir / "output_validation.json", output_validation)
     write_json(
         output_dir / "run_summary.json",
         {
