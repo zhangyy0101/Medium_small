@@ -98,6 +98,10 @@ class _GurobiModelAdapter:
         return float(var.X)
 
     @staticmethod
+    def getReducedCost(var) -> float:
+        return float(var.RC)
+
+    @staticmethod
     def getDualsolLinear(constr) -> float:
         return float(constr.Pi)
 
@@ -192,6 +196,7 @@ class ColumnGenerationConfig:
     mip_gap: float = 0.01
     verbose: bool = True
     use_gurobi: bool = True
+    allow_greedy_fallback: bool = False
     full_column_pool: bool = False
     medium_plan_quota: dict[tuple[str, str, str, str, str], int] | None = None
     medium_plan_bay_quota: dict[tuple[str, str, str, str, str, str], int] | None = None
@@ -234,13 +239,13 @@ class ColumnGenerationResult:
 
 
 class ColumnGenerationPlanner:
-    """Small-plan-first column generation.
+    """Declared-export row assignment with exact finite-universe pricing.
 
-    A column is a feasible placement pattern for one document-container fine
-    group in one bay with a fixed quantity. The restricted master covers all
-    fine groups and respects bay exclusivity/capacity. Big-plan area/size
-    quantities are soft targets, and fallback areas remain available with a
-    tiered inheritance penalty.
+    A column is one feasible group/bay/quantity/row pattern.  The master uses
+    only declared, not-yet-gated-in export containers; import containers enter
+    as existing occupancy and big-plan area reservations, never as assignment
+    demand.  Big-plan quantities guide area allocation but are not a second
+    executable planning layer.
     """
 
     def __init__(self, problem: ProblemData, config: ColumnGenerationConfig | None = None) -> None:
@@ -312,6 +317,7 @@ class ColumnGenerationPlanner:
         self.coarse_cluster_groups: defaultdict[tuple[str, ...], list[SmallBoxGroup]] = defaultdict(list)
         self.voyage_flow_size_demand: Counter[tuple[str, str, str]] = Counter()
         self._columns: list[PlacementColumn] = []
+        self._active_column_indices: set[int] = set()
         self._column_keys: set[tuple[str, str, int, tuple[tuple[str, str, int], ...]]] = set()
         self._default_column_triplets: set[tuple[str, str, int]] = set()
         self._column_indices_by_triplet: defaultdict[tuple[str, str, int], list[int]] = defaultdict(list)
@@ -385,397 +391,31 @@ class ColumnGenerationPlanner:
         return True
 
     def _build_planning_groups(self) -> list[SmallBoxGroup]:
-        # The paper model makes row-level decisions only for declared export
-        # containers. Import demand and undeclared export demand are aggregate
-        # capacity reservations prepared by the input adapter.
-        source_doc_groups = list(self.problem.small_groups)
-        source_doc_boxes = sum(group.demand for group in source_doc_groups)
-        self.group_source = {group.group_id: "declared_export" for group in source_doc_groups}
-        self.demand_stats = {
-            "declared_export_group_count": len(source_doc_groups),
-            "declared_export_box_count": source_doc_boxes,
-            "planned_box_count": source_doc_boxes,
-        }
-        return source_doc_groups
-
-        mode = "doc-only"
-        if mode not in {"original", "medium", "medium-with-doc-floor", "doc-only"}:
-            raise ValueError(
-                "demand_mode must be one of: original, medium, medium-with-doc-floor, doc-only"
-            )
-
-        source_doc_groups = list(self.problem.small_groups)
-        source_doc_boxes = sum(group.demand for group in source_doc_groups)
-        if mode == "doc-only":
-            self.group_source = {group.group_id: "document" for group in source_doc_groups}
-            self.demand_stats = {
-                "demand_mode": mode,
-                "source_doc_group_count": len(source_doc_groups),
-                "source_doc_box_count": source_doc_boxes,
-                "medium_target_group_count": len(self.problem.groups),
-                "medium_target_box_count": sum(group.demand for group in self.problem.groups),
-                "original_small_output_box_count": source_doc_boxes,
-                "original_medium_output_box_count": 0,
-                "forecast_fallback_group_count": 0,
-                "forecast_fallback_box_count": 0,
-                "dropped_doc_box_count": 0,
-                "doc_boxes_outside_medium_target": 0,
-                "planned_box_count": source_doc_boxes,
-            }
-            return source_doc_groups
-
-        remaining: Counter[tuple[str, ...]] = Counter()
-        representative_by_coarse: dict[tuple[str, ...], SmallBoxGroup] = {}
-        for group in self.problem.groups:
-            small_group = self._medium_group_as_small_group(group, group.demand)
-            coarse_key = self._coarse_key(small_group)
-            remaining[coarse_key] += group.demand
-            representative_by_coarse.setdefault(coarse_key, small_group)
-
-        if mode == "original":
-            return self._build_original_planning_groups(source_doc_groups, source_doc_boxes, remaining, representative_by_coarse)
-
-        planning_groups: list[SmallBoxGroup] = []
-        dropped_doc_boxes = 0
-        height_weights = self._forecast_height_weights(source_doc_groups)
-        for group in sorted(source_doc_groups, key=lambda g: (g.voyage_id, g.status, g.port, SIZE_ORDER.get(g.size, 3), g.group_id)):
-            key = self._coarse_key(group)
-            if mode == "medium":
-                take = min(group.demand, remaining.get(key, 0))
-                if take <= 0:
-                    dropped_doc_boxes += group.demand
-                    continue
-                if take < group.demand:
-                    dropped_doc_boxes += group.demand - take
-                planning_group = self._copy_group_with_demand(group, take)
-                planning_groups.append(planning_group)
-                self.group_source[planning_group.group_id] = "document"
-                remaining[key] -= take
-            else:
-                planning_groups.append(group)
-                self.group_source[group.group_id] = "document"
-                remaining[key] -= group.demand
-
-        forecast_group_count = 0
-        forecast_box_count = 0
-        non_export_fallback_suppressed_boxes = 0
-        for coarse_key, qty in sorted(remaining.items()):
-            if qty <= 0:
-                continue
-            representative = representative_by_coarse.get(coarse_key)
-            if representative is None:
-                continue
-            if not self._is_export_voyage(representative.voyage_id):
-                non_export_fallback_suppressed_boxes += int(qty)
-                continue
-            for height, height_qty in self._split_forecast_by_height(
-                representative.voyage_id,
-                representative.status,
-                representative.port,
-                representative.size,
-                int(qty),
-                height_weights,
-            ):
-                forecast_group_count += 1
-                attributes = self._fallback_group_attributes(
-                    representative.voyage_id,
-                    representative.status,
-                    representative.port,
-                    representative.size,
-                    height,
-                    representative.weight_class,
-                )
-                attributes.update(getattr(representative, "attributes", {}) or {})
-                group = SmallBoxGroup(
-                    group_id=f"{representative.voyage_id}_F{forecast_group_count:03d}",
-                    voyage_id=representative.voyage_id,
-                    status=representative.status,
-                    port=representative.port,
-                    size=representative.size,
-                    height=height,
-                    weight_class=representative.weight_class,
-                    demand=int(height_qty),
-                    pre_stow=False,
-                    special_stow=False,
-                    special_stow_code="",
-                    attributes=attributes,
-                    area_allowlist=self._copy_area_allowlist(representative),
-                )
-                planning_groups.append(group)
-                self.group_source[group.group_id] = "forecast_fallback"
-                forecast_box_count += int(height_qty)
-
-        self.demand_stats = {
-            "demand_mode": mode,
-            "source_doc_group_count": len(source_doc_groups),
-            "source_doc_box_count": source_doc_boxes,
-            "medium_target_group_count": len(self.problem.groups),
-            "medium_target_box_count": sum(group.demand for group in self.problem.groups),
-            "original_small_output_box_count": (
-                source_doc_boxes if mode == "medium-with-doc-floor" else source_doc_boxes - dropped_doc_boxes
-            ),
-            "original_medium_output_box_count": sum(group.demand for group in self.problem.groups),
-            "forecast_fallback_group_count": forecast_group_count,
-            "forecast_fallback_box_count": forecast_box_count,
-            "non_export_fallback_suppressed_box_count": non_export_fallback_suppressed_boxes,
-            "dropped_doc_box_count": dropped_doc_boxes,
-            "doc_boxes_outside_medium_target": 0,
-            "planned_box_count": sum(group.demand for group in planning_groups),
-        }
-        return planning_groups
-
-    def _build_original_planning_groups(
-        self,
-        source_doc_groups: list[SmallBoxGroup],
-        source_doc_boxes: int,
-        remaining_medium: Counter[tuple[str, ...]],
-        representative_by_coarse: dict[tuple[str, ...], SmallBoxGroup],
-    ) -> list[SmallBoxGroup]:
-        """Build the same demand scopes as the SA + heuristic pipeline.
-
-        The original pipeline writes the medium plan from ``problem.groups`` and
-        writes the small plan from all current document groups.  Document boxes
-        consume only the exact medium coarse target with the same voyage, flow,
-        port, and true size; the data loader lifts medium demand beforehand when
-        the document floor is higher than the forecast medium target.
-        """
-        planning_groups = list(source_doc_groups)
-        self.group_source = {group.group_id: "document" for group in source_doc_groups}
-        doc_boxes_outside_medium_target = 0
-
-        for group in sorted(source_doc_groups, key=lambda g: (g.voyage_id, g.status, g.port, SIZE_ORDER.get(g.size, 3), g.group_id)):
-            doc_boxes_outside_medium_target += self._consume_medium_target_for_document_group(
-                remaining_medium,
-                group,
-            )
-
-        height_weights = self._forecast_height_weights(source_doc_groups)
-        forecast_group_count = 0
-        forecast_box_count = 0
-        non_export_fallback_suppressed_boxes = 0
-        for coarse_key, qty in sorted(remaining_medium.items()):
-            if qty <= 0:
-                continue
-            representative = representative_by_coarse.get(coarse_key)
-            if representative is None:
-                continue
-            if not self._is_export_voyage(representative.voyage_id):
-                non_export_fallback_suppressed_boxes += int(qty)
-                continue
-            for height, height_qty in self._split_forecast_by_height(
-                representative.voyage_id,
-                representative.status,
-                representative.port,
-                representative.size,
-                int(qty),
-                height_weights,
-            ):
-                forecast_group_count += 1
-                attributes = self._fallback_group_attributes(
-                    representative.voyage_id,
-                    representative.status,
-                    representative.port,
-                    representative.size,
-                    height,
-                    representative.weight_class,
-                )
-                attributes.update(getattr(representative, "attributes", {}) or {})
-                group = SmallBoxGroup(
-                    group_id=f"{representative.voyage_id}_F{forecast_group_count:03d}",
-                    voyage_id=representative.voyage_id,
-                    status=representative.status,
-                    port=representative.port,
-                    size=representative.size,
-                    height=height,
-                    weight_class=representative.weight_class,
-                    demand=int(height_qty),
-                    pre_stow=False,
-                    special_stow=False,
-                    special_stow_code="",
-                    attributes=attributes,
-                    area_allowlist=self._copy_area_allowlist(representative),
-                )
-                planning_groups.append(group)
-                self.group_source[group.group_id] = "forecast_fallback"
-                forecast_box_count += int(height_qty)
-
-        self.demand_stats = {
-            "demand_mode": "original",
-            "source_doc_group_count": len(source_doc_groups),
-            "source_doc_box_count": source_doc_boxes,
-            "medium_target_group_count": len(self.problem.groups),
-            "medium_target_box_count": sum(group.demand for group in self.problem.groups),
-            "original_small_output_box_count": source_doc_boxes,
-            "original_medium_output_box_count": sum(group.demand for group in self.problem.groups),
-            "forecast_fallback_group_count": forecast_group_count,
-            "forecast_fallback_box_count": forecast_box_count,
-            "non_export_fallback_suppressed_box_count": non_export_fallback_suppressed_boxes,
-            "dropped_doc_box_count": 0,
-            "doc_boxes_outside_medium_target": doc_boxes_outside_medium_target,
-            "planned_box_count": sum(group.demand for group in planning_groups),
-        }
-        return planning_groups
-
-    def _consume_medium_target_for_document_group(
-        self,
-        remaining: Counter[tuple[str, ...]],
-        group: SmallBoxGroup,
-    ) -> int:
-        need = int(group.demand)
-        exact_key = self._coarse_key(group)
-        take = min(need, max(0, remaining.get(exact_key, 0)))
-        if take > 0:
-            remaining[exact_key] -= take
-            need -= take
-        if need <= 0:
-            return 0
-        return need
-
-    @staticmethod
-    def _copy_area_allowlist(group) -> set[str] | None:
-        allowlist = getattr(group, "area_allowlist", None)
-        if allowlist is None:
-            return None
-        return set(allowlist)
-
-    @staticmethod
-    def _copy_group_with_demand(group: SmallBoxGroup, demand: int) -> SmallBoxGroup:
-        return SmallBoxGroup(
-            group_id=group.group_id,
-            voyage_id=group.voyage_id,
-            status=group.status,
-            port=group.port,
-            size=group.size,
-            height=group.height,
-            weight_class=group.weight_class,
-            demand=int(demand),
-            pre_stow=group.pre_stow,
-            special_stow=group.special_stow,
-            special_stow_code=group.special_stow_code,
-            attributes=dict(getattr(group, "attributes", {}) or {}),
-            area_allowlist=ColumnGenerationPlanner._copy_area_allowlist(group),
-        )
-
-    @staticmethod
-    def _medium_group_as_small_group(group, demand: int) -> SmallBoxGroup:
-        return SmallBoxGroup(
-            group_id=group.group_id,
-            voyage_id=group.voyage_id,
-            status=group.status,
-            port=group.port,
-            size=group.size,
-            height=getattr(group, "height", "UNK") or "UNK",
-            weight_class=getattr(group, "weight_class", "UNK") or "UNK",
-            demand=int(demand),
-            pre_stow=False,
-            special_stow=False,
-            special_stow_code="",
-            attributes=dict(getattr(group, "attributes", {}) or {}),
-            area_allowlist=ColumnGenerationPlanner._copy_area_allowlist(group),
-        )
-
-    def _fallback_group_attributes(
-        self,
-        voyage_id: str,
-        flow: str,
-        port: str,
-        size: str,
-        height: str,
-        weight_class: str = "UNK",
-    ) -> dict[str, str]:
-        attrs: list[str] = []
-        rules = getattr(self.problem, "attribute_rules", None)
-        if rules is not None:
-            rule_sets = [rules.coarse_for(voyage_id), rules.fine_for(voyage_id)]
-            rule_sets.extend([rules.bay_no_mix_for(voyage_id), rules.row_no_mix_for(voyage_id)])
-            for values in rule_sets:
-                for attr in values:
-                    text = str(attr)
-                    if text and text not in attrs:
-                        attrs.append(text)
-        fallback_values = {
-            "status": flow,
-            "flow": flow,
-            "IYC_STS_CSTATUSCD": flow,
-            "size": size,
-            "size_mode": size,
-            "IYC_CSZ_CSIZECD": size,
-            "port": port,
-            "IYC_POT_UNLDPORT": port,
-            "height": height,
-            "IYC_CHEIGHTCD": height,
-        }
-        out: dict[str, str] = {}
-        for attr in attrs:
-            out[attr] = fallback_values.get(attr, "MIXED")
-        return out
-
-    @staticmethod
-    def _forecast_height_weights(
-        groups: list[SmallBoxGroup],
-    ) -> dict[tuple, Counter[str]]:
-        weights: dict[tuple, Counter[str]] = defaultdict(Counter)
+        """Return declared, not-yet-arrived export groups only."""
+        groups = [
+            group
+            for group in (getattr(self.problem, "small_groups", []) or getattr(self.problem, "groups", []) or [])
+            if str(group.status) in EXPORT_FLOWS and int(group.demand) > 0
+        ]
         for group in groups:
-            height = group.height or "HQ"
-            keys = [
-                (group.voyage_id, group.status, group.port, group.size),
-                (group.voyage_id, group.status, group.size),
-                (group.status, group.size),
-                (group.size,),
-                ("*",),
-            ]
-            for key in keys:
-                weights[key][height] += group.demand
-        return weights
-
-    @classmethod
-    def _split_forecast_by_height(
-        cls,
-        voyage_id: str,
-        flow: str,
-        port: str,
-        size: str,
-        qty: int,
-        height_weights: dict[tuple, Counter[str]],
-    ) -> list[tuple[str, int]]:
-        if qty <= 0:
-            return []
-        for key in (
-            (voyage_id, flow, port, size),
-            (voyage_id, flow, size),
-            (flow, size),
-            (size,),
-            ("*",),
-        ):
-            weights = height_weights.get(key)
-            if weights:
-                return cls._allocate_integer_by_weights(weights, qty)
-        return [("HQ", qty)]
-
-    @staticmethod
-    def _allocate_integer_by_weights(weights: Counter[str], total: int) -> list[tuple[str, int]]:
-        items = [(key, value) for key, value in sorted(weights.items()) if value > 0]
-        if not items or total <= 0:
-            return []
-        source_total = sum(value for _key, value in items)
-        raw = [value * total / source_total for _key, value in items]
-        base = [int(value) for value in raw]
-        remain = total - sum(base)
-        order = sorted(range(len(raw)), key=lambda idx: raw[idx] - base[idx], reverse=True)
-        for idx in order[:remain]:
-            base[idx] += 1
-        return [(key, qty) for (key, _value), qty in zip(items, base) if qty > 0]
-
+            self.group_source[group.group_id] = "document"
+        boxes = sum(int(group.demand) for group in groups)
+        self.demand_stats = {
+            "declared_export_group_count": len(groups),
+            "declared_export_box_count": boxes,
+            "planning_group_count": len(groups),
+            "planning_box_count": boxes,
+            "demand_policy": "declared_export_only",
+        }
+        return groups
     def solve(self) -> ColumnGenerationResult:
         self._build_initial_columns()
         base_initial_column_count = len(self._columns)
         seed_stats = self._seed_restricted_master_columns()
-        if self.config.full_column_pool:
-            before_full_pool = len(self._columns)
-            self._expand_all_candidate_columns()
-            full_pool_added_columns = len(self._columns) - before_full_pool
-        else:
-            full_pool_added_columns = 0
+        self._active_column_indices = set(range(len(self._columns)))
+        before_full_pool = len(self._columns)
+        self._expand_strict_column_universe()
+        full_pool_added_columns = len(self._columns) - before_full_pool
         diagnostics: dict = {
             "algorithm": "export_row_column_generation",
             "model_scope": "export_declared_containers_row_allocation",
@@ -842,7 +482,8 @@ class ColumnGenerationPlanner:
             },
             "initial_column_count": len(self._columns),
             "base_initial_column_count": base_initial_column_count,
-            "full_column_pool": bool(self.config.full_column_pool),
+            "strict_finite_column_pricing": True,
+            "full_column_pool": True,
             "full_pool_added_columns": full_pool_added_columns,
             **seed_stats,
             "pricing_iterations": [],
@@ -875,15 +516,20 @@ class ColumnGenerationPlanner:
 
         selected: Counter[int]
         unplaced: Counter[str]
-        try:
-            if not self.config.use_gurobi:
-                raise RuntimeError("Gurobi disabled by config")
-            selected, unplaced, master_stats = self._solve_by_column_generation()
-            diagnostics.update(master_stats)
-        except Exception as exc:
+        if not self.config.use_gurobi:
             diagnostics["used_greedy_fallback"] = True
-            diagnostics["gurobi_failure"] = f"{type(exc).__name__}: {exc}"
+            diagnostics["fallback_reason"] = "explicitly_disabled_gurobi"
             selected, unplaced = self._greedy_fallback()
+        else:
+            try:
+                selected, unplaced, master_stats = self._solve_by_column_generation()
+                diagnostics.update(master_stats)
+            except Exception as exc:
+                if not self.config.allow_greedy_fallback:
+                    raise
+                diagnostics["used_greedy_fallback"] = True
+                diagnostics["gurobi_failure"] = f"{type(exc).__name__}: {exc}"
+                selected, unplaced = self._greedy_fallback()
 
         diagnostics.update(
             {
@@ -1427,9 +1073,6 @@ class ColumnGenerationPlanner:
         }
         pricing_iterations = 0 if self.config.full_column_pool else self.config.max_iterations
         for iteration in range(pricing_iterations):
-            if total_time_low(pricing_start_min_remaining):
-                stats["pricing_stop_reason"] = "total_time_limit"
-                break
             iteration_start = perf_counter()
             if self.config.verbose:
                 print(
@@ -1438,16 +1081,6 @@ class ColumnGenerationPlanner:
                 )
             lp_model, lp_vars, lp_constraints = self._build_restricted_master(Model, quicksum, relax=True)
             lp_time_limit = float(self.config.mip_time_limit)
-            remaining = remaining_total_time()
-            if remaining is not None:
-                available_lp_time = remaining - staged_repair_reserve
-                if available_lp_time < pricing_min_lp_time_limit:
-                    stats["pricing_stop_reason"] = "total_time_limit"
-                    stats["pricing_skipped_lp_iteration"] = iteration
-                    stats["pricing_skipped_lp_available_seconds"] = round(max(0.0, available_lp_time), 3)
-                    self._free_gurobi_model(lp_model)
-                    break
-                lp_time_limit = min(lp_time_limit, available_lp_time)
             self._set_gurobi_param(lp_model, "TimeLimit", lp_time_limit)
             if self.config.verbose:
                 print(f"[column-generation-gurobi] solving LP iter={iteration} time_limit={lp_time_limit:.1f}s", flush=True)
@@ -1523,7 +1156,7 @@ class ColumnGenerationPlanner:
             stats["pricing_light_repair_best_source"] = best_start_source
             stats["pricing_light_repair_best_unplaced_boxes"] = sum(best_start_unplaced.values())
             stats["pricing_light_repair_best_objective"] = light_repair_record["best_objective_after_check"]
-            pricing_stats = self._price_columns(lp_model, lp_constraints, iteration, lp_unplaced, lp_column_values)
+            pricing_stats = self._activate_negative_reduced_cost_columns(lp_model, lp_vars)
             new_count = int(pricing_stats.get("new_columns", 0) or 0)
             stats["pricing_iterations"].append(
                 {
@@ -1554,9 +1187,6 @@ class ColumnGenerationPlanner:
                 )
             self._free_gurobi_model(lp_model)
             stats["pricing_iterations_run"] = iteration + 1
-            if total_time_low(max(5.0, staged_repair_reserve)):
-                stats["pricing_stop_reason"] = "total_time_limit"
-                break
             if (
                 stats["feasibility_early_stop_enabled"]
                 and iteration + 1 >= int(stats["feasibility_early_stop_min_iteration"])
@@ -1654,7 +1284,17 @@ class ColumnGenerationPlanner:
                 break
         if not stats["pricing_stop_reason"]:
             stats["pricing_stop_reason"] = "max_iterations"
+        if stats["pricing_stop_reason"] != "no_new_columns":
+            raise RuntimeError(
+                "Strict column generation did not reach reduced-cost convergence: "
+                + stats["pricing_stop_reason"]
+            )
         stats["column_generation_pricing_elapsed_seconds"] = round(perf_counter() - solve_start, 3)
+
+        # Exact pricing is a correctness phase and is never truncated by the
+        # downstream integer-search budget.  Start that budget only after the
+        # reduced-cost certificate has been obtained.
+        solve_start = perf_counter()
 
         post_pricing_repair_start = perf_counter()
         repair_start_source = best_start_source
@@ -1762,6 +1402,13 @@ class ColumnGenerationPlanner:
         )
         if selected_method != "pricing_incumbent":
             best_start_source = f"{repair_start_source}_{selected_method}"
+
+        # Repair is allowed to inspect the complete, pre-enumerated pattern
+        # universe.  Any columns used by its incumbent must therefore be made
+        # available to the final integer restricted master explicitly.
+        self._active_column_indices.update(
+            idx for idx, value in best_start_selected.items() if value > 0
+        )
 
         lex_selected, lex_unplaced, lex_stats = self._solve_lexicographic_integer_master(
             best_start_selected,
@@ -2207,7 +1854,7 @@ class ColumnGenerationPlanner:
         columns = {
             idx: model.addVar(
                 lb=0.0,
-                ub=1.0,
+                ub=1.0 if idx in self._active_column_indices else 0.0,
                 vtype=column_vtype,
                 obj=0.0 if objective_mode == "min_unplaced" else col.intrinsic_cost,
                 name=f"col_{idx}",
@@ -3004,7 +2651,43 @@ class ColumnGenerationPlanner:
             scope_name = scope or "GLOBAL"
             model.addCons(quicksum(uses) <= 1, name=f"row_one_{attr}_{scope_name}_{bay_key}_{row_no}")
 
-    def _price_columns(
+    def _activate_negative_reduced_cost_columns(self, lp_model, lp_vars: dict) -> dict:
+        """Perform exact pricing over the declared finite pattern universe.
+
+        All patterns in the declared finite group/bay/quantity/row-pattern
+        universe are already present in the LP matrix. Inactive variables are fixed at zero, so Gurobi's
+        reduced cost gives the exact marginal value of admitting each pattern.
+        Every improving pattern is activated; termination therefore means
+        that no omitted pattern has negative reduced cost.
+        """
+        improving: list[tuple[float, int]] = []
+        best_reduced_cost: float | None = None
+        inactive_count = 0
+        for idx, var in lp_vars["column"].items():
+            if idx in self._active_column_indices:
+                continue
+            inactive_count += 1
+            reduced_cost = float(lp_model.getReducedCost(var))
+            if best_reduced_cost is None or reduced_cost < best_reduced_cost:
+                best_reduced_cost = reduced_cost
+            if reduced_cost < -1e-7:
+                improving.append((reduced_cost, idx))
+
+        improving.sort()
+        self._active_column_indices.update(idx for _cost, idx in improving)
+        return {
+            "new_columns": len(improving),
+            "pricing_mode": "exact_finite_universe_reduced_cost",
+            "exact_pricing": True,
+            "inactive_columns_scanned": inactive_count,
+            "negative_reduced_candidates": len(improving),
+            "active_column_count": len(self._active_column_indices),
+            "best_reduced_cost": (
+                round(best_reduced_cost, 9) if best_reduced_cost is not None else None
+            ),
+        }
+
+    def _legacy_price_columns(
         self,
         lp_model,
         lp_constraints: dict,
@@ -3312,6 +2995,19 @@ class ColumnGenerationPlanner:
         for group in self.groups:
             for bay_key, max_qty, base_cost in self._candidate_bays_for_group(group):
                 for qty in self._quantity_options(group, max_qty):
+                    self._add_column(group, bay_key, qty, base_cost)
+
+    def _expand_strict_column_universe(self) -> None:
+        """Enumerate the finite row-pattern universe used by exact pricing.
+
+        Every integer quantity from one to the bay-feasible maximum and every
+        admissible row-allocation pattern returned by the model's pattern
+        generator is included. Pricing can therefore inspect every inactive
+        variable's exact reduced cost in the complete master matrix.
+        """
+        for group in self.groups:
+            for bay_key, max_qty, base_cost in self._candidate_bays_for_group(group):
+                for qty in range(1, int(max_qty) + 1):
                     self._add_column(group, bay_key, qty, base_cost)
 
     def _bay_no_mix_attrs(self, voyage_id: object = None) -> tuple[str, ...]:

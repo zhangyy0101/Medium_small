@@ -62,8 +62,20 @@ All active grouping rules resolve to the single operational group above.
   containers;
 - destination-port row compatibility;
 - aggregate import capacity reservation and large-pair preservation.
+- 45-ft containers may use only the explicitly identified edge large-bay
+  positions of an area; 20-ft containers may not use those positions, and an
+  area's edge positions cannot simultaneously host new 45-ft and non-45-ft
+  assignments. This is a hard overlength-clearance rule, not a preference.
 
 ## Retained objectives
+
+Column generation is strict over the explicitly declared finite pattern
+universe. For every feasible group/bay/integer-quantity combination, the
+planner enumerates the model's deterministic row-packing patterns (up to six
+distinct patterns per combination). Pricing reads the exact Gurobi reduced cost of every inactive pattern,
+activates every negative-reduced-cost pattern, and repeats until none remains.
+A time limit cannot silently terminate this certificate phase; failure to
+reach reduced-cost convergence is an error.
 
 The integer restricted master is solved in two lexicographic stages. Stage 1
 minimizes the number of unplaced declared containers. Stage 2 fixes that
@@ -90,6 +102,11 @@ The stage-2 integer solution is the final reported allocation. There is no
 post-solve intra-area row relayout or separate heuristic objective; row-level
 placement patterns must enter the generated column pool and are selected by
 the same restricted master.
+
+The reduced-cost certificate applies to the complete declared finite pattern
+universe. The final integer optimization remains a restricted-master MIP, not
+branch-and-price, so its MIP gap is interpreted only for the activated integer
+column pool.
 
 One pair-state variable is used for both large-container preservation and
 import reservation. Assigning a 20-ft container to either member makes the
