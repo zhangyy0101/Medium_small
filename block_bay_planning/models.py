@@ -148,15 +148,14 @@ class Bay:
 class BigPlanRow:
     """大计划输出的一行。
 
-    `size_mode` 使用大计划口径，只允许 `20`、`40` 或 `ALL`。其中 `40`
-    同时包含真实 40ft 和真实 45ft。
+    `size_mode` 只允许 `20` 或 `40`；其中 `40` 同时包含真实40ft和45ft。
     """
 
     voyage_id: str
     flow: str
     area_no: str
     new_boxes: int
-    size_mode: str = "ALL"
+    size_mode: str
     plan_date: str = ""
 
     @property
@@ -173,14 +172,6 @@ class VoyageSchedule:
     berth_no: str
     berth_time: datetime
     departure_time: datetime
-
-
-@dataclass(frozen=True)
-class AreaOperation:
-    area_no: str
-    voyage_id: str
-    start_time: datetime
-    end_time: datetime
 
 
 @dataclass(frozen=True)
@@ -217,7 +208,6 @@ class ProblemData:
     planning_time: datetime
     horizon_hours: float
     voyage_windows: dict[str, tuple[datetime, datetime]]
-    area_operations: dict[str, list[AreaOperation]]
     target_voyages: list[str]
     export_voyages: set[str] | None = None
     import_area_size_reservation: dict[tuple[str, str], int] = field(default_factory=dict)

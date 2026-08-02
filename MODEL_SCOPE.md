@@ -9,6 +9,11 @@ long-format big-plan file, this project reads `new_qty` only:
 - `planned_qty`: snapshot occupancy plus `new_qty`, and is never used as
   downstream demand or reservation.
 
+The upstream size field is mandatory and must be either `20` or `40`. The
+upstream `40` class combines physical 40-ft and 45-ft containers. Blank,
+unknown, `45`, and aggregate-size values are rejected instead of silently
+converted.
+
 The detailed model allocates declared, not-yet-arrived export containers to
 yard rows. Import containers do not receive bay or row decisions.
 
@@ -24,10 +29,14 @@ yard rows. Import containers do not receive bay or row decisions.
 - Incumbent import containers are conservatively assumed not to leave during
   the planning horizon because release-time data are unavailable.
 
+The model is static and conservative: incumbent containers remain occupied
+throughout the horizon, while every declared export container in the demand
+set is assumed to enter before the end of the horizon and still occupy yard
+capacity at that point.
+
 Import reservations consume aggregate area capacity but are not assigned to a
-specific bay or row. Known 40/45-ft import quantities additionally require
-sufficient usable large-container pair capacity. `ALL` quantities remain
-slot-equivalent reservations because their size composition is unavailable.
+specific bay or row. Large-container import quantities additionally require
+sufficient usable 40/45-ft pair capacity.
 
 ## Detailed decision level
 
@@ -43,7 +52,7 @@ All active grouping rules resolve to the single operational group above.
 
 ## Core hard constraints
 
-- declared export demand balance, with penalized unplaced quantity;
+- declared export demand balance with an explicit unplaced slack variable;
 - physical, size-specific, stack, bay-row, and row-size capacity;
 - paired-slot footprint for 40 ft and 45 ft containers;
 - area-function compatibility;
@@ -61,12 +70,20 @@ containers is minimized first. The following operational criteria are then
 evaluated for solutions with the same unplaced quantity:
 
 - deviation from the normalized upstream area-size guidance target;
-- berth-to-yard distance and concurrent-operation conflict;
+- quantity-weighted berth-to-yard distance;
 - operational-group area dispersion;
 - operational-group row dispersion;
 - proximity to incumbent containers of the exact same operational group;
 - exact loss of usable 40/45-ft pair capacity caused by assigning 20-ft
   containers to a pair member.
+
+Secondary criteria are normalized by a natural instance scale before their
+weights are applied: guided demand for area deviation, operational-group count
+for area activation, declared demand for row activation and incumbent
+proximity, total usable pair capacity for large-pair loss, and the product of
+maximum berth distance and declared demand for travel. Thus the reported
+weights express policy trade-offs rather than compensate for incompatible raw
+units.
 
 ## Removed from the paper model
 
@@ -85,3 +102,10 @@ evaluated for solutions with the same unplaced quantity:
 - misplaced-bay exclusion ratio;
 - post-window loading rewards;
 - document-floor and forecast-fallback demand construction.
+- concurrent-operation conflict penalties.
+
+When a voyage-size demand has no matching upstream allocation, it is excluded
+from the area-guidance deviation objective. Its location is determined by
+physical feasibility, dispersion, incumbent proximity, large-pair
+preservation, and quantity-weighted berth distance; a zero target is never
+created for missing guidance.

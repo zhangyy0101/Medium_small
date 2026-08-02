@@ -266,7 +266,7 @@ class BigPlanRow:
     flow: str
     area_no: str
     new_boxes: int
-    size_mode: str = "ALL"
+    size_mode: str
     plan_date: str = ""
 
     @property
@@ -283,14 +283,6 @@ class VoyageSchedule:
     berth_no: str
     berth_time: datetime
     departure_time: datetime
-
-
-@dataclass(frozen=True)
-class AreaOperation:
-    area_no: str
-    voyage_id: str
-    start_time: datetime
-    end_time: datetime
 
 
 @dataclass(frozen=True)
@@ -321,7 +313,6 @@ class ProblemData:
     planning_time: datetime
     horizon_hours: float
     voyage_windows: dict[str, tuple[datetime, datetime]]
-    area_operations: dict[str, list[AreaOperation]]
     target_voyages: list[str]
     export_voyages: set[str] | None = None
     import_area_size_reservation: dict[tuple[str, str], int] = field(default_factory=dict)
@@ -529,9 +520,12 @@ def normalize_size_small(value: Any) -> str:
 
 def normalize_big_plan_size(value: Any) -> str:
     code = normalize_code(value)
-    if code == "ALL":
-        return "ALL"
-    return normalize_size_small(code) if code else "ALL"
+    if code in {"20", "40"}:
+        return code
+    raise ValueError(
+        f"big-plan size must be 20 or 40, got {value!r}; "
+        "ALL, 45, blank, and unknown values are not accepted"
+    )
 
 
 def normalize_flow(value: Any, aliases: Mapping[str, str] | None = None, default: str = "") -> str:
@@ -3062,7 +3056,6 @@ def medium_demand_caps_from_big_plan(
     voyage_set = {normalize_voyage(voyage_id) for voyage_id in target_voyages}
     normalized_flows = {medium_small_area_flow(flow) for flow in target_flows}
     size_pool: Counter[tuple[str, str, str]] = Counter()
-    all_size_pool: Counter[tuple[str, str]] = Counter()
     for row in big_plan:
         if row.voyage_id not in voyage_set:
             continue
@@ -3071,20 +3064,13 @@ def medium_demand_caps_from_big_plan(
             continue
         if row.plan_date and row.plan_date != plan_date:
             continue
-        if row.size_mode == "ALL":
-            all_size_pool[(row.voyage_id, row_flow)] += row.new_boxes
-        else:
-            size_pool[(row.voyage_id, row_flow, "40" if row.size_mode == "45" else row.size_mode)] += row.new_boxes
+        size_pool[(row.voyage_id, row_flow, row.size_mode)] += row.new_boxes
 
     caps: dict[tuple[str, str, str], int] = {}
     for (voyage_id, flow, size_mode), qty in size_pool.items():
         if qty <= 0:
             continue
         caps[(voyage_id, flow, size_mode)] = qty
-    for (voyage_id, flow), qty in all_size_pool.items():
-        if qty <= 0 or any(v == voyage_id and f == flow for v, f, _size in size_pool):
-            continue
-        caps[(voyage_id, flow, "ALL")] = qty
     return caps
 
 
@@ -3101,8 +3087,6 @@ def cap_demand_rows_by_big_plan(
         total = sum(item.planned_boxes for item in items)
         cap_flow = medium_small_area_flow(key[1])
         cap = big_plan_caps.get((key[0], cap_flow, key[2]))
-        if cap is None:
-            cap = big_plan_caps.get((key[0], cap_flow, "ALL"))
         if cap is None:
             continue
         if total <= cap:
@@ -3243,7 +3227,6 @@ def read_big_plan(large_plan: pd.DataFrame) -> list[BigPlanRow]:
     ):
         qty20_field = _first_existing(fieldnames, ["qty_20", "planned_20", "20", "c20", "C20"])
         qty40_field = _first_existing(fieldnames, ["qty_40", "planned_40", "40", "c40", "C40"])
-        qty45_field = _first_existing(fieldnames, ["qty_45", "planned_45", "45", "c45", "C45"])
         date_field = _first_existing(fieldnames, ["plan_date", "date", "work_date", "planning_date", "day"])
         flow_field = _first_existing(fieldnames, ["flow", "cntr_type", "status"])
         for row in reader:
@@ -3251,7 +3234,7 @@ def read_big_plan(large_plan: pd.DataFrame) -> list[BigPlanRow]:
             voyage_id = normalize_voyage(row.get("voyage_id"))
             area_no = normalize_code(row.get("area_no"))
             plan_date = date_key(normalize_text(row.get(date_field))) if date_field else ""
-            for size_mode, field_name in (("20", qty20_field), ("40", qty40_field), ("45", qty45_field)):
+            for size_mode, field_name in (("20", qty20_field), ("40", qty40_field)):
                 if not field_name:
                     continue
                 boxes = int(round(float(row.get(field_name, 0) or 0)))
@@ -3365,8 +3348,6 @@ def load_port_demand_groups(
         cap = None
         if big_plan_caps:
             cap = big_plan_caps.get(cap_key)
-            if cap is None:
-                cap = big_plan_caps.get((cap_key[0], cap_key[1], "ALL"))
             if cap is None:
                 continue
         target_total = min(total, int(cap)) if cap is not None else total
@@ -4219,23 +4200,6 @@ def nearest_safe_block_end(ordered_bays: list[str], big_bay_starts: set[str], st
     return len(ordered_bays)
 
 
-def build_area_operations(input_guandong: InputAdapterGd, vessel_schedules: dict[str, VoyageSchedule]) -> dict[str, list[AreaOperation]]:
-    operations: defaultdict[str, list[AreaOperation]] = defaultdict(list)
-    tops = active_tops_rows(input_guandong, datetime.max.replace(year=2099))
-    if tops.empty:
-        return dict(operations)
-    for row in tops.to_dict("records"):
-        start_area, _ = parse_tops_area_bay(row.get("SPR_STBAY"))
-        end_area, _ = parse_tops_area_bay(row.get("SPR_EDBAY"))
-        area = start_area or end_area
-        voyage = normalize_voyage(row.get("condition_vessel"))
-        start_time = row.get("start_time")
-        end_time = row.get("end_time")
-        if area and voyage and start_time and end_time:
-            operations[area].append(AreaOperation(area, voyage, start_time, end_time))
-    return dict(operations)
-
-
 def build_problem(
     input_guandong: InputAdapterGd,
     big_plan: list[BigPlanRow],
@@ -4305,13 +4269,9 @@ def build_problem(
         big_size = "40" if group.size == "45" else group.size
         demand_by_voyage_size[(group.voyage_id, group.status, big_size)] += group.demand
     upstream_area_size_weights: Counter[tuple[str, str, str, str]] = Counter()
-    upstream_all_size_area_weights: Counter[tuple[str, str, str]] = Counter()
     for row in cleaned_plan:
         plan_flow = medium_small_area_flow(row.flow)
-        if row.size_mode == "ALL":
-            upstream_all_size_area_weights[(row.voyage_id, plan_flow, row.area_no)] += row.new_boxes
-        else:
-            upstream_area_size_weights[(row.voyage_id, plan_flow, row.area_no, row.size_mode)] += row.new_boxes
+        upstream_area_size_weights[(row.voyage_id, plan_flow, row.area_no, row.size_mode)] += row.new_boxes
 
     # Import new_qty is reserved in aggregate. Export new_qty is not a demand
     # or reservation in this model; it supplies only an area-distribution
@@ -4345,21 +4305,6 @@ def build_problem(
                         area_guidance_target[(voyage_id, flow, area_no, size_mode)] = qty
                         assigned_areas[(voyage_id, flow)].add(area_no)
                     continue
-                all_size_weights = Counter(
-                    {
-                        area_no: qty
-                        for (v, f, area_no), qty in upstream_all_size_area_weights.items()
-                        if v == voyage_id and f in compatible_plan_flows and qty > 0
-                    }
-                )
-                if not all_size_weights:
-                    continue
-                allocations = allocate_by_weights(dict(all_size_weights), target_qty)
-                for area_no, qty in allocations.items():
-                    if qty <= 0:
-                        continue
-                    area_guidance_target[(voyage_id, flow, area_no, size_mode)] = qty
-                    assigned_areas[(voyage_id, flow)].add(area_no)
     voyage_windows = {
         voyage_id: (
             vessel_schedules[voyage_id].receive_start if voyage_id in vessel_schedules else planning_time,
@@ -4386,7 +4331,6 @@ def build_problem(
         set(bays),
         attribute_rules,
     )
-    area_operations = build_area_operations(input_guandong, vessel_schedules)
     berth_distances = read_distance_matrix(input_guandong)
     berth_by_voyage = {
         voyage_id: f"B{vessel_schedules[voyage_id].berth_no}"
@@ -4403,7 +4347,6 @@ def build_problem(
         planning_time=planning_time,
         horizon_hours=horizon_hours,
         voyage_windows=voyage_windows,
-        area_operations=area_operations,
         target_voyages=target_voyages,
         export_voyages=export_voyages,
         import_area_size_reservation=dict(import_area_size_reservation),

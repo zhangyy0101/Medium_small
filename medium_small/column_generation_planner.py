@@ -198,9 +198,7 @@ class ColumnGenerationConfig:
     medium_plan_quota: dict[tuple[str, str, str, str, str], int] | None = None
     medium_plan_bay_quota: dict[tuple[str, str, str, str, str, str], int] | None = None
     repair_can_exceed_medium_plan_quota: bool = False
-    unplaced_penalty: float = 100_000.0
-    document_unplaced_penalty_multiplier: float = 10.0
-    forecast_unplaced_penalty_multiplier: float = 1.0
+    pricing_unplaced_penalty: float = 1_000_000.0
     required_area_reward: float = 0.0
     existing_coarse_bay_reward: float = 48.0
     existing_coarse_neighbor_bay_reward: float = 24.0
@@ -232,8 +230,6 @@ class ColumnGenerationConfig:
     small_plan_coarse_area_block_split_penalty: float = 0.0
     small_plan_coarse_area_bay_split_penalty: float = 0.0
     berth_distance_penalty: float = 0.02
-    active_loading_area_penalty: float = 16.0
-    post_window_loading_area_reward: float = 0.0
     fallback_bay_penalty: float = 0.0
     non_preferred_block_penalty: float = 0.0
 
@@ -826,7 +822,7 @@ class ColumnGenerationPlanner:
                 "import_boxes": int(sum(self.import_area_size_reservation.values())),
                 "export_boxes": 0,
                 "export_policy": "no_forecast_reservation",
-                "all_size_policy": "aggregate_slot_equivalent_only",
+                "accepted_big_plan_sizes": ["20", "40"],
                 "import_by_area_size": {
                     f"{area}|{size}": int(qty)
                     for (area, size), qty in sorted(self.import_area_size_reservation.items())
@@ -863,12 +859,16 @@ class ColumnGenerationPlanner:
             "gurobi_available": False,
             "used_greedy_fallback": False,
             "concentration_penalties": {
-                "operational_group_area": self.config.small_plan_group_area_split_penalty,
-                "operational_group_row": self.config.small_plan_group_row_split_penalty,
-                "existing_exact_group_bay_reward": self.config.existing_coarse_bay_reward,
-                "existing_exact_group_neighbor_reward": self.config.existing_coarse_neighbor_bay_reward,
+                "operational_group_area": self._area_activation_penalty(),
+                "operational_group_row": self._row_activation_penalty(),
+                "existing_exact_group_bay_reward": (
+                    self.config.existing_coarse_bay_reward / max(1, sum(group.demand for group in self.groups))
+                ),
+                "existing_exact_group_neighbor_reward": (
+                    self.config.existing_coarse_neighbor_bay_reward / max(1, sum(group.demand for group in self.groups))
+                ),
                 "existing_exact_group_neighbor_max_bay_distance": self.config.existing_coarse_neighbor_max_bay_distance,
-                "twenty_large_segment_loss_penalty": self.config.twenty_large_segment_loss_penalty,
+                "twenty_large_pair_loss_penalty": self._twenty_segment_loss_penalty(),
             },
             "existing_operational_group_anchors": {
                 "mode": "exact_group_bay_proximity",
@@ -877,9 +877,9 @@ class ColumnGenerationPlanner:
                 "box_count": int(sum(self.existing_coarse_bay_load.values())),
             },
             "inheritance_penalties": {
-                "unplaced": self.config.unplaced_penalty,
+                "pricing_unplaced_penalty": self.config.pricing_unplaced_penalty,
                 "required_area_reward": self.config.required_area_reward,
-                "area_guidance_deviation": self.config.area_guidance_deviation_penalty,
+                "area_guidance_deviation": self._area_guidance_penalty(),
                 "big_plan_fallback_tier": self.config.big_plan_fallback_tier_penalty,
             },
             "export_e_area_controls": {
@@ -1425,20 +1425,17 @@ class ColumnGenerationPlanner:
         relayout_state["group_area_bay_load"][group_bay_key] += int(col.quantity)
         relayout_state["coarse_area_bay_load"][coarse_bay_key] += int(col.quantity)
 
-    def _solution_rank(self, selected: Counter[int], unplaced: Counter[str]) -> tuple[int, int, int, float, int]:
+    def _solution_rank(self, selected: Counter[int], unplaced: Counter[str]) -> tuple[int, float, int]:
         return (
-            self._document_unplaced_boxes(unplaced),
             sum(unplaced.values()),
-            self._twenty_run_violation_count(selected),
             self._selected_solution_energy(selected, unplaced),
             sum(1 for qty in selected.values() if qty > 0),
         )
 
     def _selected_solution_energy(self, selected: Counter[int], unplaced: Counter[str]) -> float:
-        energy = sum(
-            self._unplaced_penalty_for_group_id(group_id) * max(0, int(qty))
-            for group_id, qty in unplaced.items()
-        )
+        # Unplaced quantity is compared lexicographically in _solution_rank;
+        # it must not be blended into the secondary operational objective.
+        energy = 0.0
         actual_quota: Counter[tuple[str, str, str, str]] = Counter()
         actual_coarse_area: Counter[tuple[str, ...]] = Counter()
         used_group_area: set[tuple[tuple[str, ...], str]] = set()
@@ -1466,11 +1463,10 @@ class ColumnGenerationPlanner:
             if col.size == "20":
                 used_twenty_bays.add(col.bay_key)
 
-        energy += self.config.small_plan_group_area_split_penalty * len(used_group_area)
+        energy += self._area_activation_penalty() * len(used_group_area)
         energy += self.config.small_plan_group_block_split_penalty * len(used_group_block)
         energy += self.config.small_plan_coarse_area_block_split_penalty * len(used_coarse_area_block)
         energy += self.config.small_plan_coarse_area_bay_split_penalty * len(used_coarse_area_bay)
-        energy += sum(self._voyage_area_cost(voyage_id, area_no) for voyage_id, area_no in used_voyage_area)
         energy += self._twenty_segment_loss_penalty() * self._large_pair_capacity_loss(used_twenty_bays)
         energy += self._twenty_consecutive_violation_penalty() * max(
             0,
@@ -1478,14 +1474,14 @@ class ColumnGenerationPlanner:
             - self._twenty_run_violation_count_for_bays(set(self.existing_twenty_bays)),
         )
 
-        target_keys = set(actual_quota)
+        target_keys: set[tuple[str, str, str, str]] = set()
         for key, qty in self.quota_by_key.items():
             voyage_id, flow, _area_no, big_size = key
             if qty > 0 and self.voyage_flow_size_demand[(voyage_id, flow, big_size)] > 0:
                 target_keys.add(key)
         for voyage_id, flow, area_no, big_size in target_keys:
             target = self._area_size_target(voyage_id, flow, area_no, big_size)
-            energy += self.config.area_guidance_deviation_penalty * abs(actual_quota.get((voyage_id, flow, area_no, big_size), 0) - target)
+            energy += self._area_guidance_penalty() * abs(actual_quota.get((voyage_id, flow, area_no, big_size), 0) - target)
 
         by_coarse: defaultdict[tuple[str, ...], list[float]] = defaultdict(list)
         for key, qty in actual_coarse_area.items():
@@ -1517,11 +1513,7 @@ class ColumnGenerationPlanner:
         return float(energy)
 
     def _document_unplaced_boxes(self, unplaced: Counter[str]) -> int:
-        return sum(
-            max(0, int(qty))
-            for group_id, qty in unplaced.items()
-            if self.group_source.get(group_id, "document") == "document"
-        )
+        return sum(max(0, int(qty)) for qty in unplaced.values())
 
     def _source_rank_for_group_id(self, group_id: str) -> int:
         return 0 if self.group_source.get(group_id, "document") == "document" else 1
@@ -1530,23 +1522,11 @@ class ColumnGenerationPlanner:
         return self._source_rank_for_group_id(group.group_id)
 
     def _unplaced_penalty_for_group_id(self, group_id: str) -> float:
-        source = self.group_source.get(group_id, "document")
-        multiplier = (
-            self.config.document_unplaced_penalty_multiplier
-            if source == "document"
-            else self.config.forecast_unplaced_penalty_multiplier
-        )
-        return float(self.config.unplaced_penalty) * max(0.0, float(multiplier))
+        return max(1.0, float(self.config.pricing_unplaced_penalty))
 
     def _unplaced_objective_for_group(self, group: SmallBoxGroup, objective_mode: str) -> float:
         if objective_mode == "min_unplaced":
-            source = self.group_source.get(group.group_id, "document")
-            multiplier = (
-                self.config.document_unplaced_penalty_multiplier
-                if source == "document"
-                else self.config.forecast_unplaced_penalty_multiplier
-            )
-            return max(1.0, float(multiplier))
+            return 1.0
         return self._unplaced_penalty_for_group_id(group.group_id)
 
     def _area_fallback_tier_penalty_for_column(self, col: PlacementColumn) -> float:
@@ -2825,8 +2805,7 @@ class ColumnGenerationPlanner:
 
         A pair is lost once any selected 20-ft placement occupies either
         member. Known 40/45-ft import reservations must fit in the remaining
-        pair capacity. ``ALL`` reservations stay in the aggregate slot limit
-        because their size composition is unavailable.
+        pair capacity.
         """
         lost_by_pair = {}
         loss_link = {}
@@ -2999,7 +2978,7 @@ class ColumnGenerationPlanner:
         coarse_area_bay_cols,
         voyage_area_cols,
     ) -> dict[str, dict]:
-        area_size_keys = set(area_size_cols)
+        area_size_keys: set[tuple[str, str, str, str]] = set()
         for key, qty in self.quota_by_key.items():
             voyage_id, flow, _area_no, big_size = key
             if qty > 0 and self.voyage_flow_size_demand[(voyage_id, flow, big_size)] > 0:
@@ -3010,28 +2989,19 @@ class ColumnGenerationPlanner:
             items = area_size_cols.get(key, [])
             voyage_id, flow, area_no, big_size = key
             target = self._area_size_target(voyage_id, flow, area_no, big_size)
-            pos = model.addVar(lb=0.0, obj=self.config.area_guidance_deviation_penalty, name=f"lp_guide_pos_{len(model.getVars())}")
-            neg = model.addVar(lb=0.0, obj=self.config.area_guidance_deviation_penalty, name=f"lp_guide_neg_{len(model.getVars())}")
+            pos = model.addVar(lb=0.0, obj=self._area_guidance_penalty(), name=f"lp_guide_pos_{len(model.getVars())}")
+            neg = model.addVar(lb=0.0, obj=self._area_guidance_penalty(), name=f"lp_guide_neg_{len(model.getVars())}")
             actual = quicksum(col.quantity * columns[idx] for idx, col in items)
             area_guidance_balance[key] = model.addCons(actual - target == pos - neg)
 
         fixed_use_constraints = {}
         for key, indices in group_area_cols.items():
-            use = model.addVar(lb=0.0, ub=1.0, obj=self.config.small_plan_group_area_split_penalty)
+            use = model.addVar(lb=0.0, ub=1.0, obj=self._area_activation_penalty())
             fixed_use_constraints[("group_area",) + key] = model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
         if self.config.small_plan_group_block_split_penalty > 0:
             for key, indices in group_block_cols.items():
                 use = model.addVar(lb=0.0, ub=1.0, obj=self.config.small_plan_group_block_split_penalty)
                 fixed_use_constraints[("group_block",) + key] = model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
-        for (voyage_id, area_no), indices in voyage_area_cols.items():
-            cost = self._voyage_area_cost(voyage_id, area_no)
-            if abs(cost) <= 1e-9:
-                continue
-            use = model.addVar(lb=0.0, ub=1.0, obj=cost)
-            total = quicksum(columns[idx] for idx in indices)
-            fixed_use_constraints[("voyage_area", voyage_id, area_no)] = model.addCons(total <= len(indices) * use)
-            if cost < 0:
-                fixed_use_constraints[("voyage_area_reward", voyage_id, area_no)] = model.addCons(use <= total)
         return {
             "area_guidance_balance": area_guidance_balance,
             "fixed_use_objective_limit": fixed_use_constraints,
@@ -3068,7 +3038,7 @@ class ColumnGenerationPlanner:
             coarse_area_keys = set(coarse_area_cols)
             self._add_coarse_group_area_objectives(quicksum, model, columns, coarse_area_keys, coarse_area_cols)
 
-        area_size_keys = set(area_size_cols)
+        area_size_keys: set[tuple[str, str, str, str]] = set()
         for key, qty in self.quota_by_key.items():
             voyage_id, flow, _area_no, big_size = key
             if qty > 0 and self.voyage_flow_size_demand[(voyage_id, flow, big_size)] > 0:
@@ -3077,26 +3047,19 @@ class ColumnGenerationPlanner:
             items = area_size_cols.get(key, [])
             voyage_id, flow, area_no, big_size = key
             target = self._area_size_target(voyage_id, flow, area_no, big_size)
-            pos = model.addVar(lb=0.0, obj=self.config.area_guidance_deviation_penalty, name=f"guide_pos_{len(model.getVars())}")
-            neg = model.addVar(lb=0.0, obj=self.config.area_guidance_deviation_penalty, name=f"guide_neg_{len(model.getVars())}")
+            pos = model.addVar(lb=0.0, obj=self._area_guidance_penalty(), name=f"guide_pos_{len(model.getVars())}")
+            neg = model.addVar(lb=0.0, obj=self._area_guidance_penalty(), name=f"guide_neg_{len(model.getVars())}")
             actual = quicksum(col.quantity * columns[idx] for idx, col in items)
             model.addCons(actual - target == pos - neg)
 
         for (fine_key, area_no), indices in group_area_cols.items():
-            use = model.addVar(vtype="B", obj=self.config.small_plan_group_area_split_penalty, name=f"use_ga_{self._key_name(fine_key)}_{area_no}")
+            use = model.addVar(vtype="B", obj=self._area_activation_penalty(), name=f"use_ga_{self._key_name(fine_key)}_{area_no}")
             model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
         if self.config.small_plan_group_block_split_penalty > 0:
             for (fine_key, block_id), indices in group_block_cols.items():
                 use = model.addVar(vtype="B", obj=self.config.small_plan_group_block_split_penalty, name=f"use_gb_{self._key_name(fine_key)}_{block_id}")
                 model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
 
-        for (voyage_id, area_no), indices in voyage_area_cols.items():
-            cost = self._voyage_area_cost(voyage_id, area_no)
-            use = model.addVar(vtype="B", obj=cost, name=f"use_va_{voyage_id}_{area_no}")
-            total = quicksum(columns[idx] for idx in indices)
-            model.addCons(total <= len(indices) * use)
-            if cost < 0:
-                model.addCons(use <= total)
 
         for area_no in set(edge_45_cols) | set(edge_non45_cols):
             has45 = model.addVar(vtype="B", name=f"area_has45_{area_no}")
@@ -3291,12 +3254,12 @@ class ColumnGenerationPlanner:
     ) -> None:
         use_by_bay_attr: defaultdict[tuple[str, str, str], list] = defaultdict(list)
         for (bay_key, attr, scope, value), indices in sorted(bay_attr_choice_cols.items()):
-            scope_name = scope or "ALL"
+            scope_name = scope or "GLOBAL"
             use = model.addVar(vtype="B", name=f"bay_use_{attr}_{scope_name}_{bay_key}_{value}")
             model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
             use_by_bay_attr[(bay_key, attr, scope)].append(use)
         for (bay_key, attr, scope), uses in use_by_bay_attr.items():
-            scope_name = scope or "ALL"
+            scope_name = scope or "GLOBAL"
             model.addCons(quicksum(uses) <= 1, name=f"bay_one_{attr}_{scope_name}_{bay_key}")
 
     def _add_row_compatibility_constraints(
@@ -3308,12 +3271,12 @@ class ColumnGenerationPlanner:
     ) -> None:
         use_by_row_attr: defaultdict[tuple[str, str, str, str], list] = defaultdict(list)
         for (bay_key, row_no, attr, scope, value), indices in sorted(row_attr_choice_cols.items()):
-            scope_name = scope or "ALL"
+            scope_name = scope or "GLOBAL"
             use = model.addVar(vtype="B", name=f"row_use_{attr}_{scope_name}_{bay_key}_{row_no}_{value}")
             model.addCons(quicksum(columns[idx] for idx in indices) <= len(indices) * use)
             use_by_row_attr[(bay_key, row_no, attr, scope)].append(use)
         for (bay_key, row_no, attr, scope), uses in use_by_row_attr.items():
-            scope_name = scope or "ALL"
+            scope_name = scope or "GLOBAL"
             model.addCons(quicksum(uses) <= 1, name=f"row_one_{attr}_{scope_name}_{bay_key}_{row_no}")
 
     def _price_columns(
@@ -3438,7 +3401,7 @@ class ColumnGenerationPlanner:
                     voyage_area_key = ("voyage_area", group.voyage_id, area_no)
                     reduced = (
                         base_cost
-                        + self.config.small_plan_group_row_split_penalty
+                        + self._row_activation_penalty()
                         - group_dual.get(group.group_id, 0.0) * qty
                         - bay_capacity_dual.get(bay_key, 0.0) * qty
                         - bay_size_dual.get((bay_key, group.size), 0.0) * qty
@@ -3455,18 +3418,14 @@ class ColumnGenerationPlanner:
                         + self._fixed_use_reduced_adjustment(
                             fixed_use_dual,
                             group_area_key,
-                            self.config.small_plan_group_area_split_penalty,
+                            self._area_activation_penalty(),
                         )
                         + self._fixed_use_reduced_adjustment(
                             fixed_use_dual,
                             coarse_area_bay_key,
                             self.config.small_plan_coarse_area_bay_split_penalty,
                         )
-                        + self._fixed_use_reduced_adjustment(
-                            fixed_use_dual,
-                            voyage_area_key,
-                            self._voyage_area_cost(group.voyage_id, area_no),
-                        )
+                        + self._berth_distance_cost(group.voyage_id, area_no, qty)
                     )
                     if block_id:
                         reduced += self._fixed_use_reduced_adjustment(
@@ -3602,7 +3561,7 @@ class ColumnGenerationPlanner:
             0 if quota_gap > 1e-6 else 1,
             -min(float(qty), max(0.0, quota_gap)),
             shape_score,
-            self._voyage_area_cost(group.voyage_id, area_no),
+            self._berth_distance_cost(group.voyage_id, area_no, qty),
             base_cost,
             -qty,
             bay.bay_order,
@@ -4102,7 +4061,7 @@ class ColumnGenerationPlanner:
             }
             if not used_rows:
                 used_rows = {str(row_no) for _footprint_key, row_no, qty in allocation if int(qty) > 0}
-            row_dispersion_cost = self.config.small_plan_group_row_split_penalty * len(used_rows)
+            row_dispersion_cost = self._row_activation_penalty() * len(used_rows)
             col = PlacementColumn(
                 column_id=column_id,
                 group_id=group.group_id,
@@ -4129,7 +4088,11 @@ class ColumnGenerationPlanner:
                 fine_key=self._fine_key(group),
                 coarse_cluster_key=self._coarse_cluster_key(group),
                 fine_cluster_key=self._fine_cluster_key(group),
-                intrinsic_cost=base_cost + row_dispersion_cost,
+                intrinsic_cost=(
+                    base_cost
+                    + row_dispersion_cost
+                    + self._berth_distance_cost(group.voyage_id, bay.area_no, quantity)
+                ),
             )
             idx = len(self._columns)
             self._columns.append(col)
@@ -4573,11 +4536,11 @@ class ColumnGenerationPlanner:
 
         score = (
             base_cost
-            + self.config.small_plan_group_row_split_penalty
+            + self._row_activation_penalty()
         )
 
         if (fine_key, area_no) not in state["used_group_area"]:
-            score += self.config.small_plan_group_area_split_penalty
+            score += self._area_activation_penalty()
         if block_id and (fine_key, block_id) not in state["used_group_block"]:
             score += self.config.small_plan_group_block_split_penalty
         if block_id and coarse_key + (area_no, block_id) not in state["used_coarse_area_block"]:
@@ -4586,14 +4549,14 @@ class ColumnGenerationPlanner:
             score += self.config.small_plan_coarse_area_bay_split_penalty
         if self._user_bay_policy_requires(group, bay_key):
             score -= float(self.config.required_area_reward)
-        if (group.voyage_id, area_no) not in state["used_voyage_area"]:
-            score += self._voyage_area_cost(group.voyage_id, area_no)
+        score += self._berth_distance_cost(group.voyage_id, area_no, qty)
 
         before_quota = state["big_plan_quota_used"][quota_key]
         target = self._area_size_target(group.voyage_id, group.status, area_no, self._big_plan_size(group.size))
-        score += self.config.area_guidance_deviation_penalty * (
-            abs(before_quota + qty - target) - abs(before_quota - target)
-        )
+        if self._has_area_guidance(group.voyage_id, group.status, self._big_plan_size(group.size)):
+            score += self._area_guidance_penalty() * (
+                abs(before_quota + qty - target) - abs(before_quota - target)
+            )
         score += (
             coarse_area_incremental_cost
             if coarse_area_incremental_cost is not None
@@ -5209,7 +5172,11 @@ class ColumnGenerationPlanner:
             cost -= float(self.config.required_area_reward)
         existing_bay_load = self._existing_coarse_bay_load_for_group(group, bay_key)
         if existing_bay_load > 0:
-            cost -= float(self.config.existing_coarse_bay_reward) * min(5, existing_bay_load)
+            cost -= (
+                float(self.config.existing_coarse_bay_reward)
+                * min(5, existing_bay_load)
+                / max(1, sum(item.demand for item in self.groups))
+            )
         else:
             same_distance = self._existing_same_coarse_bay_distance(group, bay_key)
             if same_distance is not None:
@@ -5217,7 +5184,11 @@ class ColumnGenerationPlanner:
             else:
                 existing_other_load = self._existing_other_coarse_bay_load_for_group(group, bay_key)
                 if existing_other_load > 0:
-                    cost += float(self.config.existing_other_coarse_bay_penalty) * min(5, existing_other_load)
+                    cost += (
+                        float(self.config.existing_other_coarse_bay_penalty)
+                        * min(5, existing_other_load)
+                        / max(1, sum(item.demand for item in self.groups))
+                    )
                 other_distance = self._existing_other_coarse_bay_distance(group, bay_key)
                 if other_distance is not None:
                     cost += self._existing_other_neighbor_penalty(other_distance)
@@ -5628,7 +5599,8 @@ class ColumnGenerationPlanner:
         return float(getattr(self.config, "twenty_large_segment_fresh_loss_penalty", 0.0) or 0.0) * loss
 
     def _twenty_segment_loss_penalty(self) -> float:
-        return max(0.0, float(getattr(self.config, "twenty_large_segment_loss_penalty", 0.0) or 0.0))
+        total_pair_capacity = max(1, int(sum(self.large_pair_capacity.values())))
+        return max(0.0, float(getattr(self.config, "twenty_large_segment_loss_penalty", 0.0) or 0.0)) / total_pair_capacity
 
     def _twenty_consecutive_violation_penalty(self) -> float:
         return max(0.0, float(getattr(self.config, "twenty_consecutive_violation_penalty", 0.0) or 0.0))
@@ -5650,7 +5622,7 @@ class ColumnGenerationPlanner:
                 if (
                     row.voyage_id == voyage_id
                     and row.flow in compatible
-                    and (row_size == big_size or row.size_mode == "ALL")
+                    and row_size == big_size
                 ):
                     self.quota_by_key[(voyage_id, flow, row.area_no, big_size)] += row.new_boxes
 
@@ -5795,14 +5767,22 @@ class ColumnGenerationPlanner:
         if max_distance <= 0 or distance > max_distance:
             return 0.0
         scale = (max_distance - int(distance) + 1) / (max_distance + 1)
-        return float(self.config.existing_coarse_neighbor_bay_reward) * scale
+        return (
+            float(self.config.existing_coarse_neighbor_bay_reward)
+            * scale
+            / max(1, sum(group.demand for group in self.groups))
+        )
 
     def _existing_other_neighbor_penalty(self, distance: int) -> float:
         max_distance = max(0, int(getattr(self.config, "existing_coarse_neighbor_max_bay_distance", 0) or 0))
         if max_distance <= 0 or distance > max_distance:
             return 0.0
         scale = (max_distance - int(distance) + 1) / (max_distance + 1)
-        return float(self.config.existing_other_coarse_neighbor_bay_penalty) * scale
+        return (
+            float(self.config.existing_other_coarse_neighbor_bay_penalty)
+            * scale
+            / max(1, sum(group.demand for group in self.groups))
+        )
 
     def _existing_other_coarse_bay_load_for_group(self, group: SmallBoxGroup, bay_key: str) -> int:
         coarse_key = self._existing_anchor_key(group)
@@ -5905,20 +5885,43 @@ class ColumnGenerationPlanner:
             return 0.0
         return demand * self.quota_by_key.get((voyage_id, flow, area_no, big_size), 0) / total
 
-    def _voyage_area_cost(self, voyage_id: str, area_no: str) -> float:
-        cost = 0.0
-        if area_no in getattr(self.problem, "user_voyage_area_requirements", {}).get(voyage_id, set()):
-            cost -= float(self.config.required_area_reward)
+    def _has_area_guidance(self, voyage_id: str, flow: str, big_size: str) -> bool:
+        return any(
+            v == voyage_id and f == flow and size == big_size and qty > 0
+            for (v, f, _area, size), qty in self.quota_by_key.items()
+        )
+
+    def _area_guidance_penalty(self) -> float:
+        guided_boxes = max(1, int(sum(self.quota_by_key.values())))
+        return float(self.config.area_guidance_deviation_penalty) / guided_boxes
+
+    def _area_activation_penalty(self) -> float:
+        return float(self.config.small_plan_group_area_split_penalty) / max(1, len(self.groups))
+
+    def _row_activation_penalty(self) -> float:
+        total_boxes = max(1, int(sum(group.demand for group in self.groups)))
+        return float(self.config.small_plan_group_row_split_penalty) / total_boxes
+
+    def _berth_distance_cost(self, voyage_id: str, area_no: str, quantity: int) -> float:
+        """Quantity-weighted berth-to-yard travel cost."""
         berth = self.problem.berth_by_voyage.get(voyage_id, "")
-        if berth:
-            distance = self.problem.berth_distances.get((area_no, berth))
-            if distance is not None:
-                cost += self.config.berth_distance_penalty * distance / 100.0
-        if self._area_has_loading_during_window(voyage_id, area_no):
-            cost += self.config.active_loading_area_penalty
-        if self._area_has_loading_after_window(voyage_id, area_no):
-            cost -= self.config.post_window_loading_area_reward
-        return cost
+        if not berth:
+            return 0.0
+        distance = self.problem.berth_distances.get((area_no, berth))
+        if distance is None:
+            return 0.0
+        max_distance = max(
+            (float(value) for value in self.problem.berth_distances.values() if float(value) > 0),
+            default=1.0,
+        )
+        total_boxes = max(1, int(sum(group.demand for group in self.groups)))
+        return (
+            float(self.config.berth_distance_penalty)
+            * float(distance)
+            / max_distance
+            * max(0, int(quantity))
+            / total_boxes
+        )
 
     def _user_required_area_usage(self, medium_rows: list[dict], small_rows: list[dict]) -> dict:
         requirements = getattr(self.problem, "user_voyage_area_requirements", {})
@@ -6140,21 +6143,6 @@ class ColumnGenerationPlanner:
             )
         return details
 
-    def _area_has_loading_during_window(self, voyage_id: str, area_no: str) -> bool:
-        window_start, window_end = self.problem.voyage_windows[voyage_id]
-        return any(
-            op.voyage_id != voyage_id and _time_windows_overlap(op.start_time, op.end_time, window_start, window_end)
-            for op in self.problem.area_operations.get(area_no, [])
-        )
-
-    def _area_has_loading_after_window(self, voyage_id: str, area_no: str) -> bool:
-        _window_start, window_end = self.problem.voyage_windows[voyage_id]
-        prefer_end = window_end + timedelta(hours=24)
-        return any(
-            op.voyage_id != voyage_id and _time_windows_overlap(op.start_time, op.end_time, window_end, prefer_end)
-            for op in self.problem.area_operations.get(area_no, [])
-        )
-
     def _medium_big_plan_inheritance_stats(self, medium_rows: list[dict]) -> dict[str, float | int]:
         actual = self._medium_area_size_counter(medium_rows)
         total = sum(actual.values())
@@ -6180,8 +6168,8 @@ class ColumnGenerationPlanner:
                 components["big_plan_fallback_tier"] += self.config.big_plan_fallback_tier_penalty * tier * qty
 
         targets = self._effective_big_plan_area_size_targets()
-        for key in set(actual) | set(targets):
-            components["area_guidance_deviation"] += self.config.area_guidance_deviation_penalty * abs(
+        for key in set(targets):
+            components["area_guidance_deviation"] += self._area_guidance_penalty() * abs(
                 actual.get(key, 0) - targets.get(key, 0.0)
             )
         components["total"] = sum(components.values())
@@ -6599,8 +6587,6 @@ class ColumnGenerationPlanner:
                     "size": size,
                     "window_start": window_start.isoformat(sep=" "),
                     "window_end": window_end.isoformat(sep=" "),
-                    "area_loading_during_window": self._area_has_loading_during_window(voyage_id, area_no),
-                    "area_loading_after_window_24h": self._area_has_loading_after_window(voyage_id, area_no),
                     "area_no": area_no,
                     "planned_boxes": qty,
             }
@@ -7094,8 +7080,4 @@ def write_columns(path: str | Path, columns: Iterable[PlacementColumn]) -> None:
 def write_json(path: str | Path, payload: dict) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def _time_windows_overlap(start_a: datetime, end_a: datetime, start_b: datetime, end_b: datetime) -> bool:
-    return start_a < end_b and start_b < end_a
 
