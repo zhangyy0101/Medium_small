@@ -5978,19 +5978,20 @@ class ColumnGenerationPlanner:
         """Quantity-weighted berth-to-yard travel cost."""
         berth = self.problem.berth_by_voyage.get(voyage_id, "")
         if not berth:
-            return 0.0
+            raise ValueError(
+                f"missing berth mapping for detailed export voyage {voyage_id}"
+            )
         distance = self.problem.berth_distances.get((area_no, berth))
-        berth_distances = [
-            float(value)
-            for (candidate_area, candidate_berth), value in self.problem.berth_distances.items()
-            if candidate_berth == berth and float(value) > 0
-        ]
-        if not berth_distances:
-            # The whole voyage is excluded when its berth has no distance data.
-            return 0.0
         if distance is None:
-            # A partially missing matrix entry must never look like zero travel.
-            distance = max(berth_distances)
+            raise ValueError(
+                "missing berth-area distance for detailed export allocation: "
+                f"voyage={voyage_id}, berth={berth}, area={area_no}"
+            )
+        if not math.isfinite(float(distance)) or float(distance) <= 0:
+            raise ValueError(
+                "berth-area distance must be a positive finite value: "
+                f"voyage={voyage_id}, berth={berth}, area={area_no}, distance={distance!r}"
+            )
         max_distance = max(
             (float(value) for value in self.problem.berth_distances.values() if float(value) > 0),
             default=1.0,

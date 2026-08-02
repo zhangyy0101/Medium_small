@@ -92,11 +92,11 @@ pair unavailable; the same state enters the pair-loss objective and the hard
 lower bound on pair capacity reserved for incoming 40/45-ft imports. No
 separate isolated-bay reward or auxiliary pair-loss score is used.
 
-Berth-to-area distance is weighted by assigned quantity. A voyage with no
-berth distance data is excluded from this criterion. If only an individual
-area entry is missing for an otherwise covered berth, the maximum known
-distance for that berth is used conservatively rather than treating the
-missing value as zero.
+Berth-to-area distance is weighted by assigned quantity. Every export voyage
+in the detailed model must have a berth mapping, and every candidate area must
+have a positive finite distance to that berth. Missing or invalid values are
+input errors; the model neither imputes them nor silently excludes the travel
+criterion.
 
 ## Removed from the paper model
 
