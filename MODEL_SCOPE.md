@@ -94,13 +94,24 @@ minimum exactly and minimizes the following operational criteria:
 - exact loss of usable 40/45-ft pair capacity caused by assigning 20-ft
   containers to a pair member.
 
-Secondary criteria are normalized by a natural instance scale before their
-weights are applied: guided demand for area deviation, operational-group count
-for area activation, declared demand for row activation and incumbent
-proximity, total usable pair capacity for large-pair loss, and the product of
-maximum berth distance and declared demand for travel. Thus the reported
-weights express policy trade-offs rather than compensate for incompatible raw
-units.
+Every secondary criterion is first converted to a dimensionless natural
+instance scale. Area and row dispersion count only activations beyond the first
+one used by each placed operational group, divided respectively by the maximum
+number of additional feasible areas and rows. Incumbent proximity is a
+quantity-weighted bay distance in `[0,1]`, divided by the demand of groups that
+have incumbent anchors. Big-plan deviation is divided by twice the guided
+demand, because moving one box creates one shortage and one excess in the L1
+vector. Lost large-pair capacity is divided by total usable pair capacity.
+For each voyage, berth distance is mapped from its closest and farthest
+compatible areas to `[0,1]` and then averaged by declared quantity.
+
+The baseline empirical weights are 0.20 for area dispersion, 0.17 for row
+dispersion, 0.13 for incumbent-group proximity, 0.22 for big-plan guidance,
+0.17 for large-pair capacity preservation, and 0.11 for berth distance. They
+sum to one. The first three terms jointly receive 0.50, expressing the policy
+order concentration and layout continuity > big-plan inheritance > capacity
+preservation > travel efficiency. The weights therefore express policy
+preference only, rather than compensate for incompatible raw units.
 
 The stage-2 integer solution is the final reported allocation. There is no
 post-solve intra-area row relayout or separate heuristic objective; row-level

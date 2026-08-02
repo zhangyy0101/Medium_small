@@ -152,16 +152,14 @@ class ColumnGenerationConfig:
     use_gurobi: bool = True
     allow_greedy_fallback: bool = False
     pricing_unplaced_penalty: float = 1_000_000.0
-    existing_group_bay_reward: float = 48.0
-    existing_group_neighbor_bay_reward: float = 24.0
-    existing_other_group_bay_penalty: float = 0.0
-    existing_other_group_neighbor_bay_penalty: float = 0.0
-    existing_group_neighbor_max_bay_distance: int = 12
-    twenty_large_segment_loss_penalty: float = 220.0
-    area_guidance_deviation_penalty: float = 3.0
-    small_plan_group_area_split_penalty: float = 80.0
-    small_plan_group_row_split_penalty: float = 8.0
-    berth_distance_penalty: float = 0.02
+    # Stage-2 policy weights. Every component is first mapped to a natural
+    # dimensionless scale, so these values express policy preference only.
+    area_dispersion_weight: float = 0.20
+    row_dispersion_weight: float = 0.17
+    existing_group_proximity_weight: float = 0.13
+    area_guidance_weight: float = 0.22
+    large_pair_capacity_weight: float = 0.17
+    berth_distance_weight: float = 0.11
 
 
 @dataclass
@@ -223,8 +221,6 @@ class ColumnGenerationPlanner:
         )
         self.existing_group_bays: defaultdict[tuple[str, ...], set[str]] = defaultdict(set)
         self.existing_group_area_bays: defaultdict[tuple[str, ...], set[str]] = defaultdict(set)
-        self.existing_area_group_bays: defaultdict[tuple[str, tuple[str, ...]], set[str]] = defaultdict(set)
-        self.existing_bay_group_load: defaultdict[str, Counter[tuple[str, ...]]] = defaultdict(Counter)
         self.large_segment_by_bay: dict[str, tuple[str, ...]] = {}
         self.large_segment_base_pairs: dict[tuple[str, ...], int] = {}
         self.large_segment_static_loss_by_bay: dict[str, int] = {}
@@ -237,8 +233,6 @@ class ColumnGenerationPlanner:
                 group_tuple = tuple(group_key)
                 self.existing_group_bays[group_tuple].add(str(bay_key))
                 self.existing_group_area_bays[group_tuple + (str(area_no),)].add(str(bay_key))
-                self.existing_area_group_bays[(str(area_no), group_tuple)].add(str(bay_key))
-                self.existing_bay_group_load[str(bay_key)][group_tuple] += int(value)
         self.group_demand = {group.group_id: int(group.demand) for group in self.groups}
         self.voyage_flow_size_demand: Counter[tuple[str, str, str]] = Counter()
         self._columns: list[PlacementColumn] = []
@@ -246,12 +240,16 @@ class ColumnGenerationPlanner:
         self._column_keys: set[tuple[str, str, int, tuple[tuple[str, str, int], ...]]] = set()
         self._candidate_cache: dict[tuple[str, str], list[tuple[str, int, float]]] = {}
         self._candidate_scope = "all"
+        self._objective_scales: dict[str, float] = {}
+        self._berth_distance_bounds: dict[str, tuple[float, float]] = {}
         self._master_seed_selected: Counter[int] = Counter()
         self._master_seed_unplaced: Counter[str] = Counter()
         self._master_start_selected: Counter[int] = Counter()
         self._master_start_unplaced: Counter[str] = Counter()
         self._prepare_yard_indexes()
         self._prepare_quota()
+        self._validate_objective_weights()
+        self._prepare_berth_distance_bounds()
         for group in self.groups:
             self.voyage_flow_size_demand[(group.voyage_id, group.status, self._big_plan_size(group.size))] += group.demand
 
@@ -281,6 +279,7 @@ class ColumnGenerationPlanner:
         return groups
     def solve(self) -> ColumnGenerationResult:
         self._build_unit_flow_column_universe()
+        self._prepare_objective_normalization()
         base_initial_column_count = len(self._active_column_indices)
         self._master_seed_selected = Counter()
         self._master_seed_unplaced = Counter(
@@ -365,17 +364,11 @@ class ColumnGenerationPlanner:
             "pricing_iterations": [],
             "gurobi_available": False,
             "used_greedy_fallback": False,
-            "concentration_penalties": {
-                "operational_group_area": self._area_activation_penalty(),
-                "operational_group_row": self._row_activation_penalty(),
-                "existing_exact_group_bay_reward": (
-                    self.config.existing_group_bay_reward / max(1, sum(group.demand for group in self.groups))
-                ),
-                "existing_exact_group_neighbor_reward": (
-                    self.config.existing_group_neighbor_bay_reward / max(1, sum(group.demand for group in self.groups))
-                ),
-                "existing_exact_group_neighbor_max_bay_distance": self.config.existing_group_neighbor_max_bay_distance,
-                "twenty_large_pair_loss_penalty": self._twenty_segment_loss_penalty(),
+            "secondary_objective_normalization": {
+                "weights": self._objective_weights(),
+                "scales": dict(self._objective_scales),
+                "weight_sum": round(sum(self._objective_weights().values()), 10),
+                "method": "natural_instance_scale",
             },
             "existing_operational_group_anchors": {
                 "mode": "exact_group_bay_proximity",
@@ -383,9 +376,12 @@ class ColumnGenerationPlanner:
                 "bay_key_count": len(self.existing_group_bay_load),
                 "box_count": int(sum(self.existing_group_bay_load.values())),
             },
-            "inheritance_penalties": {
+            "objective_coefficients": {
                 "pricing_unplaced_penalty": self.config.pricing_unplaced_penalty,
-                "area_guidance_transfer": self._area_guidance_penalty(),
+                "area_guidance_l1_unit": self._area_guidance_penalty(),
+                "area_activation_unit": self._area_activation_penalty(),
+                "row_activation_unit": self._row_activation_penalty(),
+                "large_pair_capacity_unit": self._twenty_segment_loss_penalty(),
             },
         }
 
@@ -406,7 +402,9 @@ class ColumnGenerationPlanner:
                 diagnostics["gurobi_failure"] = f"{type(exc).__name__}: {exc}"
                 selected, unplaced = self._greedy_fallback()
 
-        diagnostics["final_secondary_objective"] = self._selected_solution_energy(selected, unplaced)
+        objective_components = self._selected_objective_components(selected, unplaced)
+        diagnostics["final_secondary_objective"] = objective_components["weighted_total"]
+        diagnostics["final_secondary_objective_components"] = objective_components
         diagnostics["independent_solution_validation"] = self._validate_final_solution(
             selected, unplaced
         )
@@ -564,32 +562,39 @@ class ColumnGenerationPlanner:
 
 
 
-    def _selected_solution_energy(self, selected: Counter[int], unplaced: Counter[str]) -> float:
-        # Unplaced quantity is compared lexicographically in _solution_rank;
-        # it must not be blended into the secondary operational objective.
-        energy = 0.0
+    def _selected_objective_components(
+        self,
+        selected: Counter[int],
+        unplaced: Counter[str],
+    ) -> dict[str, float | dict[str, float]]:
+        """Evaluate raw, normalized and weighted stage-2 criteria."""
         actual_quota: Counter[tuple[str, str, str, str]] = Counter()
         used_group_area: set[tuple[tuple[str, ...], str]] = set()
         used_group_row: set[tuple[tuple[str, ...], str, str]] = set()
+        used_groups: set[tuple[str, ...]] = set()
         used_twenty_bays: set[str] = set()
+        proximity_sum = 0.0
+        berth_distance_sum = 0.0
         for idx, chosen in selected.items():
             if chosen <= 0 or idx < 0 or idx >= len(self._columns):
                 continue
             col = self._columns[idx]
             multiplier = int(chosen)
-            energy += col.intrinsic_cost * multiplier
             qty = col.quantity * multiplier
             actual_quota[col.quota_key] += qty
+            used_groups.add(col.group_key)
             used_group_area.add((col.group_key, col.area_no))
             for bay_key, row_no, row_qty in col.row_allocation:
-                if row_qty > 0:
+                # A 40/45-ft unit occupies a paired physical footprint but is
+                # one operational row assignment, identified by its primary
+                # large-bay key.
+                if row_qty > 0 and bay_key == col.bay_key:
                     used_group_row.add((col.group_key, bay_key, row_no))
             if col.size == "20":
                 used_twenty_bays.add(col.bay_key)
-
-        energy += self._area_activation_penalty() * len(used_group_area)
-        energy += self._row_activation_penalty() * len(used_group_row)
-        energy += self._twenty_segment_loss_penalty() * self._large_pair_capacity_loss(used_twenty_bays)
+            group = self.groups_by_id[col.group_id]
+            proximity_sum += self._normalized_existing_proximity(group, col.bay_key) * qty
+            berth_distance_sum += self._normalized_berth_distance(col.voyage_id, col.area_no) * qty
 
         target_keys = {
             key
@@ -600,11 +605,42 @@ class ColumnGenerationPlanner:
             voyage_id, flow, _area_no, big_size = key
             if qty > 0 and self.voyage_flow_size_demand[(voyage_id, flow, big_size)] > 0:
                 target_keys.add(key)
+        guidance_l1 = 0.0
         for voyage_id, flow, area_no, big_size in target_keys:
             target = self._area_size_target(voyage_id, flow, area_no, big_size)
-            energy += self._area_guidance_penalty() * abs(actual_quota.get((voyage_id, flow, area_no, big_size), 0) - target)
+            guidance_l1 += abs(
+                actual_quota.get((voyage_id, flow, area_no, big_size), 0) - target
+            )
 
-        return float(energy)
+        raw = {
+            "extra_operational_group_areas": float(max(0, len(used_group_area) - len(used_groups))),
+            "extra_operational_group_rows": float(max(0, len(used_group_row) - len(used_groups))),
+            "existing_group_normalized_distance_sum": float(proximity_sum),
+            "area_guidance_l1_deviation": float(guidance_l1),
+            "large_pair_capacity_loss": float(self._large_pair_capacity_loss(used_twenty_bays)),
+            "berth_normalized_distance_sum": float(berth_distance_sum),
+        }
+        normalized = {
+            "area_dispersion": raw["extra_operational_group_areas"] / self._objective_scale("area_dispersion"),
+            "row_dispersion": raw["extra_operational_group_rows"] / self._objective_scale("row_dispersion"),
+            "existing_group_proximity": raw["existing_group_normalized_distance_sum"] / self._objective_scale("existing_group_proximity"),
+            "area_guidance": raw["area_guidance_l1_deviation"] / self._objective_scale("area_guidance_l1"),
+            "large_pair_capacity": raw["large_pair_capacity_loss"] / self._objective_scale("large_pair_capacity"),
+            "berth_distance": raw["berth_normalized_distance_sum"] / self._objective_scale("berth_distance"),
+        }
+        weights = self._objective_weights()
+        weighted = {key: normalized[key] * weights[key] for key in normalized}
+        return {
+            "raw": {key: round(value, 8) for key, value in raw.items()},
+            "normalized": {key: round(value, 8) for key, value in normalized.items()},
+            "weighted": {key: round(value, 8) for key, value in weighted.items()},
+            "weighted_total": round(sum(weighted.values()), 8),
+        }
+
+    def _selected_solution_energy(self, selected: Counter[int], unplaced: Counter[str]) -> float:
+        # Unplaced quantity is handled lexicographically and is not blended
+        # into the normalized secondary objective.
+        return float(self._selected_objective_components(selected, unplaced)["weighted_total"])
 
 
     def _source_rank_for_group_id(self, group_id: str) -> int:
@@ -1345,7 +1381,8 @@ class ColumnGenerationPlanner:
             unavailable_by_pair[pair] = unavailable
             for idx in indices:
                 loss_link[(pair, idx)] = model.addCons(
-                    columns[idx] <= unavailable,
+                    columns[idx]
+                    <= max(1, self.group_demand[self._columns[idx].group_id]) * unavailable,
                     name=f"large_pair_loss_link_{len(loss_link)}",
                 )
             if indices:
@@ -1419,6 +1456,9 @@ class ColumnGenerationPlanner:
             area_guidance_balance[key] = model.addCons(actual - target == pos - neg)
 
         fixed_use_constraints = {}
+        area_use_by_group: defaultdict[tuple[str, ...], list] = defaultdict(list)
+        row_use_by_group: defaultdict[tuple[str, ...], list] = defaultdict(list)
+        column_indices_by_group: defaultdict[tuple[str, ...], set[int]] = defaultdict(set)
         for key, indices in group_area_cols.items():
             use = model.addVar(lb=0.0, ub=1.0, obj=self._area_activation_penalty())
             group_key, _area_no = key
@@ -1431,6 +1471,8 @@ class ColumnGenerationPlanner:
                 quicksum(self._columns[idx].quantity * columns[idx] for idx in indices)
                 <= max(1, demand) * use
             )
+            area_use_by_group[group_key].append(use)
+            column_indices_by_group[group_key].update(indices)
         for key, indices in group_row_cols.items():
             use = model.addVar(lb=0.0, ub=1.0, obj=self._row_activation_penalty())
             group_key, _bay_key, _row_no = key
@@ -1441,6 +1483,33 @@ class ColumnGenerationPlanner:
             )
             fixed_use_constraints[("group_row",) + key] = model.addCons(
                 quicksum(columns[idx] for idx in indices) <= max(1, demand) * use
+            )
+            row_use_by_group[group_key].append(use)
+            column_indices_by_group[group_key].update(indices)
+        for group_key, indices in column_indices_by_group.items():
+            demand = sum(
+                group.demand
+                for group in self.groups
+                if self._operational_group_key(group) == group_key
+            )
+            baseline = model.addVar(
+                lb=0.0,
+                ub=1.0,
+                obj=-(self._area_activation_penalty() + self._row_activation_penalty()),
+                name=f"lp_group_used_{self._key_name(group_key)}",
+            )
+            assigned = quicksum(columns[idx] for idx in sorted(indices))
+            fixed_use_constraints[("group_used_upper",) + group_key] = model.addCons(
+                assigned <= max(1, demand) * baseline
+            )
+            fixed_use_constraints[("group_used_lower",) + group_key] = model.addCons(
+                baseline <= assigned
+            )
+            fixed_use_constraints[("group_used_area",) + group_key] = model.addCons(
+                baseline <= quicksum(area_use_by_group[group_key])
+            )
+            fixed_use_constraints[("group_used_row",) + group_key] = model.addCons(
+                baseline <= quicksum(row_use_by_group[group_key])
             )
         return {
             "area_guidance_balance": area_guidance_balance,
@@ -1474,6 +1543,9 @@ class ColumnGenerationPlanner:
             actual = quicksum(col.quantity * columns[idx] for idx, col in items)
             model.addCons(actual - target == pos - neg)
 
+        area_use_by_group: defaultdict[tuple[str, ...], list] = defaultdict(list)
+        row_use_by_group: defaultdict[tuple[str, ...], list] = defaultdict(list)
+        column_indices_by_group: defaultdict[tuple[str, ...], set[int]] = defaultdict(set)
         for (group_key, area_no), indices in group_area_cols.items():
             use = model.addVar(vtype="B", obj=self._area_activation_penalty(), name=f"use_ga_{self._key_name(group_key)}_{area_no}")
             demand = sum(
@@ -1485,6 +1557,8 @@ class ColumnGenerationPlanner:
                 quicksum(self._columns[idx].quantity * columns[idx] for idx in indices)
                 <= max(1, demand) * use
             )
+            area_use_by_group[group_key].append(use)
+            column_indices_by_group[group_key].update(indices)
         for (group_key, bay_key, row_no), indices in group_row_cols.items():
             use = model.addVar(
                 vtype="B",
@@ -1497,6 +1571,24 @@ class ColumnGenerationPlanner:
                 if self._operational_group_key(group) == group_key
             )
             model.addCons(quicksum(columns[idx] for idx in indices) <= max(1, demand) * use)
+            row_use_by_group[group_key].append(use)
+            column_indices_by_group[group_key].update(indices)
+        for group_key, indices in column_indices_by_group.items():
+            demand = sum(
+                group.demand
+                for group in self.groups
+                if self._operational_group_key(group) == group_key
+            )
+            baseline = model.addVar(
+                vtype="B",
+                obj=-(self._area_activation_penalty() + self._row_activation_penalty()),
+                name=f"group_used_{self._key_name(group_key)}",
+            )
+            assigned = quicksum(columns[idx] for idx in sorted(indices))
+            model.addCons(assigned <= max(1, demand) * baseline)
+            model.addCons(baseline <= assigned)
+            model.addCons(baseline <= quicksum(area_use_by_group[group_key]))
+            model.addCons(baseline <= quicksum(row_use_by_group[group_key]))
     def _add_bay_compatibility_constraints(
         self,
         quicksum,
@@ -2299,30 +2391,11 @@ class ColumnGenerationPlanner:
         return (bay_key,)
 
     def _column_base_cost(self, group: SmallBoxGroup, bay_key: str) -> float:
-        bay = self.bays[bay_key]
-        cost = 0.0
-        existing_bay_load = self._existing_group_bay_load_for_group(group, bay_key)
-        if existing_bay_load > 0:
-            cost -= (
-                float(self.config.existing_group_bay_reward)
-                * min(5, existing_bay_load)
-                / max(1, sum(item.demand for item in self.groups))
-            )
-        else:
-            same_distance = self._existing_same_group_bay_distance(group, bay_key)
-            if same_distance is not None:
-                cost -= self._existing_neighbor_reward(same_distance)
-            else:
-                existing_other_load = self._existing_other_group_bay_load_for_group(group, bay_key)
-                if existing_other_load > 0:
-                    cost += (
-                        float(self.config.existing_other_group_bay_penalty)
-                        * min(5, existing_other_load)
-                        / max(1, sum(item.demand for item in self.groups))
-                    )
-                other_distance = self._existing_other_group_bay_distance(group, bay_key)
-                if other_distance is not None:
-                    cost += self._existing_other_neighbor_penalty(other_distance)
+        cost = (
+            self.config.existing_group_proximity_weight
+            * self._normalized_existing_proximity(group, bay_key)
+            / self._objective_scale("existing_group_proximity")
+        )
         # The exact 20-ft opportunity loss is modeled jointly through
         # large-pair loss variables in the master problem. Do not add a second
         # per-column proxy cost here.
@@ -2512,8 +2585,10 @@ class ColumnGenerationPlanner:
 
 
     def _twenty_segment_loss_penalty(self) -> float:
-        total_pair_capacity = max(1, int(sum(self.large_pair_capacity.values())))
-        return max(0.0, float(getattr(self.config, "twenty_large_segment_loss_penalty", 0.0) or 0.0)) / total_pair_capacity
+        return (
+            float(self.config.large_pair_capacity_weight)
+            / self._objective_scale("large_pair_capacity")
+        )
 
 
     def _prepare_quota(self) -> None:
@@ -2589,47 +2664,28 @@ class ColumnGenerationPlanner:
         distances = [abs(self.bays[key].bay_order - bay.bay_order) for key in anchor_bays if key in self.bays]
         return min(distances) if distances else None
 
-    def _existing_other_group_bay_distance(self, group: SmallBoxGroup, bay_key: str) -> int | None:
+    def _normalized_existing_proximity(self, group: SmallBoxGroup, bay_key: str) -> float:
+        """Return a [0, 1] cost relative to incumbent exact-group anchors.
+
+        Reusing an incumbent bay costs zero. Within an anchored area, bay
+        distance is divided by that area's full bay-order span. Selecting an
+        area without an anchor costs one. Groups without any incumbent anchor
+        are neutral and therefore contribute zero.
+        """
         bay = self.bays.get(bay_key)
         if bay is None:
-            return None
-        group_key = self._existing_anchor_key(group)
-        distances: list[int] = []
-        for (area_no, existing_group_key), anchor_bays in self.existing_area_group_bays.items():
-            if area_no != bay.area_no or existing_group_key == group_key:
-                continue
-            distances.extend(abs(self.bays[key].bay_order - bay.bay_order) for key in anchor_bays if key in self.bays)
-        return min(distances) if distances else None
-
-    def _existing_neighbor_reward(self, distance: int) -> float:
-        max_distance = max(0, int(getattr(self.config, "existing_group_neighbor_max_bay_distance", 0) or 0))
-        if max_distance <= 0 or distance > max_distance:
             return 0.0
-        scale = (max_distance - int(distance) + 1) / (max_distance + 1)
-        return (
-            float(self.config.existing_group_neighbor_bay_reward)
-            * scale
-            / max(1, sum(group.demand for group in self.groups))
-        )
-
-    def _existing_other_neighbor_penalty(self, distance: int) -> float:
-        max_distance = max(0, int(getattr(self.config, "existing_group_neighbor_max_bay_distance", 0) or 0))
-        if max_distance <= 0 or distance > max_distance:
-            return 0.0
-        scale = (max_distance - int(distance) + 1) / (max_distance + 1)
-        return (
-            float(self.config.existing_other_group_neighbor_bay_penalty)
-            * scale
-            / max(1, sum(group.demand for group in self.groups))
-        )
-
-    def _existing_other_group_bay_load_for_group(self, group: SmallBoxGroup, bay_key: str) -> int:
         group_key = self._existing_anchor_key(group)
-        return sum(
-            int(value)
-            for existing_group_key, value in self.existing_bay_group_load.get(bay_key, Counter()).items()
-            if existing_group_key != group_key
-        )
+        if not self.existing_group_bays.get(group_key):
+            return 0.0
+        distance = self._existing_same_group_bay_distance(group, bay_key)
+        if distance is None:
+            return 1.0
+        orders = [self.bays[key].bay_order for key in self.bays_by_area.get(bay.area_no, ())]
+        span = max(orders, default=0) - min(orders, default=0)
+        if span <= 0:
+            return 0.0
+        return min(1.0, max(0.0, float(distance) / float(span)))
 
     def _existing_group_bay_rank(self, group: SmallBoxGroup, bay_key: str) -> tuple[int, int, int]:
         bay_load = self._existing_group_bay_load_for_group(group, bay_key)
@@ -2673,17 +2729,124 @@ class ColumnGenerationPlanner:
             for (v, f, _area, size), qty in self.quota_by_key.items()
         )
 
+    def _objective_weights(self) -> dict[str, float]:
+        return {
+            "area_dispersion": float(self.config.area_dispersion_weight),
+            "row_dispersion": float(self.config.row_dispersion_weight),
+            "existing_group_proximity": float(self.config.existing_group_proximity_weight),
+            "area_guidance": float(self.config.area_guidance_weight),
+            "large_pair_capacity": float(self.config.large_pair_capacity_weight),
+            "berth_distance": float(self.config.berth_distance_weight),
+        }
+
+    def _validate_objective_weights(self) -> None:
+        weights = self._objective_weights()
+        if any(not math.isfinite(value) or value < 0.0 for value in weights.values()):
+            raise ValueError(f"secondary objective weights must be finite and nonnegative: {weights}")
+        total = sum(weights.values())
+        if abs(total - 1.0) > 1e-9:
+            raise ValueError(f"secondary objective weights must sum to 1, got {total}: {weights}")
+
+    def _anchored_group_demand(self) -> int:
+        return sum(
+            int(group.demand)
+            for group in self.groups
+            if self.existing_group_bays.get(self._existing_anchor_key(group))
+        )
+
+    def _guided_demand(self) -> int:
+        return sum(
+            int(qty)
+            for (voyage_id, flow, big_size), qty in self.voyage_flow_size_demand.items()
+            if self._has_area_guidance(voyage_id, flow, big_size)
+        )
+
+    def _objective_scale(self, key: str) -> float:
+        if key in self._objective_scales:
+            return max(1.0, float(self._objective_scales[key]))
+        fallback = {
+            "existing_group_proximity": self._anchored_group_demand(),
+            "area_guidance_l1": 2 * self._guided_demand(),
+            "large_pair_capacity": sum(self.large_pair_capacity.values()),
+            "berth_distance": sum(group.demand for group in self.groups),
+        }.get(key, 1.0)
+        return max(1.0, float(fallback))
+
+    def _prepare_objective_normalization(self) -> None:
+        demand_by_group: Counter[tuple[str, ...]] = Counter()
+        areas_by_group: defaultdict[tuple[str, ...], set[str]] = defaultdict(set)
+        rows_by_group: defaultdict[tuple[str, ...], set[tuple[str, str]]] = defaultdict(set)
+        for group in self.groups:
+            demand_by_group[self._operational_group_key(group)] += int(group.demand)
+        for col in self._columns:
+            areas_by_group[col.group_key].add(col.area_no)
+            for bay_key, row_no, qty in col.row_allocation:
+                if qty > 0 and bay_key == col.bay_key:
+                    rows_by_group[col.group_key].add((bay_key, row_no))
+        area_scale = sum(
+            max(0, min(int(demand), len(areas_by_group[key])) - 1)
+            for key, demand in demand_by_group.items()
+        )
+        row_scale = sum(
+            max(0, min(int(demand), len(rows_by_group[key])) - 1)
+            for key, demand in demand_by_group.items()
+        )
+        self._objective_scales = {
+            "area_dispersion": float(max(1, area_scale)),
+            "row_dispersion": float(max(1, row_scale)),
+            "existing_group_proximity": float(max(1, self._anchored_group_demand())),
+            "area_guidance_l1": float(max(1, 2 * self._guided_demand())),
+            "large_pair_capacity": float(max(1, sum(self.large_pair_capacity.values()))),
+            "berth_distance": float(max(1, sum(group.demand for group in self.groups))),
+        }
+
+    def _prepare_berth_distance_bounds(self) -> None:
+        areas_by_voyage: defaultdict[str, set[str]] = defaultdict(set)
+        for group in self.groups:
+            for bay_key, _capacity, _cost in self._candidate_bays_for_group(group):
+                areas_by_voyage[group.voyage_id].add(self.bays[bay_key].area_no)
+        for voyage_id, areas in areas_by_voyage.items():
+            berth = self.problem.berth_by_voyage.get(voyage_id, "")
+            if not berth:
+                raise ValueError(f"missing berth mapping for detailed export voyage {voyage_id}")
+            distances: list[float] = []
+            for area_no in sorted(areas):
+                distance = self.problem.berth_distances.get((area_no, berth))
+                if distance is None:
+                    raise ValueError(
+                        "missing berth-area distance for detailed export allocation: "
+                        f"voyage={voyage_id}, berth={berth}, area={area_no}"
+                    )
+                if not math.isfinite(float(distance)) or float(distance) <= 0:
+                    raise ValueError(
+                        "berth-area distance must be a positive finite value: "
+                        f"voyage={voyage_id}, berth={berth}, area={area_no}, distance={distance!r}"
+                    )
+                distances.append(float(distance))
+            if distances:
+                self._berth_distance_bounds[voyage_id] = (min(distances), max(distances))
+
+    def _normalized_berth_distance(self, voyage_id: str, area_no: str) -> float:
+        berth = self.problem.berth_by_voyage.get(voyage_id, "")
+        distance = self.problem.berth_distances.get((area_no, berth))
+        if distance is None or voyage_id not in self._berth_distance_bounds:
+            raise ValueError(
+                "missing normalized berth-area distance data: "
+                f"voyage={voyage_id}, berth={berth}, area={area_no}"
+            )
+        lower, upper = self._berth_distance_bounds[voyage_id]
+        if upper <= lower:
+            return 0.0
+        return min(1.0, max(0.0, (float(distance) - lower) / (upper - lower)))
+
     def _area_guidance_penalty(self) -> float:
-        guided_boxes = max(1, int(sum(self.quota_by_key.values())))
-        # One moved box creates one shortage and one excess in the L1 vector.
-        return float(self.config.area_guidance_deviation_penalty) / (2.0 * guided_boxes)
+        return float(self.config.area_guidance_weight) / self._objective_scale("area_guidance_l1")
 
     def _area_activation_penalty(self) -> float:
-        return float(self.config.small_plan_group_area_split_penalty) / max(1, len(self.groups))
+        return float(self.config.area_dispersion_weight) / self._objective_scale("area_dispersion")
 
     def _row_activation_penalty(self) -> float:
-        total_boxes = max(1, int(sum(group.demand for group in self.groups)))
-        return float(self.config.small_plan_group_row_split_penalty) / total_boxes
+        return float(self.config.row_dispersion_weight) / self._objective_scale("row_dispersion")
 
     def _berth_distance_cost(self, voyage_id: str, area_no: str, quantity: int) -> float:
         """Quantity-weighted berth-to-yard travel cost."""
@@ -2703,17 +2866,11 @@ class ColumnGenerationPlanner:
                 "berth-area distance must be a positive finite value: "
                 f"voyage={voyage_id}, berth={berth}, area={area_no}, distance={distance!r}"
             )
-        max_distance = max(
-            (float(value) for value in self.problem.berth_distances.values() if float(value) > 0),
-            default=1.0,
-        )
-        total_boxes = max(1, int(sum(group.demand for group in self.groups)))
         return (
-            float(self.config.berth_distance_penalty)
-            * float(distance)
-            / max_distance
+            float(self.config.berth_distance_weight)
+            * self._normalized_berth_distance(voyage_id, area_no)
             * max(0, int(quantity))
-            / total_boxes
+            / self._objective_scale("berth_distance")
         )
 
 

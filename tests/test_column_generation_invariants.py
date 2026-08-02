@@ -29,6 +29,26 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
     def test_silent_solver_fallback_is_disabled_by_default(self) -> None:
         self.assertFalse(ColumnGenerationConfig().allow_greedy_fallback)
 
+    def test_normalized_policy_weights_sum_to_one_and_follow_priority(self) -> None:
+        config = ColumnGenerationConfig()
+        concentration = (
+            config.area_dispersion_weight
+            + config.row_dispersion_weight
+            + config.existing_group_proximity_weight
+        )
+        weights = [
+            config.area_dispersion_weight,
+            config.row_dispersion_weight,
+            config.existing_group_proximity_weight,
+            config.area_guidance_weight,
+            config.large_pair_capacity_weight,
+            config.berth_distance_weight,
+        ]
+        self.assertAlmostEqual(1.0, sum(weights))
+        self.assertGreater(concentration, config.area_guidance_weight)
+        self.assertGreater(config.area_guidance_weight, config.large_pair_capacity_weight)
+        self.assertGreater(config.large_pair_capacity_weight, config.berth_distance_weight)
+
     def test_45ft_is_edge_only_without_excluding_other_sizes(self) -> None:
         planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
         planner.bays = {
