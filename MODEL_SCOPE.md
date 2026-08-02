@@ -86,6 +86,11 @@ maximum berth distance and declared demand for travel. Thus the reported
 weights express policy trade-offs rather than compensate for incompatible raw
 units.
 
+The stage-2 integer solution is the final reported allocation. There is no
+post-solve intra-area row relayout or separate heuristic objective; row-level
+placement patterns must enter the generated column pool and are selected by
+the same restricted master.
+
 One pair-state variable is used for both large-container preservation and
 import reservation. Assigning a 20-ft container to either member makes the
 pair unavailable; the same state enters the pair-loss objective and the hard
