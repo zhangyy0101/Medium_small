@@ -65,11 +65,12 @@ All active grouping rules resolve to the single operational group above.
 
 ## Retained objectives
 
-Solutions are compared lexicographically: the number of unplaced declared
-containers is minimized first. The following operational criteria are then
-evaluated for solutions with the same unplaced quantity:
+The integer restricted master is solved in two lexicographic stages. Stage 1
+minimizes the number of unplaced declared containers. Stage 2 fixes that
+minimum exactly and minimizes the following operational criteria:
 
-- deviation from the normalized upstream area-size guidance target;
+- transferred boxes relative to the normalized upstream area-size guidance
+  target, measured as one half of the L1 deviation;
 - quantity-weighted berth-to-yard distance;
 - operational-group area dispersion;
 - operational-group row dispersion;
@@ -84,6 +85,18 @@ proximity, total usable pair capacity for large-pair loss, and the product of
 maximum berth distance and declared demand for travel. Thus the reported
 weights express policy trade-offs rather than compensate for incompatible raw
 units.
+
+One pair-state variable is used for both large-container preservation and
+import reservation. Assigning a 20-ft container to either member makes the
+pair unavailable; the same state enters the pair-loss objective and the hard
+lower bound on pair capacity reserved for incoming 40/45-ft imports. No
+separate isolated-bay reward or auxiliary pair-loss score is used.
+
+Berth-to-area distance is weighted by assigned quantity. A voyage with no
+berth distance data is excluded from this criterion. If only an individual
+area entry is missing for an otherwise covered berth, the maximum known
+distance for that berth is used conservatively rather than treating the
+missing value as zero.
 
 ## Removed from the paper model
 

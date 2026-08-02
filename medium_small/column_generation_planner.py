@@ -205,10 +205,7 @@ class ColumnGenerationConfig:
     existing_other_coarse_bay_penalty: float = 0.0
     existing_other_coarse_neighbor_bay_penalty: float = 0.0
     existing_coarse_neighbor_max_bay_distance: int = 12
-    twenty_isolated_bay_reward: float = 80.0
     twenty_large_segment_loss_penalty: float = 220.0
-    twenty_large_segment_fresh_loss_penalty: float = 240.0
-    twenty_large_segment_used_zero_loss_reward: float = 160.0
     twenty_max_consecutive_bays: int = 0
     twenty_consecutive_violation_penalty: float = 0.0
     group_area_balance_penalty: float = 0.0
@@ -221,17 +218,12 @@ class ColumnGenerationConfig:
     medium_large_group_target_area_boxes: int = 0
     medium_large_group_area_excess_penalty: float = 0.0
     area_guidance_deviation_penalty: float = 3.0
-    big_plan_fallback_tier_penalty: float = 0.0
-    export_e_area_max_bays_per_voyage_area: int = -1
-    export_e_area_non_40_penalty: float = 0.0
     small_plan_group_area_split_penalty: float = 80.0
     small_plan_group_block_split_penalty: float = 0.0
     small_plan_group_row_split_penalty: float = 8.0
     small_plan_coarse_area_block_split_penalty: float = 0.0
     small_plan_coarse_area_bay_split_penalty: float = 0.0
     berth_distance_penalty: float = 0.02
-    fallback_bay_penalty: float = 0.0
-    non_preferred_block_penalty: float = 0.0
 
 
 @dataclass
@@ -879,12 +871,7 @@ class ColumnGenerationPlanner:
             "inheritance_penalties": {
                 "pricing_unplaced_penalty": self.config.pricing_unplaced_penalty,
                 "required_area_reward": self.config.required_area_reward,
-                "area_guidance_deviation": self._area_guidance_penalty(),
-                "big_plan_fallback_tier": self.config.big_plan_fallback_tier_penalty,
-            },
-            "export_e_area_controls": {
-                "max_bays_per_voyage_area": self.config.export_e_area_max_bays_per_voyage_area,
-                "non_40_penalty": self.config.export_e_area_non_40_penalty,
+                "area_guidance_transfer": self._area_guidance_penalty(),
             },
         }
 
@@ -913,6 +900,7 @@ class ColumnGenerationPlanner:
         selected, relayout_stats = self._post_repair_area_relayout(selected, unplaced)
         relayout_stats["post_repair_area_relayout_elapsed_seconds"] = round(perf_counter() - relayout_start, 3)
         diagnostics.update(relayout_stats)
+        diagnostics["final_secondary_objective"] = self._selected_solution_energy(selected, unplaced)
 
         if self._uses_original_output_scope():
             small_rows = self._make_small_rows(selected, allowed_sources={"document"})
@@ -922,7 +910,6 @@ class ColumnGenerationPlanner:
         unplaced_rows = self._unplaced_group_details(unplaced)
         consistency_stats = self._small_medium_consistency_stats(small_rows, medium_rows)
         bay_consistency_stats = self._small_medium_bay_consistency_stats(small_rows, medium_rows)
-        medium_fragmentation = self._medium_fragmentation_stats(medium_rows)
         operational_group_dispersion = self._operational_group_dispersion_stats(small_rows)
         diagnostics.update(
             {
@@ -933,12 +920,10 @@ class ColumnGenerationPlanner:
                 "area_bay_summary_row_count": len(medium_rows),
                 "planned_export_boxes": sum(int(row["planned_boxes"]) for row in small_rows),
                 "planned_medium_by_source": self._planned_medium_by_source(medium_rows),
-                "medium_area_rows_below_min_boxes": self._count_medium_area_rows_below_min(medium_rows),
-                "medium_fragmentation": medium_fragmentation,
                 "operational_group_dispersion": operational_group_dispersion,
                 "medium_big_plan_inheritance": self._medium_big_plan_inheritance_stats(medium_rows),
                 "final_medium_inheritance_energy_components": self._medium_inheritance_energy_components(medium_rows),
-                "export_e_area_usage": self._export_e_area_usage(selected),
+                "capacity_reservation_margins": self._capacity_reservation_margins(selected),
                 "export_voyage_row_no_mix": self._export_voyage_row_no_mix_stats(selected),
                 "twenty_consecutive_bay_rule": self._twenty_run_diagnostics(selected),
                 "user_required_area_usage": self._user_required_area_usage(medium_rows, small_rows),
@@ -957,6 +942,51 @@ class ColumnGenerationPlanner:
             unplaced_rows=unplaced_rows,
             columns=self._columns,
         )
+
+    def _capacity_reservation_margins(self, selected: Counter[int]) -> dict[str, dict[str, int]]:
+        """Report residual slot and large-pair capacity after the final plan."""
+        selected_slot_units: Counter[str] = Counter()
+        selected_twenty_bays: set[str] = set()
+        for idx, chosen in selected.items():
+            if chosen <= 0 or idx < 0 or idx >= len(self._columns):
+                continue
+            col = self._columns[idx]
+            selected_slot_units[col.area_no] += (
+                int(col.quantity)
+                * int(chosen)
+                * len(self._placement_footprint_keys(col.bay_key, col.size))
+            )
+            if col.size == "20":
+                selected_twenty_bays.add(col.bay_key)
+
+        areas = sorted(set(selected_slot_units) | {area for area, _size in self.import_area_size_reservation})
+        result: dict[str, dict[str, int]] = {}
+        for area_no in areas:
+            physical = sum(int(bay.physical_capacity) for bay in self.bays.values() if bay.area_no == area_no)
+            reserved_slots = sum(
+                int(qty) * (2 if size in {"40", "45"} else 1)
+                for (reserved_area, size), qty in self.import_area_size_reservation.items()
+                if reserved_area == area_no
+            )
+            pair_base = sum(
+                int(capacity)
+                for pair, capacity in self.large_pair_capacity.items()
+                if self.bays[pair[0]].area_no == area_no
+            )
+            pair_loss = self._large_pair_capacity_loss(selected_twenty_bays, area_no=area_no)
+            pair_required = sum(
+                int(qty)
+                for (reserved_area, size), qty in self.import_area_size_reservation.items()
+                if reserved_area == area_no and size in {"40", "45"}
+            )
+            result[area_no] = {
+                "residual_slot_units": int(physical - reserved_slots - selected_slot_units[area_no]),
+                "large_pair_base_capacity": int(pair_base),
+                "large_pair_capacity_loss": int(pair_loss),
+                "import_large_pair_required": int(pair_required),
+                "residual_large_pair_margin": int(pair_base - pair_loss - pair_required),
+            }
+        return result
 
     @staticmethod
     def _operational_group_dispersion_stats(rows: list[dict]) -> dict[str, int | float | str]:
@@ -1138,19 +1168,9 @@ class ColumnGenerationPlanner:
             for qty in coarse_area_bays.values():
                 if 0 < qty < min_boxes:
                     coarse_tail_boxes += min_boxes - int(qty)
-        score = (
-            1000.0 * fine_excess_bays
-            + 360.0 * coarse_excess_bays
-            + 24.0 * coarse_tail_boxes
-            + 10.0 * len(fine_area_bays)
-            + 4.0 * len(coarse_area_bays)
-            + existing_anchor_score
-            + self._twenty_segment_loss_penalty() * twenty_segment_loss
-            + self._twenty_consecutive_violation_penalty()
-            * max(0, twenty_run_violations - baseline_twenty_run_violations)
-            - float(getattr(self.config, "twenty_isolated_bay_reward", 0.0) or 0.0)
-            * min(50, twenty_isolated_empty_boxes + twenty_zero_loss_boxes)
-        )
+        # Relayout candidates are accepted with the same secondary objective
+        # as the mathematical master; these fields are diagnostics only.
+        score = self._selected_solution_energy(selected, Counter())
         return {
             "score": round(score, 6),
             "fine_area_bays": len(fine_area_bays),
@@ -1437,12 +1457,7 @@ class ColumnGenerationPlanner:
         # it must not be blended into the secondary operational objective.
         energy = 0.0
         actual_quota: Counter[tuple[str, str, str, str]] = Counter()
-        actual_coarse_area: Counter[tuple[str, ...]] = Counter()
         used_group_area: set[tuple[tuple[str, ...], str]] = set()
-        used_group_block: set[tuple[tuple[str, ...], str]] = set()
-        used_coarse_area_block: set[tuple[str, ...]] = set()
-        used_coarse_area_bay: set[tuple[str, ...]] = set()
-        used_voyage_area: set[tuple[str, str]] = set()
         used_twenty_bays: set[str] = set()
         for idx, chosen in selected.items():
             if chosen <= 0 or idx < 0 or idx >= len(self._columns):
@@ -1452,21 +1467,11 @@ class ColumnGenerationPlanner:
             energy += col.intrinsic_cost * multiplier
             qty = col.quantity * multiplier
             actual_quota[col.quota_key] += qty
-            actual_coarse_area[col.coarse_cluster_key + (col.area_no,)] += qty
-            energy += self._area_fallback_tier_penalty_for_column(col) * qty
             used_group_area.add((col.fine_cluster_key, col.area_no))
-            if col.block_id:
-                used_group_block.add((col.fine_cluster_key, col.block_id))
-                used_coarse_area_block.add(col.coarse_cluster_key + (col.area_no, col.block_id))
-            used_coarse_area_bay.add(col.coarse_cluster_key + (col.area_no, col.bay_key))
-            used_voyage_area.add((col.voyage_id, col.area_no))
             if col.size == "20":
                 used_twenty_bays.add(col.bay_key)
 
         energy += self._area_activation_penalty() * len(used_group_area)
-        energy += self.config.small_plan_group_block_split_penalty * len(used_group_block)
-        energy += self.config.small_plan_coarse_area_block_split_penalty * len(used_coarse_area_block)
-        energy += self.config.small_plan_coarse_area_bay_split_penalty * len(used_coarse_area_bay)
         energy += self._twenty_segment_loss_penalty() * self._large_pair_capacity_loss(used_twenty_bays)
         energy += self._twenty_consecutive_violation_penalty() * max(
             0,
@@ -1483,33 +1488,6 @@ class ColumnGenerationPlanner:
             target = self._area_size_target(voyage_id, flow, area_no, big_size)
             energy += self._area_guidance_penalty() * abs(actual_quota.get((voyage_id, flow, area_no, big_size), 0) - target)
 
-        by_coarse: defaultdict[tuple[str, ...], list[float]] = defaultdict(list)
-        for key, qty in actual_coarse_area.items():
-            by_coarse[tuple(key[:-1])].append(float(qty))
-        for coarse_key, quantities in by_coarse.items():
-            demand = max(1, int(self._coarse_metric_demand(coarse_key, sum(quantities))))
-            if self._prefers_concentrated_coarse_key(coarse_key):
-                if quantities:
-                    energy += self.config.medium_small_group_area_split_penalty * max(0, len(quantities) - 1)
-                    energy -= self.config.medium_small_group_fragment_penalty * max(quantities)
-            else:
-                energy += self.config.medium_large_group_area_open_penalty * max(
-                    0,
-                    len(quantities) - self._target_large_group_area_count(coarse_key, demand),
-                )
-                target_boxes = max(1, int(self.config.medium_large_group_target_area_boxes or 1))
-                energy += self.config.medium_large_group_area_excess_penalty * sum(
-                    max(0.0, qty - target_boxes) for qty in quantities
-                )
-                min_boxes = max(0, int(self.config.medium_large_group_min_area_boxes or 0))
-                if min_boxes > 0:
-                    small_area_penalty = self.config.medium_large_group_small_area_penalty / max(1.0, min_boxes)
-                    energy += sum(small_area_penalty * max(0.0, min_boxes - qty) for qty in quantities if qty > 0)
-                if len(quantities) > 1:
-                    pair_penalty = self.config.group_area_balance_penalty / max(1.0, demand) / max(1, len(quantities) - 1)
-                    for left_index, left in enumerate(quantities):
-                        for right in quantities[left_index + 1 :]:
-                            energy += pair_penalty * abs(left - right)
         return float(energy)
 
     def _document_unplaced_boxes(self, unplaced: Counter[str]) -> int:
@@ -1530,13 +1508,7 @@ class ColumnGenerationPlanner:
         return self._unplaced_penalty_for_group_id(group.group_id)
 
     def _area_fallback_tier_penalty_for_column(self, col: PlacementColumn) -> float:
-        tier = self._area_fallback_tier_for_attrs(
-            col.voyage_id,
-            col.flow,
-            col.area_no,
-            col.big_plan_size,
-        )
-        return float(self.config.big_plan_fallback_tier_penalty) * tier
+        return 0.0
 
     def _repair_from_column_priority(
         self,
@@ -2180,13 +2152,31 @@ class ColumnGenerationPlanner:
         if selected_method != "pricing_incumbent":
             best_start_source = f"{repair_start_source}_{selected_method}"
 
+        lex_selected, lex_unplaced, lex_stats = self._solve_lexicographic_integer_master(
+            best_start_selected,
+            best_start_unplaced,
+            remaining_total_time(),
+        )
+        stats.update(lex_stats)
+        if self._solution_rank(lex_selected, lex_unplaced) <= self._solution_rank(
+            best_start_selected,
+            best_start_unplaced,
+        ):
+            best_start_selected = lex_selected
+            best_start_unplaced = lex_unplaced
+            best_start_source = "lexicographic_integer_master"
+            selected_method = "lexicographic_integer_master"
+
         final_unplaced_boxes = sum(best_start_unplaced.values())
         objective = self._selected_solution_energy(best_start_selected, best_start_unplaced)
-        final_status = (
-            "staged_repair_zero_unplaced"
-            if final_unplaced_boxes <= 0
-            else "staged_repair_unproven_unplaced"
-        )
+        if stats.get("lexicographic_integer_master_used"):
+            final_status = "lexicographic_integer_master"
+        else:
+            final_status = (
+                "staged_repair_zero_unplaced"
+                if final_unplaced_boxes <= 0
+                else "staged_repair_unproven_unplaced"
+            )
         self._master_start_selected = best_start_selected
         self._master_start_unplaced = best_start_unplaced
         stats.update(
@@ -2236,13 +2226,21 @@ class ColumnGenerationPlanner:
                 "feasibility_repair_source": best_start_source,
                 "feasibility_repair_unplaced_boxes": final_unplaced_boxes,
                 "feasibility_repair_columns": sum(1 for qty in best_start_selected.values() if qty > 0),
-                "master_algorithm": "column_generation_staged_repair",
+                "master_algorithm": (
+                    "column_generation_two_stage_integer_master"
+                    if stats.get("lexicographic_integer_master_used")
+                    else "column_generation_staged_repair"
+                ),
                 "master_status": final_status,
                 "master_objective": objective,
                 "master_primal_bound": objective,
-                "master_dual_bound": final_lp_bound,
-                "master_mip_gap": self._relative_gap(objective, final_lp_bound),
+                "master_dual_bound": stats.get("lexicographic_stage2_bound", final_lp_bound),
+                "master_mip_gap": stats.get(
+                    "lexicographic_stage2_gap",
+                    self._relative_gap(objective, final_lp_bound),
+                ),
                 "master_mip_gap_is_reliable": False,
+                "master_bound_scope": "restricted_generated_column_pool",
                 "restricted_master_lp_bound": final_lp_bound,
                 "restricted_master_lp_unplaced_boxes": sum(last_lp_unplaced.values()),
                 "restricted_master_lp_fractional_column_count": None,
@@ -2262,6 +2260,106 @@ class ColumnGenerationPlanner:
                 flush=True,
             )
         return best_start_selected, best_start_unplaced, stats
+
+    def _solve_lexicographic_integer_master(
+        self,
+        start_selected: Counter[int],
+        start_unplaced: Counter[str],
+        remaining_seconds: float | None,
+    ) -> tuple[Counter[int], Counter[str], dict]:
+        """Solve the restricted integer master in two exact objective stages."""
+        from gurobipy import quicksum
+
+        Model = _GurobiModelAdapter
+        stats = {
+            "lexicographic_integer_master_used": False,
+            "lexicographic_stage1_status": "not_run",
+            "lexicographic_stage2_status": "not_run",
+            "lexicographic_stage1_optimal": False,
+            "lexicographic_stage2_optimal": False,
+        }
+        available = float(self.config.mip_time_limit) * 2.0
+        if remaining_seconds is not None:
+            available = max(0.0, min(available, float(remaining_seconds)))
+        if available < 2.0:
+            stats["lexicographic_skip_reason"] = "insufficient_time"
+            return Counter(start_selected), Counter(start_unplaced), stats
+
+        def apply_start(vars_by_kind: dict, selected: Counter[int], unplaced: Counter[str]) -> None:
+            for idx, var in vars_by_kind["column"].items():
+                var.Start = 1.0 if selected.get(idx, 0) > 0 else 0.0
+            for group_id, var in vars_by_kind["unplaced"].items():
+                var.Start = float(max(0, int(unplaced.get(group_id, 0))))
+
+        stage1, stage1_vars, _ = self._build_restricted_master(
+            Model,
+            quicksum,
+            relax=False,
+            objective_mode="min_unplaced",
+        )
+        apply_start(stage1_vars, start_selected, start_unplaced)
+        stage1_limit = max(1.0, available / 2.0)
+        self._set_gurobi_param(stage1, "TimeLimit", stage1_limit)
+        self._set_gurobi_param(stage1, "MIPGap", 0.0)
+        stage1.optimize()
+        stage1_status = self._gurobi_status_name(stage1)
+        stats["lexicographic_stage1_status"] = stage1_status
+        stats["lexicographic_stage1_optimal"] = stage1_status == "optimal"
+        if self._gurobi_solution_count(stage1) <= 0:
+            self._free_gurobi_model(stage1)
+            stats["lexicographic_skip_reason"] = "stage1_no_solution"
+            return Counter(start_selected), Counter(start_unplaced), stats
+        stage1_selected = Counter(
+            {
+                idx: int(round(self._gurobi_value(stage1, var)))
+                for idx, var in stage1_vars["column"].items()
+                if self._gurobi_value(stage1, var) > 0.5
+            }
+        )
+        stage1_unplaced = self._gurobi_unplaced_values(stage1, stage1_vars)
+        optimum_unplaced = int(sum(stage1_unplaced.values()))
+        stats["lexicographic_stage1_unplaced_boxes"] = optimum_unplaced
+        stats["lexicographic_stage1_bound"] = self._gurobi_dual_bound(stage1)
+        self._free_gurobi_model(stage1)
+
+        stage2, stage2_vars, _ = self._build_restricted_master(
+            Model,
+            quicksum,
+            relax=False,
+            objective_mode="full",
+            fixed_unplaced_total=optimum_unplaced,
+        )
+        preferred_selected = start_selected if sum(start_unplaced.values()) == optimum_unplaced else stage1_selected
+        preferred_unplaced = start_unplaced if sum(start_unplaced.values()) == optimum_unplaced else stage1_unplaced
+        apply_start(stage2_vars, preferred_selected, preferred_unplaced)
+        self._set_gurobi_param(stage2, "TimeLimit", max(1.0, available - stage1_limit))
+        self._set_gurobi_param(stage2, "MIPGap", max(0.0, float(self.config.mip_gap)))
+        stage2.optimize()
+        stage2_status = self._gurobi_status_name(stage2)
+        stats["lexicographic_stage2_status"] = stage2_status
+        stats["lexicographic_stage2_optimal"] = stage2_status == "optimal"
+        if self._gurobi_solution_count(stage2) <= 0:
+            self._free_gurobi_model(stage2)
+            stats["lexicographic_skip_reason"] = "stage2_no_solution"
+            return stage1_selected, stage1_unplaced, stats
+        selected = Counter(
+            {
+                idx: int(round(self._gurobi_value(stage2, var)))
+                for idx, var in stage2_vars["column"].items()
+                if self._gurobi_value(stage2, var) > 0.5
+            }
+        )
+        unplaced = self._gurobi_unplaced_values(stage2, stage2_vars)
+        stats.update(
+            {
+                "lexicographic_integer_master_used": True,
+                "lexicographic_stage2_objective": self._gurobi_objective_value(stage2),
+                "lexicographic_stage2_bound": self._gurobi_dual_bound(stage2),
+                "lexicographic_stage2_gap": self._gurobi_gap(stage2),
+            }
+        )
+        self._free_gurobi_model(stage2)
+        return selected, unplaced, stats
 
     def _stage0_unplaced_column_closure(self, unplaced: Counter[str]) -> dict:
         stats = {
@@ -2486,6 +2584,7 @@ class ColumnGenerationPlanner:
         quicksum,
         relax: bool,
         objective_mode: str = "full",
+        fixed_unplaced_total: int | None = None,
     ):
         model = Model("yard_export_row_column_generation_gurobi")
         self._configure_gurobi_output(model)
@@ -2736,6 +2835,12 @@ class ColumnGenerationPlanner:
                 quicksum(unplaced.values()) <= sum(self._master_seed_unplaced.values()),
                 name="seed_unplaced_cap",
             )
+        lexicographic_unplaced_limit = None
+        if not relax and fixed_unplaced_total is not None:
+            lexicographic_unplaced_limit = model.addCons(
+                quicksum(unplaced.values()) == int(fixed_unplaced_total),
+                name="lexicographic_unplaced_total",
+            )
 
         relaxed_objective_constraints = {}
         if objective_mode == "min_unplaced":
@@ -2789,6 +2894,7 @@ class ColumnGenerationPlanner:
             "required_area_limit": required_area_limit,
             "required_group_bay_limit": required_group_bay_limit,
             "seed_unplaced_limit": seed_unplaced_limit,
+            "lexicographic_unplaced_limit": lexicographic_unplaced_limit,
             **relaxed_objective_constraints,
         }
 
@@ -2807,32 +2913,32 @@ class ColumnGenerationPlanner:
         member. Known 40/45-ft import reservations must fit in the remaining
         pair capacity.
         """
-        lost_by_pair = {}
+        unavailable_by_pair = {}
         loss_link = {}
         vtype = "C" if relax else "B"
         loss_penalty = 0.0 if objective_mode == "min_unplaced" else self._twenty_segment_loss_penalty()
         for pair, capacity in sorted(self.large_pair_capacity.items()):
             indices = sorted(set(twenty_cols_by_large_pair.get(pair, [])))
-            lost = model.addVar(
+            unavailable = model.addVar(
                 lb=0.0,
                 ub=1.0,
                 vtype=vtype,
                 obj=loss_penalty * int(capacity),
-                name=f"large_pair_lost_{self._key_name(pair)}",
+                name=f"large_pair_unavailable_{self._key_name(pair)}",
             )
-            lost_by_pair[pair] = lost
+            unavailable_by_pair[pair] = unavailable
             for idx in indices:
                 loss_link[(pair, idx)] = model.addCons(
-                    columns[idx] <= lost,
+                    columns[idx] <= unavailable,
                     name=f"large_pair_loss_link_{len(loss_link)}",
                 )
             if indices:
                 model.addCons(
-                    lost <= quicksum(columns[idx] for idx in indices),
+                    unavailable <= quicksum(columns[idx] for idx in indices),
                     name=f"large_pair_loss_exact_{self._key_name(pair)}",
                 )
             else:
-                model.addCons(lost == 0.0, name=f"large_pair_loss_zero_{self._key_name(pair)}")
+                model.addCons(unavailable == 0.0, name=f"large_pair_loss_zero_{self._key_name(pair)}")
 
         reservation = {}
         import_large_by_area: Counter[str] = Counter()
@@ -2849,7 +2955,7 @@ class ColumnGenerationPlanner:
                 if self.bays[pair[0]].area_no == area_no
             ]
             reservation[area_no] = model.addCons(
-                quicksum(int(capacity) * (1.0 - lost_by_pair[pair]) for pair, capacity in pairs)
+                quicksum(int(capacity) * (1.0 - unavailable_by_pair[pair]) for pair, capacity in pairs)
                 >= int(required),
                 name=f"import_large_pair_reservation_{area_no}",
             )
@@ -2857,7 +2963,7 @@ class ColumnGenerationPlanner:
             if required_45 > 0:
                 reservation[(area_no, "45")] = model.addCons(
                     quicksum(
-                        int(self.large_pair_capacity_45.get(pair, 0)) * (1.0 - lost_by_pair[pair])
+                        int(self.large_pair_capacity_45.get(pair, 0)) * (1.0 - unavailable_by_pair[pair])
                         for pair, _capacity in pairs
                     )
                     >= required_45,
@@ -5056,20 +5162,13 @@ class ColumnGenerationPlanner:
         return self._is_export_voyage(col.voyage_id) and self._is_e_area(col.area_no)
 
     def _export_e_area_max_bays(self) -> int | None:
-        limit = int(getattr(self.config, "export_e_area_max_bays_per_voyage_area", 2) or 0)
-        if limit < 0:
-            return None
-        return limit
+        return None
 
     def _export_e_area_size_rank(self, group: SmallBoxGroup, area_no: str) -> int:
-        if not self._is_export_e_group_area(group, area_no):
-            return 0
-        return 0 if group.size in {"40", "45"} else 1
+        return 0
 
     def _export_e_area_non_40_penalty(self, group: SmallBoxGroup, area_no: str) -> float:
-        if self._export_e_area_size_rank(group, area_no) <= 0:
-            return 0.0
-        return max(0.0, float(getattr(self.config, "export_e_area_non_40_penalty", 0.0) or 0.0))
+        return 0.0
 
     def _user_area_policy_allows(self, voyage_id: str, area_no: str) -> bool:
         return True
@@ -5163,11 +5262,6 @@ class ColumnGenerationPlanner:
     def _column_base_cost(self, group: SmallBoxGroup, bay_key: str) -> float:
         bay = self.bays[bay_key]
         cost = 0.0
-        if not self.block_by_bay.get((bay.area_no, bay_key)):
-            cost += self.config.non_preferred_block_penalty
-        cost += self._export_e_area_non_40_penalty(group, bay.area_no)
-        if bay.is_fallback_bay:
-            cost += self.config.fallback_bay_penalty
         if self._user_bay_policy_requires(group, bay_key):
             cost -= float(self.config.required_area_reward)
         existing_bay_load = self._existing_coarse_bay_load_for_group(group, bay_key)
@@ -5198,10 +5292,7 @@ class ColumnGenerationPlanner:
         return cost
 
     def _area_fallback_tier_penalty(self, group: SmallBoxGroup, area_no: str) -> float:
-        tier = self._area_fallback_tier_for_group(group, area_no)
-        if tier == 0:
-            return 0.0
-        return float(self.config.big_plan_fallback_tier_penalty) * tier
+        return 0.0
 
     def _is_big_plan_area_for_group(self, group: SmallBoxGroup, area_no: str) -> bool:
         if area_no in self.problem.assigned_areas.get((group.voyage_id, group.status), set()):
@@ -5567,36 +5658,16 @@ class ColumnGenerationPlanner:
             if pair[0] in used_twenty_bays or pair[1] in used_twenty_bays
         )
 
-    def _twenty_bay_static_cost(self, group: SmallBoxGroup, bay_key: str) -> float:
-        if group.size != "20":
-            return 0.0
-        reward = float(getattr(self.config, "twenty_isolated_bay_reward", 0.0) or 0.0)
-        segment = self._large_segment_key_for_20_bay(bay_key)
-        if segment is None:
-            return 0.0 if self._bay_existing_size_modes(bay_key) else -reward
-        loss = self._twenty_segment_static_loss_for_bay(bay_key)
-        if loss <= 0:
-            return -reward
-        return self._twenty_segment_loss_penalty() * loss
-
     def _twenty_bay_state_cost(self, group: SmallBoxGroup, bay_key: str, state: dict | None) -> float:
         if group.size != "20":
             return 0.0
-        reward = float(getattr(self.config, "twenty_isolated_bay_reward", 0.0) or 0.0)
-        segment = self._large_segment_key_for_20_bay(bay_key)
-        if segment is None:
-            if self._bay_existing_size_modes(bay_key):
-                return 0.0
-            if state is not None and state.get("bay_load", Counter()).get(bay_key, 0) > 0:
-                return 0.0
-            return -reward
-        loss = self._twenty_segment_incremental_loss(bay_key, state)
-        if loss <= 0:
-            used = set(state.get("twenty_segment_used_bays", set())) if state is not None else set()
-            if any(self.large_segment_by_bay.get(key) == segment for key in used):
-                return -float(getattr(self.config, "twenty_large_segment_used_zero_loss_reward", 0.0) or 0.0)
-            return -reward
-        return float(getattr(self.config, "twenty_large_segment_fresh_loss_penalty", 0.0) or 0.0) * loss
+        pair = self.large_pair_by_member.get(bay_key)
+        if pair is None:
+            return 0.0
+        used = set(state.get("twenty_segment_used_bays", set())) if state is not None else set()
+        if pair[0] in used or pair[1] in used:
+            return 0.0
+        return self._twenty_segment_loss_penalty() * int(self.large_pair_capacity.get(pair, 0))
 
     def _twenty_segment_loss_penalty(self) -> float:
         total_pair_capacity = max(1, int(sum(self.large_pair_capacity.values())))
@@ -5893,7 +5964,8 @@ class ColumnGenerationPlanner:
 
     def _area_guidance_penalty(self) -> float:
         guided_boxes = max(1, int(sum(self.quota_by_key.values())))
-        return float(self.config.area_guidance_deviation_penalty) / guided_boxes
+        # One moved box creates one shortage and one excess in the L1 vector.
+        return float(self.config.area_guidance_deviation_penalty) / (2.0 * guided_boxes)
 
     def _area_activation_penalty(self) -> float:
         return float(self.config.small_plan_group_area_split_penalty) / max(1, len(self.groups))
@@ -5908,8 +5980,17 @@ class ColumnGenerationPlanner:
         if not berth:
             return 0.0
         distance = self.problem.berth_distances.get((area_no, berth))
-        if distance is None:
+        berth_distances = [
+            float(value)
+            for (candidate_area, candidate_berth), value in self.problem.berth_distances.items()
+            if candidate_berth == berth and float(value) > 0
+        ]
+        if not berth_distances:
+            # The whole voyage is excluded when its berth has no distance data.
             return 0.0
+        if distance is None:
+            # A partially missing matrix entry must never look like zero travel.
+            distance = max(berth_distances)
         max_distance = max(
             (float(value) for value in self.problem.berth_distances.values() if float(value) > 0),
             default=1.0,
@@ -6147,29 +6228,23 @@ class ColumnGenerationPlanner:
         actual = self._medium_area_size_counter(medium_rows)
         total = sum(actual.values())
         inherited = sum(min(qty, int(self.quota_by_key.get(key, 0) or 0)) for key, qty in actual.items())
-        deviated = max(0, total - inherited)
+        transferred = max(0, total - inherited)
         return {
             "total_boxes": total,
             "inherited_boxes": inherited,
-            "deviated_boxes": deviated,
+            "transferred_boxes": transferred,
             "inheritance_ratio": round(inherited / total, 6) if total else 1.0,
-            "deviation_ratio": round(deviated / total, 6) if total else 0.0,
+            "transfer_ratio": round(transferred / total, 6) if total else 0.0,
         }
 
     def _medium_inheritance_energy_components(self, medium_rows: list[dict]) -> dict[str, float]:
         actual = self._medium_area_size_counter(medium_rows)
         components = {
-            "big_plan_fallback_tier": 0.0,
-            "area_guidance_deviation": 0.0,
+            "area_guidance_transfer": 0.0,
         }
-        for (voyage_id, flow, area_no, big_size), qty in actual.items():
-            tier = self._area_fallback_tier_for_attrs(voyage_id, flow, area_no, big_size)
-            if tier > 0:
-                components["big_plan_fallback_tier"] += self.config.big_plan_fallback_tier_penalty * tier * qty
-
         targets = self._effective_big_plan_area_size_targets()
         for key in set(targets):
-            components["area_guidance_deviation"] += self._area_guidance_penalty() * abs(
+            components["area_guidance_transfer"] += self._area_guidance_penalty() * abs(
                 actual.get(key, 0) - targets.get(key, 0.0)
             )
         components["total"] = sum(components.values())
