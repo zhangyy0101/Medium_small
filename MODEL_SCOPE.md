@@ -62,10 +62,11 @@ All active grouping rules resolve to the single operational group above.
   containers;
 - destination-port row compatibility;
 - aggregate import capacity reservation and large-pair preservation.
-- 45-ft containers may use only the explicitly identified edge large-bay
-  positions of an area; 20-ft containers may not use those positions, and an
-  area's edge positions cannot simultaneously host new 45-ft and non-45-ft
-  assignments. This is a hard overlength-clearance rule, not a preference.
+- 45-ft containers may use only the first or last feasible large-bay position
+  of an area. They remain subject to the same paired-bay, capacity, row, size,
+  height, voyage, and destination-port constraints as every other container.
+  This rule does not reserve every edge position for 45-ft containers and does
+  not impose area-wide mutual exclusion between 45-ft and non-45-ft demand.
 
 ## Retained objectives
 
@@ -77,7 +78,8 @@ activates every negative-reduced-cost pattern, and repeats until none remains.
 A time limit cannot silently terminate this certificate phase; failure to
 reach reduced-cost convergence is an error.
 
-The integer restricted master is solved in two lexicographic stages. Stage 1
+The final integer master over the complete declared pattern universe is solved
+in two lexicographic stages. Stage 1
 minimizes the number of unplaced declared containers. Stage 2 fixes that
 minimum exactly and minimizes the following operational criteria:
 
@@ -100,13 +102,13 @@ units.
 
 The stage-2 integer solution is the final reported allocation. There is no
 post-solve intra-area row relayout or separate heuristic objective; row-level
-placement patterns must enter the generated column pool and are selected by
-the same restricted master.
+placement patterns must belong to the declared pattern universe and are
+selected by the same final master.
 
 The reduced-cost certificate applies to the complete declared finite pattern
-universe. The final integer optimization remains a restricted-master MIP, not
-branch-and-price, so its MIP gap is interpreted only for the activated integer
-column pool.
+universe. The final two-stage MIP activates that entire universe, so its MIP
+gap is valid for the declared finite pattern formulation. This is not a
+branch-and-price claim for row patterns outside that declared formulation.
 
 One pair-state variable is used for both large-container preservation and
 import reservation. Assigning a 20-ft container to either member makes the

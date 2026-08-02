@@ -53,7 +53,7 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         self.assertEqual(1, stats["new_columns"])
         self.assertTrue(stats["exact_pricing"])
 
-    def test_45ft_is_edge_only_and_20ft_is_excluded_from_edge(self) -> None:
+    def test_45ft_is_edge_only_without_excluding_other_sizes(self) -> None:
         planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
         planner.bays = {
             "edge": Bay(
@@ -100,7 +100,7 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         planner._stack_count_for_group = lambda bay_key, size, group: 10
         planner._stack_unit_capacity_for_group = lambda bay_key, size, group: 1
 
-        self.assertEqual(0, planner._max_quantity_in_bay(make_group("20"), "edge"))
+        self.assertEqual(5, planner._max_quantity_in_bay(make_group("20"), "edge"))
         self.assertEqual(0, planner._max_quantity_in_bay(make_group("45"), "middle"))
         self.assertEqual(5, planner._max_quantity_in_bay(make_group("45"), "edge"))
 

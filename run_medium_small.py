@@ -78,7 +78,7 @@ def main() -> None:
     )
     result = ColumnGenerationPlanner(inputs.problem, config).solve()
 
-    write_rows(output_dir / "area_bay_summary.csv", result.medium_rows)
+    write_rows(output_dir / "area_bay_summary.csv", result.area_bay_rows)
     write_rows(output_dir / "export_row_plan.csv", result.small_rows)
     write_rows(output_dir / "unplaced_boxes.csv", result.unplaced_rows)
     write_columns(output_dir / "generated_columns.csv", result.columns)
@@ -92,7 +92,7 @@ def main() -> None:
             "large_plan": str(large_plan_path),
             "planning_time": planning_time.isoformat(),
             "voyages": voyages,
-            "area_bay_summary_row_count": len(result.medium_rows),
+            "area_bay_summary_row_count": len(result.area_bay_rows),
             "export_row_plan_row_count": len(result.small_rows),
             "unplaced_row_count": len(result.unplaced_rows),
             "unplaced_boxes": result.diagnostics.get("unplaced_boxes"),

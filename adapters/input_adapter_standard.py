@@ -316,8 +316,8 @@ class ProblemData:
     target_voyages: list[str]
     export_voyages: set[str] | None = None
     import_area_size_reservation: dict[tuple[str, str], int] = field(default_factory=dict)
-    existing_coarse_area_load: dict[tuple[str, ...], int] = field(default_factory=dict)
-    existing_coarse_bay_load: dict[tuple[str, ...], int] = field(default_factory=dict)
+    existing_group_area_load: dict[tuple[str, ...], int] = field(default_factory=dict)
+    existing_group_bay_load: dict[tuple[str, ...], int] = field(default_factory=dict)
     berth_distances: dict[tuple[str, str], float] = field(default_factory=dict)
     berth_by_voyage: dict[str, str] = field(default_factory=dict)
     allowed_areas_by_voyage: dict[str, set[str]] = field(default_factory=dict)
@@ -797,10 +797,9 @@ def common_attribute_intersection(values: Iterable[Sequence[str]]) -> tuple[str,
 
 def small_groupby_columns(attribute_rules: AttributeRules, voyage_id: str) -> tuple[str, ...]:
     attrs: list[str] = []
-    attrs.extend(attribute_rules.coarse_for(voyage_id))
-    attrs.extend(attribute_rules.fine_for(voyage_id))
-    # Keep no-mix attributes on the planning groups so bay/row compatibility
-    # can be evaluated even when they are not part of the user fine group.
+    attrs.extend(attribute_rules.group_for(voyage_id))
+    # Keep no-mix attributes on planning groups so compatibility can be
+    # evaluated even when an attribute is not part of the group identity.
     attrs.extend(attribute_rules.bay_no_mix_for(voyage_id))
     attrs.extend(attribute_rules.row_no_mix_for(voyage_id))
     if getattr(attribute_rules, "weight_group_enabled_for", lambda _voyage_id: False)(voyage_id):
@@ -815,7 +814,7 @@ def small_groupby_columns(attribute_rules: AttributeRules, voyage_id: str) -> tu
 
 def medium_groupby_attributes(attribute_rules: AttributeRules, voyage_id: str) -> tuple[str, ...]:
     attrs: list[str] = []
-    attrs.extend(attribute_rules.coarse_for(voyage_id))
+    attrs.extend(attribute_rules.group_for(voyage_id))
     out: list[str] = []
     for attr in attrs:
         name = attribute_output_name(attr)
@@ -851,9 +850,7 @@ def import_base_group_attributes(row: Mapping[str, Any], size_mode: str, port: s
 def import_small_groupby_columns(attribute_rules: AttributeRules, voyage_id: str, row: Mapping[str, Any], size_mode: str, port: str) -> tuple[str, ...]:
     base_attrs, _base_values, _port_label = import_base_group_attributes(row, size_mode, port)
     attrs: list[str] = list(base_attrs)
-    attrs.extend(getattr(attribute_rules, "import_shared_fine_group_attributes", ()))
-    # These are not part of the user fine group; they are carried only so the
-    # no-mix constraints have a concrete value to compare.
+    # Carry no-mix attributes so compatibility has concrete values.
     attrs.extend(attribute_rules.bay_no_mix_for(voyage_id))
     attrs.extend(attribute_rules.row_no_mix_for(voyage_id))
     if getattr(attribute_rules, "weight_group_enabled_for", lambda _voyage_id: False)(voyage_id):
@@ -1120,76 +1117,6 @@ def build_medium_small_area_controls(
     return allowed_by_voyage, priority_by_voyage, diagnostics
 
 
-def build_medium_small_bay_controls(
-    input_guandong: InputAdapterGd,
-    groups: Sequence[BoxGroup],
-    small_groups: Sequence[SmallBoxGroup],
-    bays: Mapping[str, Bay],
-) -> tuple[dict[str, set[str]], dict[str, set[str]], list[dict[str, Any]], dict[str, Any]]:
-    adjust_plan_info = getattr(input_guandong, "adjust_plan_info", {})
-    required: defaultdict[str, set[str]] = defaultdict(set)
-    blocked: defaultdict[str, set[str]] = defaultdict(set)
-    rule_records: list[dict[str, Any]] = []
-    summary = {
-        "matched_rules": 0,
-        "matched_groups": 0,
-        "unknown_bays": [],
-        "ignored_rules": 0,
-    }
-
-    group_by_voyage: defaultdict[str, list[Any]] = defaultdict(list)
-    for group in list(groups) + list(small_groups):
-        group_by_voyage[normalize_voyage(getattr(group, "voyage_id", ""))].append(group)
-
-    for plan_level in ("medium_plan", "small_plan"):
-        for voyage_id, rules in _plan_adjust_rules(adjust_plan_info, plan_level).items():
-            normalized_voyage = normalize_voyage(voyage_id)
-            if isinstance(rules, Mapping):
-                rules = [rules]
-            if not isinstance(rules, Sequence) or isinstance(rules, (str, bytes)):
-                summary["ignored_rules"] += 1
-                continue
-            for rule in rules:
-                if not isinstance(rule, Mapping):
-                    summary["ignored_rules"] += 1
-                    continue
-                attr_filter = _canonical_adjust_attributes(rule.get("attribute", {}))
-                add_bays, add_unknown = _canonical_adjust_bays(rule.get("add"), bays)
-                remove_bays, remove_unknown = _canonical_adjust_bays(rule.get("remove"), bays)
-                rule_records.append(
-                    {
-                        "plan_level": plan_level,
-                        "voyage_id": normalized_voyage,
-                        "attributes": dict(attr_filter),
-                        "required_bays": set(add_bays),
-                        "blocked_bays": set(remove_bays),
-                    }
-                )
-                matched_groups = [
-                    group
-                    for group in group_by_voyage.get(normalized_voyage, [])
-                    if _group_matches_adjust_attributes(group, attr_filter)
-                ]
-                if not matched_groups:
-                    continue
-                summary["matched_rules"] += 1
-                summary["matched_groups"] += len(matched_groups)
-                for group in matched_groups:
-                    required[group.group_id].update(add_bays)
-                    blocked[group.group_id].update(remove_bays)
-                for item in add_unknown + remove_unknown:
-                    summary["unknown_bays"].append(
-                        {"plan_level": plan_level, "voyage_id": normalized_voyage, "bay": item}
-                    )
-
-    cleaned_required = {group_id: bays - blocked.get(group_id, set()) for group_id, bays in required.items()}
-    cleaned_required = {group_id: values for group_id, values in cleaned_required.items() if values}
-    cleaned_blocked = {group_id: values for group_id, values in blocked.items() if values}
-    summary["required_group_count"] = len(cleaned_required)
-    summary["blocked_group_count"] = len(cleaned_blocked)
-    summary["required_bay_count"] = sum(len(values) for values in cleaned_required.values())
-    summary["blocked_bay_count"] = sum(len(values) for values in cleaned_blocked.values())
-    return cleaned_required, cleaned_blocked, rule_records, summary
 
 
 def build_user_design_area_bay_allowlist(
@@ -2923,17 +2850,17 @@ def read_yard_by_voyage_port_size(
     return dict(out)
 
 
-def existing_coarse_group_loads(
+def existing_operational_group_loads(
     input_guandong: InputAdapterGd,
     planning_time: datetime,
     target_voyages: set[str],
     valid_bay_keys: set[str],
     attribute_rules: AttributeRules | None = None,
 ) -> tuple[Counter[tuple[str, ...]], Counter[tuple[str, ...]]]:
-    """Count current yard boxes for target voyages by the configured coarse key.
+    """Count current yard boxes by the single operational-group key.
 
     Current yard boxes are not part of the new demand, but their location is
-    useful as a soft anchor for placing the same configured coarse group nearby.
+    useful as a soft anchor for placing the same operational group nearby.
     """
     attribute_rules = attribute_rules or read_attribute_rules(input_guandong, sorted(target_voyages))
     frame = getattr(input_guandong, "bay_slots_detail", None)
@@ -2998,9 +2925,9 @@ def existing_coarse_group_loads(
             record = normalized_doc_record(row, flow, size, port)
             record["IYC_EVOY_ID"] = normalize_voyage(row.get("IYC_EVOY_ID"))
             record["IYC_IVOY_ID"] = normalize_voyage(row.get("IYC_IVOY_ID"))
-            coarse_key = configured_coarse_anchor_key(record, voyage_id, attribute_rules, export_voyages)
+            group_key = configured_operational_group_key(record, voyage_id, attribute_rules, export_voyages)
             container_key = str(row.get("_container_key", ""))
-            anchor_container_key = (coarse_key, container_key)
+            anchor_container_key = (group_key, container_key)
             if container_key and anchor_container_key in seen_anchor_containers:
                 continue
             if container_key:
@@ -3009,12 +2936,12 @@ def existing_coarse_group_loads(
             bay_key = str(row.get("_bay_key", ""))
             if not area_no or not bay_key:
                 continue
-            area_load[coarse_key + (area_no,)] += 1
-            bay_load[coarse_key + (area_no, bay_key)] += 1
+            area_load[group_key + (area_no,)] += 1
+            bay_load[group_key + (area_no, bay_key)] += 1
     return area_load, bay_load
 
 
-def configured_coarse_anchor_key(
+def configured_operational_group_key(
     row: Mapping[str, Any],
     voyage_id: str,
     attribute_rules: AttributeRules,
@@ -4324,7 +4251,7 @@ def build_problem(
         misplaced_bay_exclusion_ratio,
         attribute_rules,
     )
-    existing_coarse_area_load, existing_coarse_bay_load = existing_coarse_group_loads(
+    existing_group_area_load, existing_group_bay_load = existing_operational_group_loads(
         input_guandong,
         planning_time,
         set(target_voyages),
@@ -4350,8 +4277,8 @@ def build_problem(
         target_voyages=target_voyages,
         export_voyages=export_voyages,
         import_area_size_reservation=dict(import_area_size_reservation),
-        existing_coarse_area_load=dict(existing_coarse_area_load),
-        existing_coarse_bay_load=dict(existing_coarse_bay_load),
+        existing_group_area_load=dict(existing_group_area_load),
+        existing_group_bay_load=dict(existing_group_bay_load),
         berth_distances=berth_distances,
         berth_by_voyage=berth_by_voyage,
         allowed_areas_by_voyage={

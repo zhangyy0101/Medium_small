@@ -23,10 +23,7 @@ class AttributeRules:
             "row_no_mix_attributes": list(self.row_no_mix_attributes),
         }
 
-    def coarse_for(self, voyage_id: object) -> tuple[str, ...]:
-        return self.group_attributes
-
-    def fine_for(self, voyage_id: object) -> tuple[str, ...]:
+    def group_for(self, voyage_id: object) -> tuple[str, ...]:
         return self.group_attributes
 
     def bay_no_mix_for(self, voyage_id: object) -> tuple[str, ...]:
@@ -211,8 +208,8 @@ class ProblemData:
     target_voyages: list[str]
     export_voyages: set[str] | None = None
     import_area_size_reservation: dict[tuple[str, str], int] = field(default_factory=dict)
-    existing_coarse_area_load: dict[tuple[str, ...], int] = field(default_factory=dict)
-    existing_coarse_bay_load: dict[tuple[str, ...], int] = field(default_factory=dict)
+    existing_group_area_load: dict[tuple[str, ...], int] = field(default_factory=dict)
+    existing_group_bay_load: dict[tuple[str, ...], int] = field(default_factory=dict)
     berth_distances: dict[tuple[str, str], float] = field(default_factory=dict)
     berth_by_voyage: dict[str, str] = field(default_factory=dict)
     tops_reserved_slot_count: int = 0
