@@ -117,8 +117,9 @@ criterion.
 - document-floor and forecast-fallback demand construction.
 - concurrent-operation conflict penalties.
 
-When a voyage-size demand has no matching upstream allocation, it is excluded
-from the area-guidance deviation objective. Its location is determined by
-physical feasibility, dispersion, incumbent proximity, large-pair
-preservation, and quantity-weighted berth distance; a zero target is never
-created for missing guidance.
+When an entire voyage-flow-size demand has no matching upstream allocation, it
+is excluded from the area-guidance transfer objective. Once that combination
+has valid guidance, however, every candidate area is evaluated: areas absent
+from its upstream allocation have target zero. This makes one half of the L1
+deviation exactly equal to the number of boxes transferred away from the
+normalized upstream area pattern.

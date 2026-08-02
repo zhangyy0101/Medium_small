@@ -1479,7 +1479,11 @@ class ColumnGenerationPlanner:
             - self._twenty_run_violation_count_for_bays(set(self.existing_twenty_bays)),
         )
 
-        target_keys: set[tuple[str, str, str, str]] = set()
+        target_keys = {
+            key
+            for key in actual_quota
+            if self._has_area_guidance(key[0], key[1], key[3])
+        }
         for key, qty in self.quota_by_key.items():
             voyage_id, flow, _area_no, big_size = key
             if qty > 0 and self.voyage_flow_size_demand[(voyage_id, flow, big_size)] > 0:
@@ -3084,7 +3088,11 @@ class ColumnGenerationPlanner:
         coarse_area_bay_cols,
         voyage_area_cols,
     ) -> dict[str, dict]:
-        area_size_keys: set[tuple[str, str, str, str]] = set()
+        area_size_keys = {
+            key
+            for key in area_size_cols
+            if self._has_area_guidance(key[0], key[1], key[3])
+        }
         for key, qty in self.quota_by_key.items():
             voyage_id, flow, _area_no, big_size = key
             if qty > 0 and self.voyage_flow_size_demand[(voyage_id, flow, big_size)] > 0:
@@ -3144,7 +3152,11 @@ class ColumnGenerationPlanner:
             coarse_area_keys = set(coarse_area_cols)
             self._add_coarse_group_area_objectives(quicksum, model, columns, coarse_area_keys, coarse_area_cols)
 
-        area_size_keys: set[tuple[str, str, str, str]] = set()
+        area_size_keys = {
+            key
+            for key in area_size_cols
+            if self._has_area_guidance(key[0], key[1], key[3])
+        }
         for key, qty in self.quota_by_key.items():
             voyage_id, flow, _area_no, big_size = key
             if qty > 0 and self.voyage_flow_size_demand[(voyage_id, flow, big_size)] > 0:
@@ -6244,7 +6256,12 @@ class ColumnGenerationPlanner:
             "area_guidance_transfer": 0.0,
         }
         targets = self._effective_big_plan_area_size_targets()
-        for key in set(targets):
+        evaluated_keys = set(targets) | {
+            key
+            for key in actual
+            if self._has_area_guidance(key[0], key[1], key[3])
+        }
+        for key in evaluated_keys:
             components["area_guidance_transfer"] += self._area_guidance_penalty() * abs(
                 actual.get(key, 0) - targets.get(key, 0.0)
             )
