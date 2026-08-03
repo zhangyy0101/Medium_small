@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import json
 import re
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta
-from pathlib import Path
+from datetime import datetime
 from typing import Any, Mapping, Sequence
 
 import pandas as pd
@@ -13,52 +11,12 @@ from .input_adapter_gd import InputAdapterGd
 
 from yard_planning.models import (
     AttributeRules, Bay, BigPlanRow, DeclaredExportDemand, EXPORT_VOYAGE_ROW_NO_MIX_ATTR,
-    ExportGroup, PlanningInputs, ProblemData, VoyageSchedule,
+    ExportGroup, PlanningInputs, ProblemData,
 )
 
 
 DEFAULT_TARGET_BIG_PLAN_FLOWS = frozenset({"OF", "IF", "IZ", "T", "OZ"})
 SIZE_MODES = ("20", "40", "45")
-
-
-def parse_datetime(value: object) -> datetime | None:
-    if value is None or pd.isna(value):
-        return None
-    if isinstance(value, datetime):
-        return value
-    if isinstance(value, pd.Timestamp):
-        return value.to_pydatetime()
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        try:
-            return pd.to_datetime(value, unit="D", origin="1899-12-30").to_pydatetime()
-        except (ValueError, TypeError, OverflowError):
-            return None
-    text = str(value).strip()
-    if not text or text.lower() == "nan":
-        return None
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S.%f",
-        "%Y-%m-%d %H:%M:%S",
-        "%Y/%m/%d %H:%M:%S",
-        "%Y/%m/%d %H:%M",
-        "%Y-%m-%d",
-        "%Y/%m/%d",
-    ):
-        try:
-            return datetime.strptime(text, fmt)
-        except ValueError:
-            pass
-    parsed = pd.to_datetime(text, errors="coerce")
-    if not pd.isna(parsed):
-        return parsed.to_pydatetime()
-    return None
-
-
-def parse_planning_time(value: str) -> pd.Timestamp:
-    planning_time = pd.Timestamp(value)
-    if pd.isna(planning_time):
-        raise ValueError(f"Invalid planning time: {value}")
-    return planning_time
 
 
 def date_key(value: str) -> str:
@@ -295,7 +253,7 @@ def _take_over_vessels(input_guandong: InputAdapterGd, direction: str) -> list[s
 
 def classified_export_voyages(input_guandong: InputAdapterGd) -> set[str]:
     """Return voyages explicitly classified as export, independent of box flow."""
-    cache = adapter_runtime_cache(input_guandong)
+    cache = planning_runtime_cache(input_guandong)
     cached = cache.get("classified_export_voyages")
     if isinstance(cached, set):
         return set(cached)
@@ -350,20 +308,20 @@ def size_enabled_mask(values: pd.Series, size_mode: str) -> pd.Series:
     return missing | enabled
 
 
-def adapter_runtime_cache(input_guandong: InputAdapterGd) -> dict[str, Any]:
-    cache = getattr(input_guandong, "_standard_runtime_cache", None)
+def planning_runtime_cache(input_guandong: InputAdapterGd) -> dict[str, Any]:
+    cache = getattr(input_guandong, "_planning_runtime_cache", None)
     if isinstance(cache, dict):
         return cache
     cache = {}
     try:
-        setattr(input_guandong, "_standard_runtime_cache", cache)
+        setattr(input_guandong, "_planning_runtime_cache", cache)
     except Exception:
         return {}
     return cache
 
 
 def read_vessel_info(input_guandong: InputAdapterGd) -> pd.DataFrame:
-    cache = adapter_runtime_cache(input_guandong)
+    cache = planning_runtime_cache(input_guandong)
     cached = cache.get("vessel_info")
     if isinstance(cached, pd.DataFrame):
         return cached.copy()
@@ -376,74 +334,22 @@ def read_vessel_info(input_guandong: InputAdapterGd) -> pd.DataFrame:
     fallback_berth = frame.get("VBT_BTH_PBTHNO", pd.Series(index=frame.index)).map(normalize_code)
     frame["berth_no"] = frame["berth_no"].where(frame["berth_no"].ne(""), fallback_berth)
     frame["berth_key"] = frame["berth_no"].map(lambda value: f"B{value}" if value and not str(value).startswith("B") else value)
-    for column in ["SCD_RCVSTDT", "SCD_RCVEDDT", "VBT_ABTHDT", "VBT_PBTHDT", "VBT_ADPTDT", "VBT_PDPTDT"]:
-        if column in frame.columns:
-            frame[column] = frame[column].map(parse_datetime)
-    frame["planned_berth_time"] = pd.to_datetime(
-        frame.get("VBT_PBTHDT", pd.Series(index=frame.index, dtype=object)),
-        errors="coerce",
-    )
-    frame["planned_departure_time"] = pd.to_datetime(
-        frame.get("VBT_PDPTDT", pd.Series(index=frame.index, dtype=object)),
-        errors="coerce",
-    )
     cache["vessel_info"] = frame
     return frame.copy()
 
 
-def read_vessel_schedules(input_guandong: InputAdapterGd) -> dict[str, VoyageSchedule]:
-
+def read_export_berths(input_guandong: InputAdapterGd, target_voyages: Sequence[str]) -> dict[str, str]:
     frame = read_vessel_info(input_guandong)
-    schedules: dict[str, VoyageSchedule] = {}
+    target_set = {normalize_voyage(value) for value in target_voyages}
+    berths: dict[str, str] = {}
     for row in frame.to_dict("records"):
         if row.get("ie_flag") != "E":
             continue
         voyage_id = normalize_voyage(row.get("voy_id"))
-        receive_start = row.get("SCD_RCVSTDT")
-        receive_end = row.get("SCD_RCVEDDT")
-        berth_time = row.get("VBT_ABTHDT") or row.get("VBT_PBTHDT")
-        departure_time = row.get("VBT_ADPTDT") or row.get("VBT_PDPTDT")
         berth_no = normalize_code(row.get("berth_no"))
-        if not (voyage_id and receive_start and receive_end and berth_time and departure_time):
-            continue
-        schedules[voyage_id] = VoyageSchedule(
-            voyage_id=voyage_id,
-            receive_start=receive_start,
-            receive_end=receive_end,
-            berth_no=berth_no,
-            berth_time=berth_time,
-            departure_time=departure_time,
-        )
-    return schedules
-
-
-def read_target_vessel_schedules(
-    input_guandong: InputAdapterGd,
-    target_voyages: list[str],
-    planning_time: datetime,
-    horizon_hours: float,
-) -> dict[str, VoyageSchedule]:
-    schedules = read_vessel_schedules(input_guandong)
-    frame = read_vessel_info(input_guandong)
-    rows_by_voyage = {
-        normalize_voyage(row.get("voy_id")): row
-        for row in frame.to_dict("records")
-        if row.get("ie_flag") == "E"
-    }
-    for voyage_id in target_voyages:
-        if voyage_id in schedules:
-            continue
-        row = rows_by_voyage.get(voyage_id, {})
-        berth_no = normalize_code(row.get("berth_no"))
-        schedules[voyage_id] = VoyageSchedule(
-            voyage_id=voyage_id,
-            receive_start=planning_time,
-            receive_end=planning_time + timedelta(hours=horizon_hours),
-            berth_no=berth_no,
-            berth_time=planning_time + timedelta(hours=horizon_hours),
-            departure_time=planning_time + timedelta(hours=horizon_hours + 12),
-        )
-    return schedules
+        if voyage_id in target_set and berth_no:
+            berths[voyage_id] = f"B{berth_no}" if not berth_no.startswith("B") else berth_no
+    return berths
 
 
 def read_area_functions(input_guandong: InputAdapterGd) -> dict[str, set[str]]:
@@ -560,7 +466,7 @@ def slot_range_mask_preparsed(
 
 
 def active_tops_rows(input_guandong: InputAdapterGd, planning_time: datetime) -> pd.DataFrame:
-    cache = adapter_runtime_cache(input_guandong)
+    cache = planning_runtime_cache(input_guandong)
     tops = cache.get("tops_plan_normalized")
     if not isinstance(tops, pd.DataFrame):
         raw_tops = input_guandong.tops_plan
@@ -870,7 +776,6 @@ def build_bays(
     allowed_areas: set[str],
     closed_areas: set[str],
     planning_time: datetime,
-    vessel_schedules: dict[str, VoyageSchedule],
     target_voyages: set[str],
     attribute_rules: AttributeRules | None = None,
 ) -> dict[str, Bay]:
@@ -884,22 +789,13 @@ def build_bays(
     frame = drop_reserved_slots(frame, reserved_slots)
 
     large_bay_partner_by_bay = large_bay_partner_lookup_by_bay(frame)
-    existing_large_pairs_by_member = existing_large_pair_members_by_bay(
-        frame,
-        vessel_schedules,
-        planning_time,
-    )
+    existing_large_pairs_by_member = existing_large_pair_members_by_bay(frame)
     large_shadow_slots = active_large_container_shadow_slots(
         frame,
-        vessel_schedules,
-        planning_time,
         large_bay_partner_by_bay,
         existing_large_pairs_by_member,
     )
-    available = drop_shadow_slots(
-        available_or_released_slots(frame, vessel_schedules, planning_time),
-        large_shadow_slots,
-    )
+    available = drop_shadow_slots(available_empty_slots(frame), large_shadow_slots)
     cap_by_size = capacity_by_bay_size(available)
     physical_cap = physical_capacity_by_bay(available)
     row_cap_by_size = capacity_by_bay_row_size(available)
@@ -915,8 +811,6 @@ def build_bays(
         row_physical_cap_by_bay[(area_no, bay_no)][row_no] = qty
     existing_attrs = existing_bay_attributes(
         frame,
-        vessel_schedules,
-        planning_time,
         attribute_rules,
         large_bay_partner_by_bay=large_bay_partner_by_bay,
         existing_large_pairs_by_member=existing_large_pairs_by_member,
@@ -949,7 +843,6 @@ def build_bays(
                 for size in SIZE_MODES
             },
             row_physical_capacity=dict(row_physical_cap_by_bay.get((area_no, bay_no), {})),
-            large_bay_partner_no=large_bay_partner.get((area_no, bay_no), ""),
             large_bay_partner_key=(
                 f"{area_no}|{large_bay_partner[(area_no, bay_no)]}"
                 if (area_no, bay_no) in large_bay_partner
@@ -957,7 +850,10 @@ def build_bays(
             ),
             existing_size_modes=set(attrs.get("sizes", set())),
             existing_heights=set(attrs.get("heights", set())),
-            existing_ports=set(attrs.get("ports", set())),
+            existing_ports_by_row={
+                str(row_no): set(values)
+                for row_no, values in attrs.get("ports_by_row", {}).items()
+            },
             existing_attrs={str(k): set(v) for k, v in attrs.get("attributes", {}).items()},
             existing_attrs_by_row={
                 str(row_no): {str(k): set(v) for k, v in row_attrs.items()}
@@ -971,7 +867,6 @@ def build_bays(
                 str(row_no): {
                     str(voyage): {str(k): set(v) for k, v in voyage_attrs.items()}
                     for voyage, voyage_attrs in row_voyage_attrs.items()
-
                 }
                 for row_no, row_voyage_attrs in attrs.get("attributes_by_row_by_voyage", {}).items()
             },
@@ -1041,16 +936,12 @@ def drop_reserved_slots(frame: pd.DataFrame, reserved_slots: set[tuple[str, str,
     return frame.loc[mask].copy()
 
 
-def active_occupied(frame: pd.DataFrame, vessel_schedules: dict[str, VoyageSchedule], planning_time: datetime) -> pd.DataFrame:
-    """Current physical yard occupancy; vessel schedule arguments are kept for caller compatibility."""
+def active_occupied(frame: pd.DataFrame) -> pd.DataFrame:
+    """Return containers physically occupying the yard snapshot."""
     return frame[frame["HAS_CONTAINER"].fillna(0).astype(int).eq(1)].copy()
 
 
-def available_or_released_slots(
-    frame: pd.DataFrame,
-    vessel_schedules: dict[str, VoyageSchedule],
-    planning_time: datetime,
-) -> pd.DataFrame:
+def available_empty_slots(frame: pd.DataFrame) -> pd.DataFrame:
     """Current physical empty slots only; planned departures do not release snapshot containers."""
     return frame[frame["HAS_CONTAINER"].fillna(0).astype(int).eq(0)].copy()
 
@@ -1137,8 +1028,6 @@ def consecutive_large_pairs_from_bays(area_no: str, bay_nos: set[str]) -> list[t
 
 def existing_large_pair_members_by_bay(
     frame: pd.DataFrame,
-    vessel_schedules: dict[str, VoyageSchedule],
-    planning_time: datetime,
 ) -> dict[tuple[str, str], set[frozenset[str]]]:
     bay_set_by_area: defaultdict[str, set[str]] = defaultdict(set)
     if frame.empty:
@@ -1148,7 +1037,7 @@ def existing_large_pair_members_by_bay(
         bay_no = normalize_bay(row.get("YBY_BAYNO"))
         if area_no and bay_no:
             bay_set_by_area[area_no].add(bay_no)
-    occupied = active_occupied(frame, vessel_schedules, planning_time)
+    occupied = active_occupied(frame)
     out: defaultdict[tuple[str, str], set[frozenset[str]]] = defaultdict(set)
     if occupied.empty:
         return {}
@@ -1209,14 +1098,12 @@ def large_pair_conflicts_existing(
 
 def active_large_container_shadow_slots(
     frame: pd.DataFrame,
-    vessel_schedules: dict[str, VoyageSchedule],
-    planning_time: datetime,
     large_bay_partner_by_bay: Mapping[tuple[str, str], str],
     existing_large_pairs_by_member: Mapping[tuple[str, str], set[frozenset[str]]] | None = None,
 ) -> set[tuple[str, str, str, str, str]]:
     if not large_bay_partner_by_bay and not existing_large_pairs_by_member:
         return set()
-    occupied = active_occupied(frame, vessel_schedules, planning_time)
+    occupied = active_occupied(frame)
     if occupied.empty:
         return set()
     existing_large_pairs_by_member = existing_large_pairs_by_member or {}
@@ -1332,13 +1219,11 @@ def physical_capacity_by_bay_row(base: pd.DataFrame) -> dict[tuple[str, str, str
 
 def existing_bay_attributes(
     frame: pd.DataFrame,
-    vessel_schedules: dict[str, VoyageSchedule],
-    planning_time: datetime,
     attribute_rules: AttributeRules | None = None,
     large_bay_partner_by_bay: Mapping[tuple[str, str], str] | None = None,
     existing_large_pairs_by_member: Mapping[tuple[str, str], set[frozenset[str]]] | None = None,
 ) -> dict[tuple[str, str], dict[str, set[str]]]:
-    occupied = active_occupied(frame, vessel_schedules, planning_time)
+    occupied = active_occupied(frame)
     out: dict[tuple[str, str], dict[str, set[str]]] = {}
     dynamic_attrs: list[str] = []
     if attribute_rules is not None:
@@ -1382,7 +1267,7 @@ def existing_bay_attributes(
                 {
                     "sizes": set(),
                     "heights": set(),
-                    "ports": set(),
+                    "ports_by_row": {},
                     "attributes": {},
                     "attributes_by_row": {},
                     "attributes_by_voyage": {},
@@ -1392,9 +1277,9 @@ def existing_bay_attributes(
             attrs["sizes"].add(size)
             attrs["heights"].add(normalize_text(row.get("IYC_CHEIGHTCD"), "UNK"))
             port = normalize_text(row.get("IYC_POT_UNLDPORT"))
-            if port:
-                attrs["ports"].add(port)
             row_no = normalize_row(row.get("YST_ROWNO"))
+            if port and row_no:
+                attrs["ports_by_row"].setdefault(row_no, set()).add(port)
             row_attrs = attrs["attributes_by_row"].setdefault(row_no, {}) if row_no else {}
             if row_no and row_voyages:
                 row_attrs.setdefault(EXPORT_VOYAGE_ROW_NO_MIX_ATTR, set()).update(row_voyages)
@@ -1419,7 +1304,6 @@ def build_problem(
     input_guandong: InputAdapterGd,
     big_plan: list[BigPlanRow],
     planning_time: datetime,
-    horizon_hours: float,
     target_voyages: list[str],
 ) -> ProblemData:
     closed = read_closed_areas(input_guandong)
@@ -1439,7 +1323,7 @@ def build_problem(
     # controls. Feasibility is defined by yard functions and the upstream big
     # plan; operator overrides remain outside the mathematical model.
     allowed_areas_by_voyage = {voyage_id: set(function_areas) for voyage_id in target_voyages}
-    vessel_schedules = read_target_vessel_schedules(input_guandong, target_voyages, planning_time, horizon_hours)
+    berth_by_voyage = read_export_berths(input_guandong, target_voyages)
     plan_date = planning_time.date().isoformat()
     target_big_plan_flows = {planning_area_flow(flow) for flow in DEFAULT_TARGET_BIG_PLAN_FLOWS}
     target_voyage_set = set(target_voyages)
@@ -1528,7 +1412,6 @@ def build_problem(
         allowed_areas,
         closed,
         planning_time,
-        vessel_schedules,
         set(target_voyages),
         attribute_rules,
     )
@@ -1540,11 +1423,6 @@ def build_problem(
         attribute_rules,
     )
     berth_distances = read_distance_matrix(input_guandong)
-    berth_by_voyage = {
-        voyage_id: f"B{vessel_schedules[voyage_id].berth_no}"
-        for voyage_id in target_voyages
-        if voyage_id in vessel_schedules and vessel_schedules[voyage_id].berth_no
-    }
     return ProblemData(
         export_groups=export_groups,
         bays=bays,
@@ -1565,7 +1443,6 @@ def load_planning_inputs(
     input_guandong: InputAdapterGd,
     planning_time: datetime,
     voyages: Sequence[str],
-    horizon_hours: float,
     big_plan: pd.DataFrame | Sequence[BigPlanRow] | None = None,
 ) -> PlanningInputs:
     if big_plan is None:
@@ -1579,7 +1456,6 @@ def load_planning_inputs(
         input_guandong,
         big_plan_rows,
         planning_time=planning_time,
-        horizon_hours=horizon_hours,
         target_voyages=list(voyages),
     )
     return PlanningInputs(demand_rows=demand_rows, problem=problem)
@@ -1609,15 +1485,7 @@ def _first_existing(columns: set[str], candidates: Sequence[str]) -> str | None:
     return None
 
 
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
 __all__ = [
     "PlanningInputs",
     "load_planning_inputs",
-    "parse_datetime",
-    "parse_planning_time",
-    "write_json",
 ]

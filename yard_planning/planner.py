@@ -11,7 +11,6 @@ from typing import Iterable
 
 from .models import EXPORT_VOYAGE_ROW_NO_MIX_ATTR, Bay, ExportGroup, ProblemData
 
-
 SIZE_ORDER = {"45": 0, "20": 1, "40": 2}
 EXPORT_FLOWS = frozenset({"OF"})
 MANDATORY_BAY_NO_MIX_ATTRS = ("IYC_CSZ_CSIZECD", "IYC_CHEIGHTCD")
@@ -20,7 +19,7 @@ HEIGHT_NO_MIX_ATTRS = frozenset({"IYC_CHEIGHTCD", "HEIGHT"})
 
 
 class _GurobiModelAdapter:
-    """Thin compatibility layer around :class:`gurobipy.Model`.
+    """API adapter around :class:`gurobipy.Model`.
 
     Keeping model construction behind this adapter lets the mathematical
     constraints remain unchanged while the optimization backend is Gurobi.
@@ -94,7 +93,6 @@ class _GurobiModelAdapter:
     @staticmethod
     def getVal(var) -> float:
         return float(var.X)
-
 
     @staticmethod
     def getDualsolLinear(constr) -> float:
@@ -184,7 +182,7 @@ class ColumnGenerationPlanner:
         self.groups = sorted(self._build_planning_groups(), key=self._group_sort_key)
         self.groups_by_id = {group.group_id: group for group in self.groups}
         self.bays = problem.bays
-        self.attribute_rules = getattr(problem, "attribute_rules", None)
+        self.attribute_rules = problem.attribute_rules
         self.bays_by_area: dict[str, list[str]] = defaultdict(list)
         self.area_edge_bays: dict[str, set[str]] = defaultdict(set)
         self.area_size_height_cap: Counter[tuple[str, str, str]] = Counter()
@@ -194,9 +192,7 @@ class ColumnGenerationPlanner:
         self.import_area_size_reference: Counter[tuple[str, str, str]] = Counter(
             {
                 (str(flow), str(area_no), str(size)): int(qty)
-                for (flow, area_no, size), qty in (
-                    getattr(problem, "import_area_size_reference", {}) or {}
-                ).items()
+                for (flow, area_no, size), qty in problem.import_area_size_reference.items()
                 if int(qty) > 0
             }
         )
@@ -206,14 +202,14 @@ class ColumnGenerationPlanner:
         self.existing_group_area_load: Counter[tuple[str, ...]] = Counter(
             {
                 tuple(key): int(value)
-                for key, value in getattr(problem, "existing_group_area_load", {}).items()
+                for key, value in problem.existing_group_area_load.items()
                 if int(value) > 0
             }
         )
         self.existing_group_bay_load: Counter[tuple[str, ...]] = Counter(
             {
                 tuple(key): int(value)
-                for key, value in getattr(problem, "existing_group_bay_load", {}).items()
+                for key, value in problem.existing_group_bay_load.items()
                 if int(value) > 0
             }
         )
@@ -253,8 +249,6 @@ class ColumnGenerationPlanner:
     def columns(self) -> list[PlacementColumn]:
         return self._columns
 
-
-
     def _build_planning_groups(self) -> list[ExportGroup]:
         """Return declared, not-yet-arrived export groups only."""
         groups = [
@@ -290,7 +284,7 @@ class ColumnGenerationPlanner:
             "model_scope": "export_declared_containers_row_allocation",
             "detailed_allocation_direction": "export_only",
             "target_voyages": self.problem.target_voyages,
-            "attribute_rules": self.attribute_rules.as_dict() if hasattr(self.attribute_rules, "as_dict") else {},
+            "attribute_rules": self.attribute_rules.as_dict(),
             "declared_export_group_count": int(self.demand_stats.get("declared_export_group_count", 0)),
             "declared_export_box_count": int(self.demand_stats.get("declared_export_box_count", 0)),
             "planned_group_count": len(self.groups),
@@ -631,8 +625,6 @@ class ColumnGenerationPlanner:
             "average_rows_per_group": round(sum(row_counts) / group_count, 3) if group_count else 0.0,
         }
 
-
-
     def _selected_objective_components(
         self,
         selected: Counter[int],
@@ -723,7 +715,6 @@ class ColumnGenerationPlanner:
         # into the normalized secondary objective.
         return float(self._selected_objective_components(selected, unplaced)["weighted_total"])
 
-
     def _unplaced_penalty_for_group_id(self, group_id: str) -> float:
         return max(1.0, float(self.config.pricing_unplaced_penalty))
 
@@ -731,9 +722,6 @@ class ColumnGenerationPlanner:
         if objective_mode == "min_unplaced":
             return 1.0
         return self._unplaced_penalty_for_group_id(group.group_id)
-
-
-
 
     @staticmethod
     def _row_area_summary_consistency_stats(export_rows: list[dict], bay_summary_rows: list[dict]) -> dict[str, int]:
@@ -1102,8 +1090,6 @@ class ColumnGenerationPlanner:
         self._free_gurobi_model(stage2)
         return selected, unplaced, stats
 
-
-
     def _gurobi_unplaced_values(self, model, lp_vars) -> Counter[str]:
         return Counter(
             {
@@ -1125,7 +1111,6 @@ class ColumnGenerationPlanner:
                 if self._gurobi_value(model, var) > 1e-6
             }
         )
-
 
     def _configure_gurobi_output(self, model) -> None:
         if not self.config.verbose:
@@ -1176,8 +1161,6 @@ class ColumnGenerationPlanner:
         except Exception:
             return 0.0
 
-
-
     @staticmethod
     def _gurobi_dual_bound(model) -> float:
         for method_name in ("getDualbound", "getDualBound"):
@@ -1190,11 +1173,9 @@ class ColumnGenerationPlanner:
                 continue
         return float("nan")
 
-
     @staticmethod
     def _gurobi_value(model, var) -> float:
         return float(model.getVal(var))
-
 
     @staticmethod
     def _free_gurobi_model(model) -> None:
@@ -1208,7 +1189,6 @@ class ColumnGenerationPlanner:
                 return
             except Exception:
                 continue
-
 
     def _build_restricted_master(
         self,
@@ -1488,8 +1468,6 @@ class ColumnGenerationPlanner:
             )
         return balance
 
-
-
     def _add_relaxed_master_objectives(
         self,
         quicksum,
@@ -1695,13 +1673,6 @@ class ColumnGenerationPlanner:
             scope_name = scope or "GLOBAL"
             model.addCons(quicksum(uses) <= 1, name=f"row_one_{attr}_{scope_name}_{bay_key}_{row_no}")
 
-
-
-
-
-
-
-
     def _build_unit_flow_column_universe(self) -> None:
         """Create every feasible group/bay/row placement option as metadata.
 
@@ -1773,10 +1744,11 @@ class ColumnGenerationPlanner:
                         self._active_column_indices.add(idx)
 
     def _bay_no_mix_attrs(self, voyage_id: object = None) -> tuple[str, ...]:
-        if self.attribute_rules is not None and voyage_id is not None and hasattr(self.attribute_rules, "bay_no_mix_for"):
-            attrs = self.attribute_rules.bay_no_mix_for(voyage_id)
-        else:
-            attrs = getattr(self.attribute_rules, "bay_no_mix_attributes", ())
+        attrs = (
+            self.attribute_rules.bay_no_mix_for(voyage_id)
+            if voyage_id is not None
+            else self.attribute_rules.bay_no_mix_attributes
+        )
         ordered: list[str] = list(MANDATORY_BAY_NO_MIX_ATTRS)
         seen = set(ordered)
         for attr in attrs:
@@ -1791,15 +1763,16 @@ class ColumnGenerationPlanner:
         return tuple(ordered)
 
     def _row_no_mix_attrs(self, voyage_id: object = None) -> tuple[str, ...]:
-        if self.attribute_rules is not None and voyage_id is not None and hasattr(self.attribute_rules, "row_no_mix_for"):
-            attrs = self.attribute_rules.row_no_mix_for(voyage_id)
-        else:
-            attrs = getattr(self.attribute_rules, "row_no_mix_attributes", ())
+        attrs = (
+            self.attribute_rules.row_no_mix_for(voyage_id)
+            if voyage_id is not None
+            else self.attribute_rules.row_no_mix_attributes
+        )
         return tuple(str(attr) for attr in attrs if str(attr))
 
     @staticmethod
     def _infer_export_voyages(problem: ProblemData) -> set[str]:
-        declared = getattr(problem, "export_voyages", None)
+        declared = problem.export_voyages
         if declared is not None:
             return {str(voyage_id) for voyage_id in declared if str(voyage_id)}
         return {
@@ -1807,7 +1780,6 @@ class ColumnGenerationPlanner:
             for group in problem.export_groups
             if str(group.status) in EXPORT_FLOWS
         }
-
 
     def _is_export_voyage(self, voyage_id: object) -> bool:
         return str(voyage_id) in self.export_voyages
@@ -1832,7 +1804,7 @@ class ColumnGenerationPlanner:
 
     @staticmethod
     def _group_attr_value(group: ExportGroup, attr: str) -> str:
-        attrs = getattr(group, "attributes", {}) or {}
+        attrs = group.attributes
         value = attrs.get(attr, "")
         if isinstance(value, bool):
             return "1" if value else "0"
@@ -1915,18 +1887,18 @@ class ColumnGenerationPlanner:
 
     def _existing_bay_attr_values(self, bay: Bay, attr: str, voyage_id: object) -> set[str]:
         if self._is_size_no_mix_attr(attr):
-            values = set(getattr(bay, "existing_attrs", {}).get(attr, set()))
-            return values or set(getattr(bay, "existing_size_modes", set()))
+            values = set(bay.existing_attrs.get(attr, set()))
+            return values or set(bay.existing_size_modes)
         if str(attr).strip().upper() in HEIGHT_NO_MIX_ATTRS:
-            return set(getattr(bay, "existing_heights", set()))
-        by_voyage = getattr(bay, "existing_attrs_by_voyage", {}) or {}
+            return set(bay.existing_heights)
+        by_voyage = bay.existing_attrs_by_voyage
         return set(by_voyage.get(str(voyage_id), {}).get(attr, set()))
 
     def _existing_row_attr_values(self, bay: Bay, row_no: str, attr: str, voyage_id: object) -> set[str]:
         if self._is_global_row_no_mix_attr(attr):
-            row_attrs = getattr(bay, "existing_attrs_by_row", {}).get(str(row_no), {})
+            row_attrs = bay.existing_attrs_by_row.get(str(row_no), {})
             return set(row_attrs.get(attr, set()))
-        by_row_voyage = getattr(bay, "existing_attrs_by_row_by_voyage", {}) or {}
+        by_row_voyage = bay.existing_attrs_by_row_by_voyage
         return set(by_row_voyage.get(str(row_no), {}).get(str(voyage_id), {}).get(attr, set()))
 
     def _row_existing_attrs_allow_group(self, bay: Bay, row_no: str, group: ExportGroup) -> bool:
@@ -2038,7 +2010,6 @@ class ColumnGenerationPlanner:
     def _row_allocation_signature(row_allocation: tuple[tuple[str, str, int], ...]) -> tuple[tuple[str, str, int], ...]:
         return tuple(sorted((str(bay_key), str(row_no), int(qty)) for bay_key, row_no, qty in row_allocation if int(qty) > 0))
 
-
     def _row_capacity_for_column(
         self,
         group: ExportGroup,
@@ -2082,8 +2053,6 @@ class ColumnGenerationPlanner:
         if unit_capacity <= 0:
             return 10**9
         return int(math.ceil(quantity / unit_capacity))
-
-
 
     def _greedy_import_reservation(self, state: dict) -> Counter[tuple[str, str, str]]:
         """Construct a feasible anonymous reserve for the non-Gurobi fallback."""
@@ -2214,7 +2183,6 @@ class ColumnGenerationPlanner:
             state["bay_port_size_load"][port_key] = after
             state["bay_stack_used"][total_key] += after_units - before_units
 
-
     def _greedy_fallback(self) -> tuple[Counter[int], Counter[str]]:
         selected: Counter[int] = Counter()
         placed: Counter[str] = Counter()
@@ -2249,12 +2217,6 @@ class ColumnGenerationPlanner:
             }
         )
         return selected, unplaced
-
-
-
-
-
-
 
     def _selection_state(self, selected: Counter[int]) -> tuple[Counter[int], dict, Counter[str]]:
         repaired: Counter[int] = Counter()
@@ -2295,11 +2257,6 @@ class ColumnGenerationPlanner:
             "used_voyage_area": set(),
             "big_plan_quota_used": Counter(),
         }
-
-
-
-
-
 
     def _column_fits_state(
         self,
@@ -2398,7 +2355,6 @@ class ColumnGenerationPlanner:
         state["used_voyage_area"].add((col.voyage_id, col.area_no))
         state["big_plan_quota_used"][col.quota_key] += col.quantity
 
-
     def _candidate_bays_for_group(self, group: ExportGroup, scope: str | None = None) -> list[tuple[str, int, float]]:
         scope = scope or self._candidate_scope
 
@@ -2427,7 +2383,6 @@ class ColumnGenerationPlanner:
         self._candidate_cache[cache_key] = out
         return out
 
-
     def _candidate_areas_for_group(self, group: ExportGroup, scope: str | None = None) -> list[str]:
         scope = scope or self._candidate_scope
 
@@ -2447,23 +2402,11 @@ class ColumnGenerationPlanner:
     def _candidate_area_base_scope(self, group: ExportGroup, area_no: str, scope: str) -> bool:
         return True
 
-
-
-
-
-
-
-
-
-
-
-
     def _area_supports_group_flow(self, group: ExportGroup, area_no: str) -> bool:
         if self._is_big_plan_area_for_group(group, area_no):
             return True
         functions = self.problem.area_functions.get(area_no, set())
         return _area_flow(group.status) in functions
-
 
     def _max_quantity_in_bay(self, group: ExportGroup, bay_key: str) -> int:
         bay = self.bays[bay_key]
@@ -2502,7 +2445,6 @@ class ColumnGenerationPlanner:
         # no pair-loss or other per-column objective cost.
         return cost
 
-
     def _is_big_plan_area_for_group(self, group: ExportGroup, area_no: str) -> bool:
         big_size = self._big_plan_size(group.size)
         return any(
@@ -2513,10 +2455,6 @@ class ColumnGenerationPlanner:
             and qty > 0
             for (voyage_id, flow, candidate_area, size), qty in self.quota_by_key.items()
         )
-
-
-
-
 
     def _prepare_yard_indexes(self) -> None:
         for key, bay in self.bays.items():
@@ -2552,14 +2490,6 @@ class ColumnGenerationPlanner:
                 for height in heights:
                     self.area_size_height_cap[(bay.area_no, size, height)] += cap
 
-
-
-
-
-
-
-
-
     def _prepare_import_reservation_candidates(self) -> None:
         """Build anonymous import reserve options using only flow and size."""
         self.import_reservation_candidates.clear()
@@ -2590,9 +2520,8 @@ class ColumnGenerationPlanner:
             ),
         )
 
-
     def _prepare_quota(self) -> None:
-        for (voyage_id, flow, area_no, big_size), qty in getattr(self.problem, "area_guidance_target", {}).items():
+        for (voyage_id, flow, area_no, big_size), qty in self.problem.area_guidance_target.items():
             if qty > 0:
                 self.quota_by_key[(voyage_id, flow, area_no, big_size)] += int(qty)
 
@@ -2608,13 +2537,8 @@ class ColumnGenerationPlanner:
         return group.voyage_id, group.status, area_no, self._big_plan_size(group.size)
 
     def _operational_group_key(self, group: ExportGroup) -> tuple[str, ...]:
-        rules = getattr(self.problem, "attribute_rules", None)
-        attrs = tuple(getattr(rules, "group_attributes", ()) or MANDATORY_BAY_NO_MIX_ATTRS)
+        attrs = tuple(self.problem.attribute_rules.group_attributes or MANDATORY_BAY_NO_MIX_ATTRS)
         return self._attribute_cluster_key(group, attrs)
-
-
-
-
 
     def _attribute_cluster_key(self, group: ExportGroup, attrs: tuple[str, ...]) -> tuple[str, ...]:
         scope = str(group.voyage_id) if self._is_export_voyage(group.voyage_id) else "IMPORT"
@@ -2624,13 +2548,8 @@ class ColumnGenerationPlanner:
             *(f"{attr}={self._group_attr_value(group, attr)}" for attr in attrs),
         )
 
-
-
-
-
     def _existing_anchor_key(self, group: ExportGroup) -> tuple[str, ...]:
         return self._operational_group_key(group)
-
 
     def _existing_group_bay_load_for_group(self, group: ExportGroup, bay_key: str) -> int:
         bay = self.bays.get(bay_key)
@@ -2692,13 +2611,6 @@ class ColumnGenerationPlanner:
                 text = text.replace(old, new)
             out.append(text)
         return "_".join(out) or "key"
-
-
-
-
-
-
-
 
     def _area_size_target(self, voyage_id: str, flow: str, area_no: str, big_size: str) -> float:
         total = sum(qty for (v, f, _a, s), qty in self.quota_by_key.items() if v == voyage_id and f == flow and s == big_size)
@@ -2865,9 +2777,6 @@ class ColumnGenerationPlanner:
             * max(0, int(quantity))
             / self._objective_scale("berth_distance")
         )
-
-
-
 
     def _export_voyage_row_no_mix_stats(self, selected: Counter[int]) -> dict:
         """Audit the export-voyage row isolation hard constraint in the final solution."""
@@ -3112,7 +3021,6 @@ class ColumnGenerationPlanner:
                     row[attr] = value
             rows.append(row)
         return rows
-
 
     def _group_sort_key(self, group: ExportGroup) -> tuple[int, int, int, str, str, str]:
         return (

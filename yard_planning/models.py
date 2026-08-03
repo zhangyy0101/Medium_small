@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
-
-
 DEFAULT_GROUP_ATTRIBUTES = ("IYC_CSZ_CSIZECD", "IYC_POT_UNLDPORT", "IYC_CHEIGHTCD")
 DEFAULT_BAY_NO_MIX_ATTRIBUTES = ("IYC_CHEIGHTCD",)
 DEFAULT_ROW_NO_MIX_ATTRIBUTES = ("IYC_POT_UNLDPORT",)
@@ -45,11 +42,9 @@ class Bay:
     physical_capacity: int = 0
     row_cap_by_size: dict[str, dict[str, int]] = field(default_factory=dict)
     row_physical_capacity: dict[str, int] = field(default_factory=dict)
-    large_bay_partner_no: str = ""
     large_bay_partner_key: str = ""
     existing_size_modes: set[str] = field(default_factory=set)
     existing_heights: set[str] = field(default_factory=set)
-    existing_ports: set[str] = field(default_factory=set)
     existing_ports_by_row: dict[str, set[str]] = field(default_factory=dict)
     existing_attrs: dict[str, set[str]] = field(default_factory=dict)
     existing_attrs_by_row: dict[str, dict[str, set[str]]] = field(default_factory=dict)
@@ -67,16 +62,6 @@ class BigPlanRow:
     new_boxes: int
     size_mode: str
     plan_date: str = ""
-
-
-@dataclass(frozen=True)
-class VoyageSchedule:
-    voyage_id: str
-    receive_start: datetime
-    receive_end: datetime
-    berth_no: str
-    berth_time: datetime
-    departure_time: datetime
 
 
 @dataclass(frozen=True)

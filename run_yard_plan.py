@@ -33,7 +33,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--voyages", nargs="+", default=None, help="Optional voyage subset; default is every voyage in the large plan.")
     parser.add_argument("--planning-time", default=None, help="Optional override; default is the JSON planning_time.")
-    parser.add_argument("--horizon-hours", type=float, default=24.0)
     parser.add_argument("--total-time-limit", type=float, default=240.0)
     parser.add_argument("--mip-time-limit", type=float, default=120.0)
     parser.add_argument("--mip-gap", type=float, default=0.01)
@@ -64,7 +63,6 @@ def main() -> None:
         adapter,
         planning_time=planning_time.to_pydatetime(),
         voyages=voyages,
-        horizon_hours=args.horizon_hours,
         big_plan=large_plan,
     )
     config = ColumnGenerationConfig(

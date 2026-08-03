@@ -121,7 +121,7 @@ def validate_output_files(
         bay_size_load[(bay_key, size)] += qty
 
     import_required: Counter[tuple[str, str]] = Counter()
-    for (flow, _area, size), qty in getattr(problem, "import_area_size_reference", {}).items():
+    for (flow, _area, size), qty in problem.import_area_size_reference.items():
         import_required[(str(flow), str(size))] += int(qty)
     import_reserved: Counter[tuple[str, str]] = Counter()
     for row in import_rows:
