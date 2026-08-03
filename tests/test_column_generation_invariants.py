@@ -41,13 +41,11 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             config.row_dispersion_weight,
             config.existing_group_proximity_weight,
             config.area_guidance_weight,
-            config.large_pair_capacity_weight,
             config.berth_distance_weight,
         ]
         self.assertAlmostEqual(1.0, sum(weights))
         self.assertGreater(concentration, config.area_guidance_weight)
-        self.assertGreater(config.area_guidance_weight, config.large_pair_capacity_weight)
-        self.assertGreater(config.large_pair_capacity_weight, config.berth_distance_weight)
+        self.assertGreater(config.area_guidance_weight, config.berth_distance_weight)
 
     def test_45ft_is_edge_only_without_excluding_other_sizes(self) -> None:
         planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
@@ -137,11 +135,13 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             row_cap_by_size={"20": {"1": 4}}, row_physical_capacity={"1": 4},
         )
         problem = SimpleNamespace(
-            small_groups=[group], bays={"A|01": bay}, import_area_size_reservation={}
+            small_groups=[group], bays={"A|01": bay},
+            import_area_size_reference={}, area_functions={"A": {"OF"}},
         )
         with TemporaryDirectory() as directory:
             plan_path = Path(directory) / "plan.csv"
             unplaced_path = Path(directory) / "unplaced.csv"
+            import_path = Path(directory) / "import.csv"
             with plan_path.open("w", encoding="utf-8", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=[
                     "group_id", "planned_boxes", "area_no", "bay_no", "row_no",
@@ -154,8 +154,72 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
                     "voyage_id": "V1", "port": "P1",
                 })
             unplaced_path.touch()
+            import_path.touch()
             with self.assertRaisesRegex(ValueError, "capacity"):
-                validate_output_files(problem, plan_path, unplaced_path)
+                validate_output_files(problem, plan_path, unplaced_path, import_path)
+
+    def test_import_reservation_does_not_inherit_existing_size_no_mix(self) -> None:
+        bay = Bay(
+            area_no="A", bay_no="01", bay_key="A|01", block_id="",
+            block_bays=(), block_bay_count=0, block_boundary_adjusted=False,
+            bay_order=0, cap_by_size={"20": 4, "40": 4}, physical_capacity=4,
+            row_cap_by_size={"20": {"1": 4}}, row_physical_capacity={"1": 4},
+            existing_size_modes={"40"},
+        )
+        planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
+        planner.bays = {"A|01": bay}
+        self.assertEqual(4, planner._import_reservation_capacity("A|01", "20"))
+        problem = SimpleNamespace(
+            small_groups=[], bays={"A|01": bay},
+            import_area_size_reference={("IF", "A", "20"): 1},
+            area_functions={"A": {"IF"}},
+        )
+        with TemporaryDirectory() as directory:
+            plan_path = Path(directory) / "plan.csv"
+            unplaced_path = Path(directory) / "unplaced.csv"
+            import_path = Path(directory) / "import.csv"
+            plan_path.touch()
+            unplaced_path.touch()
+            with import_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=[
+                    "flow", "size", "area_no", "bay_key", "bay_no", "reserved_boxes",
+                ])
+                writer.writeheader()
+                writer.writerow({
+                    "flow": "IF", "size": "20", "area_no": "A",
+                    "bay_key": "A|01", "bay_no": "01", "reserved_boxes": 1,
+                })
+            result = validate_output_files(problem, plan_path, unplaced_path, import_path)
+            self.assertTrue(result["passed"])
+
+    def test_import_reservation_requires_area_function(self) -> None:
+        bay = Bay(
+            area_no="A", bay_no="01", bay_key="A|01", block_id="",
+            block_bays=(), block_bay_count=0, block_boundary_adjusted=False,
+            bay_order=0, cap_by_size={"20": 4}, physical_capacity=4,
+        )
+        problem = SimpleNamespace(
+            small_groups=[], bays={"A|01": bay},
+            import_area_size_reference={("IF", "B", "20"): 1},
+            area_functions={"A": {"OF"}},
+        )
+        with TemporaryDirectory() as directory:
+            plan_path = Path(directory) / "plan.csv"
+            unplaced_path = Path(directory) / "unplaced.csv"
+            import_path = Path(directory) / "import.csv"
+            plan_path.touch()
+            unplaced_path.touch()
+            with import_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=[
+                    "flow", "size", "area_no", "bay_key", "bay_no", "reserved_boxes",
+                ])
+                writer.writeheader()
+                writer.writerow({
+                    "flow": "IF", "size": "20", "area_no": "A",
+                    "bay_key": "A|01", "bay_no": "01", "reserved_boxes": 1,
+                })
+            with self.assertRaisesRegex(ValueError, "area-function"):
+                validate_output_files(problem, plan_path, unplaced_path, import_path)
 
 
 if __name__ == "__main__":

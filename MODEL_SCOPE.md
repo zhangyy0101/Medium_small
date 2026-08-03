@@ -15,7 +15,8 @@ unknown, `45`, and aggregate-size values are rejected instead of silently
 converted.
 
 The detailed model allocates declared, not-yet-arrived export containers to
-yard rows. Import containers do not receive bay or row decisions.
+yard rows. Imports receive anonymous bay-size capacity reservations, not
+container-group, individual-container, or row assignments.
 
 ## Demand and reservations
 
@@ -23,7 +24,10 @@ yard rows. Import containers do not receive bay or row decisions.
 - Export big-plan guidance: export `new_qty` is normalized by voyage and size
   and rescaled to the declared export demand. It supplies a soft area target
   only; forecast-only export quantity is neither allocated nor reserved.
-- Import aggregate reservation: import big-plan `new_qty`, by area and size.
+- Import capacity total: import big-plan `new_qty`, conserved by flow and size.
+  Its upstream area allocation is a soft reference. Anonymous reservations may
+  move between areas that support the import flow when the original area lacks
+  usable size capacity.
 - Incumbent import and export containers: already reflected in available bay
   and row capacity derived from the yard snapshot.
 - Incumbent import containers are conservatively assumed not to leave during
@@ -34,9 +38,11 @@ throughout the horizon, while every declared export container in the demand
 set is assumed to enter before the end of the horizon and still occupy yard
 capacity at that point.
 
-Import reservations consume aggregate area capacity but are not assigned to a
-specific bay or row. Large-container import quantities additionally require
-sufficient usable 40/45-ft pair capacity.
+Import reservations consume bay-size and joint physical capacity. A 20-ft
+reservation uses a 20-ft-enabled bay; an upstream `40` reservation uses the
+paired physical footprint of a 40-ft-enabled large bay. The upstream data do
+not distinguish physical 40-ft and 45-ft imports, so no import-specific 45-ft
+edge rule is inferred.
 
 ## Detailed decision level
 
@@ -61,7 +67,7 @@ All active grouping rules resolve to the single operational group above.
 - different voyages cannot share a row, including conflicts with incumbent
   containers;
 - destination-port row compatibility;
-- aggregate import capacity reservation and large-pair preservation.
+- import flow-size total conservation and anonymous bay-size capacity;
 - 45-ft containers may use only the first or last feasible large-bay position
   of an area. They remain subject to the same paired-bay, capacity, row, size,
   height, voyage, and destination-port constraints as every other container.
@@ -85,33 +91,31 @@ in two lexicographic stages. Stage 1
 minimizes the number of unplaced declared containers. Stage 2 fixes that
 minimum exactly and minimizes the following operational criteria:
 
-- transferred boxes relative to the normalized upstream area-size guidance
-  target, measured as one half of the L1 deviation;
+- transferred boxes relative to upstream area-size guidance: normalized export
+  guidance plus the import reservation's original area reference, measured by
+  their combined L1 deviation;
 - quantity-weighted berth-to-yard distance;
 - operational-group area dispersion;
 - operational-group row dispersion;
 - proximity to incumbent containers of the exact same operational group;
-- exact loss of usable 40/45-ft pair capacity caused by assigning 20-ft
-  containers to a pair member.
 
 Every secondary criterion is first converted to a dimensionless natural
 instance scale. Area and row dispersion count only activations beyond the first
 one used by each placed operational group, divided respectively by the maximum
 number of additional feasible areas and rows. Incumbent proximity is a
 quantity-weighted bay distance in `[0,1]`, divided by the demand of groups that
-have incumbent anchors. Big-plan deviation is divided by twice the guided
-demand, because moving one box creates one shortage and one excess in the L1
-vector. Lost large-pair capacity is divided by total usable pair capacity.
-For each voyage, berth distance is mapped from its closest and farthest
-compatible areas to `[0,1]` and then averaged by declared quantity.
+have incumbent anchors. Big-plan deviation is divided by twice the sum of
+guided export demand and import reservation demand, because moving one box
+creates one shortage and one excess in the L1 vector. For each voyage, berth
+distance is mapped from its closest and farthest compatible areas to `[0,1]`
+and then averaged by declared quantity.
 
-The baseline empirical weights are 0.20 for area dispersion, 0.17 for row
-dispersion, 0.13 for incumbent-group proximity, 0.22 for big-plan guidance,
-0.17 for large-pair capacity preservation, and 0.11 for berth distance. They
-sum to one. The first three terms jointly receive 0.50, expressing the policy
-order concentration and layout continuity > big-plan inheritance > capacity
-preservation > travel efficiency. The weights therefore express policy
-preference only, rather than compensate for incompatible raw units.
+The baseline empirical weights are 0.240 for area dispersion, 0.205 for row
+dispersion, 0.157 for incumbent-group proximity, 0.265 for big-plan guidance,
+and 0.133 for berth distance. They sum to one. The first three terms jointly
+receive 0.602, expressing the policy order concentration and layout continuity
+> big-plan inheritance > travel efficiency. The weights therefore express
+policy preference only, rather than compensate for incompatible raw units.
 
 The stage-2 integer solution is the final reported allocation. There is no
 post-solve intra-area row relayout or separate heuristic objective; row-level
@@ -123,11 +127,14 @@ two-stage MIP activates that universe, so its MIP gap is valid for the complete
 row-flow formulation. This is not a branch-and-price claim beyond the stated
 static planning model.
 
-One pair-state variable is used for both large-container preservation and
-import reservation. Assigning a 20-ft container to either member makes the
-pair unavailable; the same state enters the pair-loss objective and the hard
-lower bound on pair capacity reserved for incoming 40/45-ft imports. No
-separate isolated-bay reward or auxiliary pair-loss score is used.
+The import variables are anonymous capacity reservations indexed only by flow,
+size, and bay. Their totals equal the corresponding import `new_qty`. Their
+area totals may deviate from the big plan and the same big-plan L1 criterion
+selects the minimum adjustment. Import variables enter only area-function,
+bay-size, paired-footprint, and joint physical-capacity constraints. They do
+not enter size/height no-mix, voyage no-mix, destination-port compatibility,
+stack, or row constraints. If all compatible bays together cannot reserve the
+full import total, the model reports infeasibility instead of truncating demand.
 
 Berth-to-area distance is weighted by assigned quantity. Every export voyage
 in the detailed model must have a berth mapping, and every candidate area must
@@ -139,7 +146,7 @@ criterion.
 
 - detailed placement of forecast export containers;
 - aggregate reservation of forecast-only export containers;
-- detailed placement of import containers;
+- detailed group, container, or row placement of import containers;
 - weight classes;
 - reefer, dangerous, over-limit, and other special-container rules;
 - manual required/allowed/blocked area or bay overrides;

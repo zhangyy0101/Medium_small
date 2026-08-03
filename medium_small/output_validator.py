@@ -19,10 +19,12 @@ def validate_output_files(
     problem: ProblemData,
     export_row_plan_path: str | Path,
     unplaced_path: str | Path,
+    import_reservation_path: str | Path,
 ) -> dict[str, int | bool]:
     """Validate written CSVs using input data only, without planner state."""
     plan = _read_rows(export_row_plan_path)
     unplaced_rows = _read_rows(unplaced_path)
+    import_rows = _read_rows(import_reservation_path)
     errors: list[str] = []
 
     demand = {group.group_id: int(group.demand) for group in problem.small_groups}
@@ -32,12 +34,10 @@ def validate_output_files(
     bay_size_load: Counter[tuple[str, str]] = Counter()
     row_load: Counter[tuple[str, str]] = Counter()
     row_size_load: Counter[tuple[str, str, str]] = Counter()
-    area_slot_load: Counter[str] = Counter()
     bay_sizes: defaultdict[str, set[str]] = defaultdict(set)
     bay_heights: defaultdict[str, set[str]] = defaultdict(set)
     row_voyages: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
     row_ports: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
-    used_twenty_bays: set[str] = set()
 
     bays_by_area: defaultdict[str, list[str]] = defaultdict(list)
     for key, bay in problem.bays.items():
@@ -85,7 +85,6 @@ def validate_output_files(
         if size == "45" and bay_key not in edge_large_bays:
             errors.append(f"45-ft container is not on an edge large bay: {group_id}, {bay_key}")
         assigned[group_id] += qty
-        area_slot_load[area] += qty * len(footprint)
         for key in footprint:
             footprint_bay = problem.bays[key]
             if footprint_bay.existing_size_modes and size not in footprint_bay.existing_size_modes:
@@ -120,8 +119,46 @@ def validate_output_files(
             row_voyages[(key, row_no)].add(voyage)
             row_ports[(key, row_no)].add(port)
         bay_size_load[(bay_key, size)] += qty
-        if size == "20":
-            used_twenty_bays.add(bay_key)
+
+    import_required: Counter[tuple[str, str]] = Counter()
+    for (flow, _area, size), qty in getattr(problem, "import_area_size_reference", {}).items():
+        import_required[(str(flow), str(size))] += int(qty)
+    import_reserved: Counter[tuple[str, str]] = Counter()
+    for row in import_rows:
+        flow = str(row.get("flow", ""))
+        size = str(row.get("size", ""))
+        area = str(row.get("area_no", ""))
+        bay_no = str(row.get("bay_no", ""))
+        bay_key = str(row.get("bay_key", "")) or f"{area}|{bay_no}"
+        qty = int(float(row.get("reserved_boxes", 0) or 0))
+        if qty <= 0 or bay_key not in problem.bays:
+            errors.append(
+                f"invalid import reservation: flow={flow}, size={size}, bay={bay_key}, qty={qty}"
+            )
+            continue
+        bay = problem.bays[bay_key]
+        if area != bay.area_no:
+            errors.append(
+                f"import reservation area mismatch: bay={bay_key}, output={area}, input={bay.area_no}"
+            )
+        if flow not in problem.area_functions.get(bay.area_no, set()):
+            errors.append(
+                f"import area-function violation: flow={flow}, area={bay.area_no}, bay={bay_key}"
+            )
+        if size not in {"20", "40"} or int(bay.cap_by_size.get(size, 0)) <= 0:
+            errors.append(f"import bay-size violation: size={size}, bay={bay_key}")
+            continue
+        footprint = [bay_key]
+        if size == "40":
+            partner = str(bay.large_bay_partner_key or "")
+            if not partner or partner not in problem.bays:
+                errors.append(f"import 40-ft reservation lacks paired bay: {bay_key}")
+                continue
+            footprint.append(partner)
+        import_reserved[(flow, size)] += qty
+        for key in footprint:
+            bay_load[key] += qty
+        bay_size_load[(bay_key, size)] += qty
 
     for row in unplaced_rows:
         group_id = str(row.get("group_id", ""))
@@ -134,6 +171,12 @@ def validate_output_files(
             errors.append(
                 f"demand balance: {group_id}, assigned={assigned[group_id]}, "
                 f"unplaced={unplaced[group_id]}, demand={qty}"
+            )
+    for key in sorted(set(import_required) | set(import_reserved)):
+        if int(import_reserved[key]) != int(import_required[key]):
+            errors.append(
+                f"import reservation total: flow={key[0]}, size={key[1]}, "
+                f"reserved={import_reserved[key]}, required={import_required[key]}"
             )
     for key, load in bay_load.items():
         if load > problem.bays[key].physical_capacity:
@@ -164,60 +207,6 @@ def validate_output_files(
         if len(values) > 1:
             errors.append(f"row port mixing: {key}, values={sorted(values)}")
 
-    for area, keys in bays_by_area.items():
-        physical = sum(problem.bays[key].physical_capacity for key in keys)
-        reserved = sum(
-            qty * (2 if size in {"40", "45"} else 1)
-            for (reserved_area, size), qty in problem.import_area_size_reservation.items()
-            if reserved_area == area
-        )
-        if area_slot_load[area] + reserved > physical:
-            errors.append(
-                f"area reservation: {area}, export={area_slot_load[area]}, "
-                f"import={reserved}, capacity={physical}"
-            )
-
-    # Reconstruct the model's usable large-bay pairs from input geometry.  A
-    # newly occupied 20-ft member makes the pair unavailable to an incoming
-    # 40/45-ft container.
-    large_pairs: dict[tuple[str, str], tuple[int, int]] = {}
-    for key, bay in problem.bays.items():
-        partner = str(bay.large_bay_partner_key or "")
-        if not partner or partner not in problem.bays:
-            continue
-        capacity = max(int(bay.cap_by_size.get("40", 0)), int(bay.cap_by_size.get("45", 0)))
-        if capacity > 0:
-            large_pairs[(key, partner)] = (capacity, int(bay.cap_by_size.get("45", 0)))
-    for area in bays_by_area:
-        available_large = sum(
-            capacity
-            for pair, (capacity, _capacity_45) in large_pairs.items()
-            if problem.bays[pair[0]].area_no == area
-            and not (set(pair) & used_twenty_bays)
-        )
-        required_large = sum(
-            int(qty)
-            for (reserved_area, size), qty in problem.import_area_size_reservation.items()
-            if reserved_area == area and size in {"40", "45"}
-        )
-        if available_large < required_large:
-            errors.append(
-                f"import large-pair reservation: {area}, available={available_large}, "
-                f"required={required_large}"
-            )
-        available_45 = sum(
-            capacity_45
-            for pair, (_capacity, capacity_45) in large_pairs.items()
-            if problem.bays[pair[0]].area_no == area
-            and not (set(pair) & used_twenty_bays)
-        )
-        required_45 = int(problem.import_area_size_reservation.get((area, "45"), 0))
-        if available_45 < required_45:
-            errors.append(
-                f"import 45-ft pair reservation: {area}, available={available_45}, "
-                f"required={required_45}"
-            )
-
     if errors:
         raise ValueError("Output validation failed: " + "; ".join(errors[:20]))
     return {
@@ -226,4 +215,6 @@ def validate_output_files(
         "groups_checked": len(demand),
         "assigned_boxes_checked": int(sum(assigned.values())),
         "unplaced_boxes_checked": int(sum(unplaced.values())),
+        "import_reservation_rows_checked": len(import_rows),
+        "import_reserved_boxes_checked": int(sum(import_reserved.values())),
     }

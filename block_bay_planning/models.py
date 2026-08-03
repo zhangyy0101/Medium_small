@@ -207,7 +207,7 @@ class ProblemData:
     voyage_windows: dict[str, tuple[datetime, datetime]]
     target_voyages: list[str]
     export_voyages: set[str] | None = None
-    import_area_size_reservation: dict[tuple[str, str], int] = field(default_factory=dict)
+    import_area_size_reference: dict[tuple[str, str, str], int] = field(default_factory=dict)
     existing_group_area_load: dict[tuple[str, ...], int] = field(default_factory=dict)
     existing_group_bay_load: dict[tuple[str, ...], int] = field(default_factory=dict)
     berth_distances: dict[tuple[str, str], float] = field(default_factory=dict)

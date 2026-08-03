@@ -81,6 +81,10 @@ def main() -> None:
 
     write_rows(output_dir / "area_bay_summary.csv", result.area_bay_rows)
     write_rows(output_dir / "export_row_plan.csv", result.small_rows)
+    write_rows(
+        output_dir / "import_capacity_reservation.csv",
+        result.import_reservation_rows,
+    )
     write_rows(output_dir / "unplaced_boxes.csv", result.unplaced_rows)
     write_columns(output_dir / "generated_columns.csv", result.columns)
     write_rows(output_dir / "declared_export_demand.csv", [asdict(row) for row in inputs.demand_rows])
@@ -90,6 +94,7 @@ def main() -> None:
         inputs.problem,
         output_dir / "export_row_plan.csv",
         output_dir / "unplaced_boxes.csv",
+        output_dir / "import_capacity_reservation.csv",
     )
     write_json(output_dir / "output_validation.json", output_validation)
     write_json(
@@ -101,6 +106,7 @@ def main() -> None:
             "voyages": voyages,
             "area_bay_summary_row_count": len(result.area_bay_rows),
             "export_row_plan_row_count": len(result.small_rows),
+            "import_capacity_reservation_row_count": len(result.import_reservation_rows),
             "unplaced_row_count": len(result.unplaced_rows),
             "unplaced_boxes": result.diagnostics.get("unplaced_boxes"),
             "algorithm": result.diagnostics.get("algorithm"),
@@ -110,6 +116,7 @@ def main() -> None:
     print(f"area_bay_summary: {output_dir / 'area_bay_summary.csv'}")
     print(f"export_row_plan: {output_dir / 'export_row_plan.csv'}")
     print(f"unplaced_boxes: {output_dir / 'unplaced_boxes.csv'}")
+    print(f"import_capacity_reservation: {output_dir / 'import_capacity_reservation.csv'}")
     print(f"diagnostics: {output_dir / 'diagnostics.json'}")
 
 

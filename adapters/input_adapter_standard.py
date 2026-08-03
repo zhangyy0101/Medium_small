@@ -315,7 +315,7 @@ class ProblemData:
     voyage_windows: dict[str, tuple[datetime, datetime]]
     target_voyages: list[str]
     export_voyages: set[str] | None = None
-    import_area_size_reservation: dict[tuple[str, str], int] = field(default_factory=dict)
+    import_area_size_reference: dict[tuple[str, str, str], int] = field(default_factory=dict)
     existing_group_area_load: dict[tuple[str, ...], int] = field(default_factory=dict)
     existing_group_bay_load: dict[tuple[str, ...], int] = field(default_factory=dict)
     berth_distances: dict[tuple[str, str], float] = field(default_factory=dict)
@@ -4158,29 +4158,40 @@ def build_problem(
     vessel_schedules = read_target_vessel_schedules(input_guandong, target_voyages, planning_time, horizon_hours)
     plan_date = planning_time.date().isoformat()
     target_big_plan_flows = {medium_small_area_flow(flow) for flow in DEFAULT_TARGET_BIG_PLAN_FLOWS}
+    target_voyage_set = set(target_voyages)
+    all_export_voyages = classified_export_voyages(input_guandong)
+    export_voyages = all_export_voyages & target_voyage_set
+    # Detailed row allocation is limited to the selected export voyages, but
+    # every import row in the same big-plan snapshot is an external capacity
+    # commitment. Keeping these scopes separate prevents ``--voyages`` from
+    # accidentally disabling import-capacity protection.
     input_plan = [
-        row for row in big_plan if row.voyage_id in target_voyages and (not row.plan_date or row.plan_date == plan_date)
+        row
+        for row in big_plan
+        if (not row.plan_date or row.plan_date == plan_date)
+        and (row.voyage_id in export_voyages or row.voyage_id not in all_export_voyages)
     ]
     allowed_areas = set().union(*(set(areas) for areas in allowed_areas_by_voyage.values())) if allowed_areas_by_voyage else set(function_areas)
     skipped_closed_area: Counter[tuple[str, str]] = Counter()
     skipped_flow_function: Counter[tuple[str, str]] = Counter()
     for row in input_plan:
-        if row.area_no not in allowed_areas_by_voyage.get(row.voyage_id, set(function_areas)):
-            continue
-        if row.area_no in closed:
-            skipped_closed_area[(row.voyage_id, row.area_no)] += row.new_boxes
-            continue
         plan_flow = medium_small_area_flow(row.flow)
         if plan_flow not in target_big_plan_flows:
             continue
-        if not area_allows_flow(row.area_no, plan_flow, area_functions):
-            skipped_flow_function[(row.voyage_id, row.area_no)] += row.new_boxes
-            continue
+        is_import = row.voyage_id not in all_export_voyages
+        if not is_import:
+            if row.area_no not in allowed_areas_by_voyage.get(row.voyage_id, set(function_areas)):
+                continue
+            if row.area_no in closed:
+                skipped_closed_area[(row.voyage_id, row.area_no)] += row.new_boxes
+                continue
+            if not area_allows_flow(row.area_no, plan_flow, area_functions):
+                skipped_flow_function[(row.voyage_id, row.area_no)] += row.new_boxes
+                continue
         cleaned_plan.append(row)
-        assigned_areas[(row.voyage_id, plan_flow)].add(row.area_no)
+        if row.voyage_id in export_voyages:
+            assigned_areas[(row.voyage_id, plan_flow)].add(row.area_no)
     # Medium/small demand uses actual demand; big-plan rows below remain area inheritance targets.
-    target_voyage_set = set(target_voyages)
-    export_voyages = classified_export_voyages(input_guandong) & target_voyage_set
     small_groups = load_small_doc_groups(
         input_guandong,
         target_voyages,
@@ -4197,16 +4208,21 @@ def build_problem(
         demand_by_voyage_size[(group.voyage_id, group.status, big_size)] += group.demand
     upstream_area_size_weights: Counter[tuple[str, str, str, str]] = Counter()
     for row in cleaned_plan:
+        if row.voyage_id not in export_voyages:
+            continue
         plan_flow = medium_small_area_flow(row.flow)
         upstream_area_size_weights[(row.voyage_id, plan_flow, row.area_no, row.size_mode)] += row.new_boxes
 
-    # Import new_qty is reserved in aggregate. Export new_qty is not a demand
-    # or reservation in this model; it supplies only an area-distribution
-    # pattern for the declared export containers.
-    import_area_size_reservation: Counter[tuple[str, str]] = Counter()
+    # Import new_qty supplies a reference distribution for anonymous capacity
+    # reservation.  Its total is conserved by flow and size, while its area
+    # distribution may move when the upstream area is not physically usable.
+    # Export new_qty remains a soft area-distribution reference only.
+    import_area_size_reference: Counter[tuple[str, str, str]] = Counter()
     for row in cleaned_plan:
-        if row.voyage_id not in export_voyages:
-            import_area_size_reservation[(row.area_no, row.size_mode)] += row.new_boxes
+        if row.voyage_id not in all_export_voyages:
+            import_area_size_reference[
+                (medium_small_area_flow(row.flow), row.area_no, row.size_mode)
+            ] += row.new_boxes
     for voyage_id in target_voyages:
         flows = sorted({flow for (v, flow, _size), qty in demand_by_voyage_size.items() if v == voyage_id and qty > 0})
         for flow in flows:
@@ -4276,7 +4292,7 @@ def build_problem(
         voyage_windows=voyage_windows,
         target_voyages=target_voyages,
         export_voyages=export_voyages,
-        import_area_size_reservation=dict(import_area_size_reservation),
+        import_area_size_reference=dict(import_area_size_reference),
         existing_group_area_load=dict(existing_group_area_load),
         existing_group_bay_load=dict(existing_group_bay_load),
         berth_distances=berth_distances,

@@ -154,12 +154,11 @@ class ColumnGenerationConfig:
     pricing_unplaced_penalty: float = 1_000_000.0
     # Stage-2 policy weights. Every component is first mapped to a natural
     # dimensionless scale, so these values express policy preference only.
-    area_dispersion_weight: float = 0.20
-    row_dispersion_weight: float = 0.17
-    existing_group_proximity_weight: float = 0.13
-    area_guidance_weight: float = 0.22
-    large_pair_capacity_weight: float = 0.17
-    berth_distance_weight: float = 0.11
+    area_dispersion_weight: float = 0.240
+    row_dispersion_weight: float = 0.205
+    existing_group_proximity_weight: float = 0.157
+    area_guidance_weight: float = 0.265
+    berth_distance_weight: float = 0.133
 
 
 @dataclass
@@ -168,6 +167,7 @@ class ColumnGenerationResult:
     small_rows: list[dict]
     diagnostics: dict
     unplaced_rows: list[dict] = field(default_factory=list)
+    import_reservation_rows: list[dict] = field(default_factory=list)
     columns: list[PlacementColumn] = field(default_factory=list)
 
 
@@ -176,10 +176,10 @@ class ColumnGenerationPlanner:
 
     A column is one feasible group/bay/row unit flow.  Its integer master
     variable gives the number of identical containers assigned there.  The master uses
-    only declared, not-yet-gated-in export containers; import containers enter
-    as existing occupancy and big-plan area reservations, never as assignment
-    demand.  Big-plan quantities guide area allocation but are not a second
-    executable planning layer.
+    only declared, not-yet-gated-in export containers. Incoming imports are
+    represented by anonymous size-compatible bay-capacity reservations: their
+    flow/size totals are fixed, while their area distribution may deviate from
+    the upstream big-plan reference. They never become detailed row demand.
     """
 
     def __init__(self, problem: ProblemData, config: ColumnGenerationConfig | None = None) -> None:
@@ -188,7 +188,6 @@ class ColumnGenerationPlanner:
         self.group_source: dict[str, str] = {}
         self.demand_stats: dict[str, int | str] = {}
         self.export_voyages = self._infer_export_voyages(problem)
-        self.import_voyages = self._infer_import_voyages(problem)
         self.groups = sorted(self._build_planning_groups(), key=self._group_sort_key)
         self.groups_by_id = {group.group_id: group for group in self.groups}
         self.bays = problem.bays
@@ -202,9 +201,18 @@ class ColumnGenerationPlanner:
         self.area_group_cap: Counter[tuple[str, str]] = Counter()
         self._area_group_cap_computed: set[tuple[str, str]] = set()
         self.quota_by_key: Counter[tuple[str, str, str, str]] = Counter()
-        self.import_area_size_reservation: Counter[tuple[str, str]] = Counter(
-            getattr(problem, "import_area_size_reservation", {}) or {}
+        self.import_area_size_reference: Counter[tuple[str, str, str]] = Counter(
+            {
+                (str(flow), str(area_no), str(size)): int(qty)
+                for (flow, area_no, size), qty in (
+                    getattr(problem, "import_area_size_reference", {}) or {}
+                ).items()
+                if int(qty) > 0
+            }
         )
+        self.import_total_by_flow_size: Counter[tuple[str, str]] = Counter()
+        for (flow, _area_no, size), qty in self.import_area_size_reference.items():
+            self.import_total_by_flow_size[(flow, size)] += int(qty)
         self.existing_group_area_load: Counter[tuple[str, ...]] = Counter(
             {
                 tuple(key): int(value)
@@ -221,13 +229,10 @@ class ColumnGenerationPlanner:
         )
         self.existing_group_bays: defaultdict[tuple[str, ...], set[str]] = defaultdict(set)
         self.existing_group_area_bays: defaultdict[tuple[str, ...], set[str]] = defaultdict(set)
-        self.large_segment_by_bay: dict[str, tuple[str, ...]] = {}
-        self.large_segment_base_pairs: dict[tuple[str, ...], int] = {}
-        self.large_segment_static_loss_by_bay: dict[str, int] = {}
-        self.large_pair_capacity: dict[tuple[str, str], int] = {}
-        self.large_pair_capacity_45: dict[tuple[str, str], int] = {}
-        self.large_pair_by_member: dict[str, tuple[str, str]] = {}
-        self.existing_twenty_bays: set[str] = set()
+        self.import_reservation_candidates: dict[
+            tuple[str, str], list[tuple[str, int]]
+        ] = {}
+        self._final_import_reservation: Counter[tuple[str, str, str]] = Counter()
         for (*group_key, area_no, bay_key), value in self.existing_group_bay_load.items():
             if value > 0:
                 group_tuple = tuple(group_key)
@@ -247,6 +252,7 @@ class ColumnGenerationPlanner:
         self._master_start_selected: Counter[int] = Counter()
         self._master_start_unplaced: Counter[str] = Counter()
         self._prepare_yard_indexes()
+        self._prepare_import_reservation_candidates()
         self._prepare_quota()
         self._validate_objective_weights()
         self._prepare_berth_distance_bounds()
@@ -322,37 +328,25 @@ class ColumnGenerationPlanner:
                     )
                 ),
             },
-            "aggregate_capacity_reservations": {
+            "import_capacity_reservation": {
                 "source_quantity_field": "new_qty",
-                "import_boxes": int(sum(self.import_area_size_reservation.values())),
-                "export_boxes": 0,
-                "export_policy": "no_forecast_reservation",
+                "role": "anonymous_size_compatible_capacity_only",
+                "area_policy": "weighted_l1_deviation_from_big_plan_reference",
+                "constraint_scope": ["area_function", "bay_size", "physical_capacity"],
+                "excluded_constraints": ["bay_no_mix", "row_no_mix", "container_group_attributes"],
+                "import_boxes": int(sum(self.import_area_size_reference.values())),
                 "accepted_big_plan_sizes": ["20", "40"],
-                "import_by_area_size": {
-                    f"{area}|{size}": int(qty)
-                    for (area, size), qty in sorted(self.import_area_size_reservation.items())
+                "reference_by_flow_area_size": {
+                    f"{flow}|{area}|{size}": int(qty)
+                    for (flow, area, size), qty in sorted(self.import_area_size_reference.items())
                 },
-            },
-            "import_large_pair_reservation": {
-                "required_by_area": {
-                    area_no: int(
-                        sum(
-                            qty
-                            for (reserved_area, size), qty in self.import_area_size_reservation.items()
-                            if reserved_area == area_no and size in {"40", "45"}
-                        )
-                    )
-                    for area_no in sorted({area for area, _size in self.import_area_size_reservation})
+                "required_by_flow_size": {
+                    f"{flow}|{size}": int(qty)
+                    for (flow, size), qty in sorted(self.import_total_by_flow_size.items())
                 },
-                "base_pair_capacity_by_area": {
-                    area_no: int(
-                        sum(
-                            capacity
-                            for pair, capacity in self.large_pair_capacity.items()
-                            if self.bays[pair[0]].area_no == area_no
-                        )
-                    )
-                    for area_no in sorted({self.bays[pair[0]].area_no for pair in self.large_pair_capacity})
+                "candidate_bay_capacity_upper_bound_sum_by_flow_size": {
+                    f"{flow}|{size}": int(sum(capacity for _bay_key, capacity in candidates))
+                    for (flow, size), candidates in sorted(self.import_reservation_candidates.items())
                 },
             },
             "initial_column_count": len(self._active_column_indices),
@@ -381,7 +375,6 @@ class ColumnGenerationPlanner:
                 "area_guidance_l1_unit": self._area_guidance_penalty(),
                 "area_activation_unit": self._area_activation_penalty(),
                 "row_activation_unit": self._row_activation_penalty(),
-                "large_pair_capacity_unit": self._twenty_segment_loss_penalty(),
             },
         }
 
@@ -402,6 +395,10 @@ class ColumnGenerationPlanner:
                 diagnostics["gurobi_failure"] = f"{type(exc).__name__}: {exc}"
                 selected, unplaced = self._greedy_fallback()
 
+        import_reservation_rows = self._make_import_reservation_rows()
+        diagnostics["import_capacity_reservation"].update(
+            self._import_reservation_diagnostics()
+        )
         objective_components = self._selected_objective_components(selected, unplaced)
         diagnostics["final_secondary_objective"] = objective_components["weighted_total"]
         diagnostics["final_secondary_objective_components"] = objective_components
@@ -444,6 +441,7 @@ class ColumnGenerationPlanner:
             small_rows=small_rows,
             diagnostics=diagnostics,
             unplaced_rows=unplaced_rows,
+            import_reservation_rows=import_reservation_rows,
             columns=self._columns,
         )
 
@@ -456,8 +454,12 @@ class ColumnGenerationPlanner:
         normalized = Counter(
             {idx: int(round(value)) for idx, value in selected.items() if int(round(value)) > 0}
         )
-        repaired, _state, placed = self._selection_state(normalized)
-        errors: list[str] = []
+        errors = self._import_reservation_validation_errors()
+        try:
+            repaired, _state, placed = self._selection_state(normalized)
+        except RuntimeError as exc:
+            repaired, placed = Counter(), Counter()
+            errors.append(str(exc))
         if repaired != normalized:
             errors.append("selected columns violate a physical or no-mix rule")
         for group in self.groups:
@@ -480,52 +482,135 @@ class ColumnGenerationPlanner:
             "groups_checked": len(self.groups),
             "assigned_boxes_checked": int(sum(placed.values())),
             "unplaced_boxes_checked": int(sum(unplaced.values())),
+            "import_reserved_boxes_checked": int(sum(self._final_import_reservation.values())),
         }
 
+    def _import_reservation_validation_errors(self) -> list[str]:
+        errors: list[str] = []
+        actual: Counter[tuple[str, str]] = Counter()
+        for (flow, size, bay_key), qty in self._final_import_reservation.items():
+            if qty <= 0:
+                continue
+            actual[(flow, size)] += int(qty)
+            bay = self.bays.get(bay_key)
+            if bay is None:
+                errors.append(f"unknown import reserve bay: {bay_key}")
+                continue
+            if flow not in self.problem.area_functions.get(bay.area_no, set()):
+                errors.append(
+                    f"import reserve violates area function: flow={flow}, area={bay.area_no}"
+                )
+            if self._import_reservation_capacity(bay_key, size) <= 0:
+                errors.append(
+                    f"import reserve violates bay size: size={size}, bay={bay_key}"
+                )
+        for key, required in self.import_total_by_flow_size.items():
+            if int(actual[key]) != int(required):
+                errors.append(
+                    f"import reserve total mismatch: flow={key[0]}, size={key[1]}, "
+                    f"reserved={actual[key]}, required={required}"
+                )
+        for key, qty in actual.items():
+            if key not in self.import_total_by_flow_size and qty > 0:
+                errors.append(
+                    f"unexpected import reserve total: flow={key[0]}, size={key[1]}, reserved={qty}"
+                )
+        return errors
+
     def _capacity_reservation_margins(self, selected: Counter[int]) -> dict[str, dict[str, int]]:
-        """Report residual slot and large-pair capacity after the final plan."""
-        selected_slot_units: Counter[str] = Counter()
-        selected_twenty_bays: set[str] = set()
+        """Report joint export/import capacity use after the final plan."""
+        export_bay_load: Counter[str] = Counter()
         for idx, chosen in selected.items():
             if chosen <= 0 or idx < 0 or idx >= len(self._columns):
                 continue
             col = self._columns[idx]
-            selected_slot_units[col.area_no] += (
-                int(col.quantity)
-                * int(chosen)
-                * len(self._placement_footprint_keys(col.bay_key, col.size))
-            )
-            if col.size == "20":
-                selected_twenty_bays.add(col.bay_key)
+            qty = int(col.quantity) * int(chosen)
+            for bay_key in self._placement_footprint_keys(col.bay_key, col.size):
+                export_bay_load[bay_key] += qty
 
-        areas = sorted(set(selected_slot_units) | {area for area, _size in self.import_area_size_reservation})
+        import_bay_load: Counter[str] = Counter()
+        import_area_boxes: Counter[str] = Counter()
+        import_area_slot_units: Counter[str] = Counter()
+        for (_flow, size, bay_key), qty in self._final_import_reservation.items():
+            if qty <= 0:
+                continue
+            area_no = self.bays[bay_key].area_no
+            import_area_boxes[area_no] += int(qty)
+            footprint = self._placement_footprint_keys(bay_key, size)
+            import_area_slot_units[area_no] += int(qty) * len(footprint)
+            for footprint_key in footprint:
+                import_bay_load[footprint_key] += int(qty)
+
+        areas = sorted(
+            set(self.bays_by_area)
+            & (
+                {self.bays[key].area_no for key in export_bay_load}
+                | set(import_area_boxes)
+                | {area for _flow, area, _size in self.import_area_size_reference}
+            )
+        )
         result: dict[str, dict[str, int]] = {}
         for area_no in areas:
-            physical = sum(int(bay.physical_capacity) for bay in self.bays.values() if bay.area_no == area_no)
-            reserved_slots = sum(
-                int(qty) * (2 if size in {"40", "45"} else 1)
-                for (reserved_area, size), qty in self.import_area_size_reservation.items()
-                if reserved_area == area_no
-            )
-            pair_base = sum(
-                int(capacity)
-                for pair, capacity in self.large_pair_capacity.items()
-                if self.bays[pair[0]].area_no == area_no
-            )
-            pair_loss = self._large_pair_capacity_loss(selected_twenty_bays, area_no=area_no)
-            pair_required = sum(
+            keys = self.bays_by_area.get(area_no, [])
+            physical = sum(int(self.bays[key].physical_capacity) for key in keys)
+            export_slots = sum(export_bay_load[key] for key in keys)
+            import_slots = sum(import_bay_load[key] for key in keys)
+            reference_boxes = sum(
                 int(qty)
-                for (reserved_area, size), qty in self.import_area_size_reservation.items()
-                if reserved_area == area_no and size in {"40", "45"}
+                for (flow, reference_area, size), qty in self.import_area_size_reference.items()
+                if reference_area == area_no
             )
             result[area_no] = {
-                "residual_slot_units": int(physical - reserved_slots - selected_slot_units[area_no]),
-                "large_pair_base_capacity": int(pair_base),
-                "large_pair_capacity_loss": int(pair_loss),
-                "import_large_pair_required": int(pair_required),
-                "residual_large_pair_margin": int(pair_base - pair_loss - pair_required),
+                "physical_slot_capacity": int(physical),
+                "export_slot_use": int(export_slots),
+                "import_reserved_slot_use": int(import_slots),
+                "residual_slot_units": int(physical - export_slots - import_slots),
+                "import_reference_boxes": int(reference_boxes),
+                "import_reserved_boxes": int(import_area_boxes[area_no]),
             }
         return result
+
+    def _make_import_reservation_rows(self) -> list[dict]:
+        rows: list[dict] = []
+        for (flow, size, bay_key), qty in sorted(self._final_import_reservation.items()):
+            if qty <= 0 or bay_key not in self.bays:
+                continue
+            bay = self.bays[bay_key]
+            rows.append(
+                {
+                    "flow": flow,
+                    "size": size,
+                    "area_no": bay.area_no,
+                    "bay_key": bay_key,
+                    "bay_no": bay.bay_no,
+                    "reserved_boxes": int(qty),
+                    "footprint_slot_units": int(qty)
+                    * len(self._placement_footprint_keys(bay_key, size)),
+                    "reservation_scope": "anonymous_capacity",
+                }
+            )
+        return rows
+
+    def _import_reservation_diagnostics(self) -> dict[str, object]:
+        actual: Counter[tuple[str, str, str]] = Counter()
+        for (flow, size, bay_key), qty in self._final_import_reservation.items():
+            if qty > 0 and bay_key in self.bays:
+                actual[(flow, self.bays[bay_key].area_no, size)] += int(qty)
+        keys = set(actual) | set(self.import_area_size_reference)
+        l1 = sum(
+            abs(int(actual.get(key, 0)) - int(self.import_area_size_reference.get(key, 0)))
+            for key in keys
+        )
+        return {
+            "reserved_boxes": int(sum(actual.values())),
+            "reserved_by_flow_area_size": {
+                f"{flow}|{area}|{size}": int(qty)
+                for (flow, area, size), qty in sorted(actual.items())
+                if qty > 0
+            },
+            "area_l1_deviation": int(l1),
+            "boxes_shifted_between_areas": int(l1 // 2),
+        }
 
     @staticmethod
     def _operational_group_dispersion_stats(rows: list[dict]) -> dict[str, int | float | str]:
@@ -572,7 +657,6 @@ class ColumnGenerationPlanner:
         used_group_area: set[tuple[tuple[str, ...], str]] = set()
         used_group_row: set[tuple[tuple[str, ...], str, str]] = set()
         used_groups: set[tuple[str, ...]] = set()
-        used_twenty_bays: set[str] = set()
         proximity_sum = 0.0
         berth_distance_sum = 0.0
         for idx, chosen in selected.items():
@@ -590,8 +674,6 @@ class ColumnGenerationPlanner:
                 # large-bay key.
                 if row_qty > 0 and bay_key == col.bay_key:
                     used_group_row.add((col.group_key, bay_key, row_no))
-            if col.size == "20":
-                used_twenty_bays.add(col.bay_key)
             group = self.groups_by_id[col.group_id]
             proximity_sum += self._normalized_existing_proximity(group, col.bay_key) * qty
             berth_distance_sum += self._normalized_berth_distance(col.voyage_id, col.area_no) * qty
@@ -605,19 +687,33 @@ class ColumnGenerationPlanner:
             voyage_id, flow, _area_no, big_size = key
             if qty > 0 and self.voyage_flow_size_demand[(voyage_id, flow, big_size)] > 0:
                 target_keys.add(key)
-        guidance_l1 = 0.0
+        export_guidance_l1 = 0.0
         for voyage_id, flow, area_no, big_size in target_keys:
             target = self._area_size_target(voyage_id, flow, area_no, big_size)
-            guidance_l1 += abs(
+            export_guidance_l1 += abs(
                 actual_quota.get((voyage_id, flow, area_no, big_size), 0) - target
             )
+        import_actual_by_area: Counter[tuple[str, str, str]] = Counter()
+        for (flow, size, bay_key), qty in self._final_import_reservation.items():
+            if qty > 0 and bay_key in self.bays:
+                import_actual_by_area[(flow, self.bays[bay_key].area_no, size)] += int(qty)
+        import_keys = set(self.import_area_size_reference) | set(import_actual_by_area)
+        import_guidance_l1 = sum(
+            abs(
+                int(import_actual_by_area.get(key, 0))
+                - int(self.import_area_size_reference.get(key, 0))
+            )
+            for key in import_keys
+        )
+        guidance_l1 = float(export_guidance_l1 + import_guidance_l1)
 
         raw = {
             "extra_operational_group_areas": float(max(0, len(used_group_area) - len(used_groups))),
             "extra_operational_group_rows": float(max(0, len(used_group_row) - len(used_groups))),
             "existing_group_normalized_distance_sum": float(proximity_sum),
             "area_guidance_l1_deviation": float(guidance_l1),
-            "large_pair_capacity_loss": float(self._large_pair_capacity_loss(used_twenty_bays)),
+            "export_area_guidance_l1_deviation": float(export_guidance_l1),
+            "import_reservation_area_l1_deviation": float(import_guidance_l1),
             "berth_normalized_distance_sum": float(berth_distance_sum),
         }
         normalized = {
@@ -625,7 +721,6 @@ class ColumnGenerationPlanner:
             "row_dispersion": raw["extra_operational_group_rows"] / self._objective_scale("row_dispersion"),
             "existing_group_proximity": raw["existing_group_normalized_distance_sum"] / self._objective_scale("existing_group_proximity"),
             "area_guidance": raw["area_guidance_l1_deviation"] / self._objective_scale("area_guidance_l1"),
-            "large_pair_capacity": raw["large_pair_capacity_loss"] / self._objective_scale("large_pair_capacity"),
             "berth_distance": raw["berth_normalized_distance_sum"] / self._objective_scale("berth_distance"),
         }
         weights = self._objective_weights()
@@ -981,6 +1076,8 @@ class ColumnGenerationPlanner:
             }
         )
         stage1_unplaced = self._gurobi_unplaced_values(stage1, stage1_vars)
+        stage1_import_reservation = self._gurobi_import_reservation_values(stage1, stage1_vars)
+        self._final_import_reservation = stage1_import_reservation
         optimum_unplaced = int(sum(stage1_unplaced.values()))
         stats["lexicographic_stage1_unplaced_boxes"] = optimum_unplaced
         stats["lexicographic_stage1_bound"] = self._gurobi_dual_bound(stage1)
@@ -1014,6 +1111,9 @@ class ColumnGenerationPlanner:
             }
         )
         unplaced = self._gurobi_unplaced_values(stage2, stage2_vars)
+        self._final_import_reservation = self._gurobi_import_reservation_values(
+            stage2, stage2_vars
+        )
         stats.update(
             {
                 "lexicographic_integer_master_used": True,
@@ -1032,6 +1132,19 @@ class ColumnGenerationPlanner:
             {
                 group_id: int(round(self._gurobi_value(model, var)))
                 for group_id, var in lp_vars["unplaced"].items()
+                if self._gurobi_value(model, var) > 1e-6
+            }
+        )
+
+    def _gurobi_import_reservation_values(
+        self,
+        model,
+        variables: dict,
+    ) -> Counter[tuple[str, str, str]]:
+        return Counter(
+            {
+                key: int(round(self._gurobi_value(model, var)))
+                for key, var in variables.get("import_reserve", {}).items()
                 if self._gurobi_value(model, var) > 1e-6
             }
         )
@@ -1154,10 +1267,20 @@ class ColumnGenerationPlanner:
             )
             for group in self.groups
         }
+        import_reserve = {
+            (flow, size, bay_key): model.addVar(
+                lb=0.0,
+                ub=float(capacity),
+                vtype="C" if relax else "I",
+                obj=0.0,
+                name=f"import_reserve_{flow}_{size}_{self._key_name((bay_key,))}",
+            )
+            for (flow, size), candidates in sorted(self.import_reservation_candidates.items())
+            for bay_key, capacity in candidates
+        }
 
         group_cols: defaultdict[str, list[tuple[int, PlacementColumn]]] = defaultdict(list)
         bay_capacity_cols: defaultdict[str, list[tuple[int, PlacementColumn]]] = defaultdict(list)
-        area_physical_cols: defaultdict[str, list[tuple[int, PlacementColumn, int]]] = defaultdict(list)
         bay_size_capacity_cols: defaultdict[tuple[str, str], list[tuple[int, PlacementColumn]]] = defaultdict(list)
         bay_port_size_cols: defaultdict[tuple[str, str, str], list[tuple[int, PlacementColumn]]] = defaultdict(list)
         row_capacity_cols: defaultdict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
@@ -1167,7 +1290,10 @@ class ColumnGenerationPlanner:
         area_size_cols: defaultdict[tuple[str, str, str, str], list[tuple[int, PlacementColumn]]] = defaultdict(list)
         group_area_cols: defaultdict[tuple[tuple[str, ...], str], list[int]] = defaultdict(list)
         group_row_cols: defaultdict[tuple[tuple[str, ...], str, str], list[int]] = defaultdict(list)
-        twenty_cols_by_large_pair: defaultdict[tuple[str, str], list[int]] = defaultdict(list)
+        import_by_bay: defaultdict[str, list] = defaultdict(list)
+        import_by_bay_size: defaultdict[tuple[str, str], list] = defaultdict(list)
+        import_by_flow_size: defaultdict[tuple[str, str], list] = defaultdict(list)
+        import_by_flow_area_size: defaultdict[tuple[str, str, str], list] = defaultdict(list)
         for idx, col in enumerate(self._columns):
             if idx not in columns:
                 continue
@@ -1178,8 +1304,6 @@ class ColumnGenerationPlanner:
                 for attr in self._bay_no_mix_attrs_for_column(col):
                     scope = self._attr_voyage_scope(attr, col.voyage_id)
                     bay_attr_choice_cols[(footprint_key, attr, scope, self._column_attr_value(col, attr))].append(idx)
-            footprint_units = len(self._placement_footprint_keys(col.bay_key, col.size))
-            area_physical_cols[col.area_no].append((idx, col, footprint_units))
             for footprint_key, row_no, qty in col.row_allocation:
                 row_capacity_cols[(footprint_key, row_no)].append((idx, int(qty)))
                 row_size_capacity_cols[(footprint_key, row_no, col.size)].append((idx, int(qty)))
@@ -1192,10 +1316,15 @@ class ColumnGenerationPlanner:
             for footprint_key, row_no, _qty in col.row_allocation:
                 if footprint_key == col.bay_key:
                     group_row_cols[(col.group_key, footprint_key, row_no)].append(idx)
-            if col.size == "20":
-                pair = self.large_pair_by_member.get(col.bay_key)
-                if pair is not None:
-                    twenty_cols_by_large_pair[pair].append(idx)
+
+        for key, var in import_reserve.items():
+            flow, size, bay_key = key
+            area_no = self.bays[bay_key].area_no
+            for footprint_key in self._placement_footprint_keys(bay_key, size):
+                import_by_bay[footprint_key].append(var)
+            import_by_bay_size[(bay_key, size)].append(var)
+            import_by_flow_size[(flow, size)].append(var)
+            import_by_flow_area_size[(flow, area_no, size)].append(var)
 
         group_cover = {}
         for group in self.groups:
@@ -1203,36 +1332,22 @@ class ColumnGenerationPlanner:
             group_cover[group.group_id] = model.addCons(expr + unplaced[group.group_id] == group.demand, name=f"cover_{group.group_id}")
 
         bay_capacity_limit = {}
-        for bay_key, items in bay_capacity_cols.items():
+        for bay_key in sorted(set(bay_capacity_cols) | set(import_by_bay)):
+            items = bay_capacity_cols.get(bay_key, [])
             bay_capacity_limit[bay_key] = model.addCons(
-                quicksum(col.quantity * columns[idx] for idx, col in items) <= self.bays[bay_key].physical_capacity,
+                quicksum(col.quantity * columns[idx] for idx, col in items)
+                + quicksum(import_by_bay.get(bay_key, []))
+                <= self.bays[bay_key].physical_capacity,
                 name=f"bay_cap_{bay_key}",
             )
-        area_reservation_limit = {}
-        reservation_keys = set(self.import_area_size_reservation)
-        for area_no in sorted({area for area, _size in reservation_keys}):
-            physical_capacity = sum(
-                int(bay.physical_capacity)
-                for bay in self.bays.values()
-                if bay.area_no == area_no
-            )
-            reserved_slot_units = 0
-            for (reserved_area, size), qty in self.import_area_size_reservation.items():
-                if reserved_area == area_no:
-                    reserved_slot_units += int(qty) * (2 if size in {"40", "45"} else 1)
-            available_for_detail = max(0, physical_capacity - reserved_slot_units)
-            area_reservation_limit[area_no] = model.addCons(
-                quicksum(
-                    col.quantity * footprint_units * columns[idx]
-                    for idx, col, footprint_units in area_physical_cols.get(area_no, [])
-                ) <= available_for_detail,
-                name=f"area_after_aggregate_reservation_{area_no}",
-            )
         bay_size_limit = {}
-        for key, items in bay_size_capacity_cols.items():
+        for key in sorted(set(bay_size_capacity_cols) | set(import_by_bay_size)):
+            items = bay_size_capacity_cols.get(key, [])
             bay_key, size = key
             bay_size_limit[key] = model.addCons(
-                quicksum(col.quantity * columns[idx] for idx, col in items) <= self.bays[bay_key].cap_by_size.get(size, 0),
+                quicksum(col.quantity * columns[idx] for idx, col in items)
+                + quicksum(import_by_bay_size.get(key, []))
+                <= self.bays[bay_key].cap_by_size.get(size, 0),
                 name=f"bay_size_{bay_key}_{size}",
             )
         row_capacity_limit = {}
@@ -1280,14 +1395,25 @@ class ColumnGenerationPlanner:
                     quicksum(stack_vars) <= stack_count,
                     name=f"stack_total_{bay_key}_{size}",
                 )
-        large_pair_limits = self._add_large_pair_preservation_constraints(
+        import_total_balance = {}
+        for key, required in sorted(self.import_total_by_flow_size.items()):
+            candidates = import_by_flow_size.get(key, [])
+            if not candidates:
+                raise ValueError(
+                    "import capacity reservation has no function- and size-compatible bay: "
+                    f"flow={key[0]}, size={key[1]}, required={required}"
+                )
+            import_total_balance[key] = model.addCons(
+                quicksum(candidates) == int(required),
+                name=f"import_total_{key[0]}_{key[1]}",
+            )
+        import_reference_balance = self._add_import_reference_deviation(
             quicksum,
             model,
-            columns,
-            twenty_cols_by_large_pair,
-            relax=relax,
+            import_by_flow_area_size,
             objective_mode=objective_mode,
         )
+
         # Big-plan allocations are soft inheritance targets. Hard upper bounds
         # are intentionally omitted so detailed declared boxes can recover from
         # stale or physically incompatible upstream allocations.
@@ -1332,15 +1458,18 @@ class ColumnGenerationPlanner:
         self._add_row_compatibility_constraints(
             quicksum, model, columns, row_attr_choice_cols, relax=relax
         )
-        return model, {"column": columns, "unplaced": unplaced}, {
+        return model, {
+            "column": columns,
+            "unplaced": unplaced,
+            "import_reserve": import_reserve,
+        }, {
             "group_cover": group_cover,
             "bay_capacity_limit": bay_capacity_limit,
-            "area_reservation_limit": area_reservation_limit,
             "bay_size_limit": bay_size_limit,
             "row_capacity_limit": row_capacity_limit,
             "row_size_limit": row_size_limit,
-            "large_pair_loss_link": large_pair_limits.get("loss_link", {}),
-            "import_large_pair_reservation": large_pair_limits.get("reservation", {}),
+            "import_total_balance": import_total_balance,
+            "import_reference_balance": import_reference_balance,
             "bay_port_stack_link": bay_port_stack_link,
             "bay_port_stack_limit": bay_port_stack_limit,
             "bay_stack_total_limit": bay_stack_total_limit,
@@ -1350,79 +1479,35 @@ class ColumnGenerationPlanner:
             **relaxed_objective_constraints,
         }
 
-    def _add_large_pair_preservation_constraints(
+    def _add_import_reference_deviation(
         self,
         quicksum,
         model,
-        columns,
-        twenty_cols_by_large_pair: dict[tuple[str, str], list[int]],
-        relax: bool,
+        import_by_flow_area_size: dict[tuple[str, str, str], list],
         objective_mode: str,
-    ) -> dict[str, dict]:
-        """Preserve usable large-container pairs and price their exact loss.
-
-        A pair is lost once any selected 20-ft placement occupies either
-        member. Known 40/45-ft import reservations must fit in the remaining
-        pair capacity.
-        """
-        unavailable_by_pair = {}
-        loss_link = {}
-        vtype = "C" if relax else "B"
-        loss_penalty = 0.0 if objective_mode == "min_unplaced" else self._twenty_segment_loss_penalty()
-        for pair, capacity in sorted(self.large_pair_capacity.items()):
-            indices = sorted(set(twenty_cols_by_large_pair.get(pair, [])))
-            unavailable = model.addVar(
+    ) -> dict[tuple[str, str, str], object]:
+        """Penalize the minimum area adjustment of anonymous import reserve."""
+        keys = set(self.import_area_size_reference) | set(import_by_flow_area_size)
+        balance = {}
+        penalty = 0.0 if objective_mode == "min_unplaced" else self._area_guidance_penalty()
+        for flow, area_no, size in sorted(keys):
+            target = int(self.import_area_size_reference.get((flow, area_no, size), 0))
+            pos = model.addVar(
                 lb=0.0,
-                ub=1.0,
-                vtype=vtype,
-                obj=loss_penalty * int(capacity),
-                name=f"large_pair_unavailable_{self._key_name(pair)}",
+                obj=penalty,
+                name=f"import_guide_pos_{flow}_{area_no}_{size}",
             )
-            unavailable_by_pair[pair] = unavailable
-            for idx in indices:
-                loss_link[(pair, idx)] = model.addCons(
-                    columns[idx]
-                    <= max(1, self.group_demand[self._columns[idx].group_id]) * unavailable,
-                    name=f"large_pair_loss_link_{len(loss_link)}",
-                )
-            if indices:
-                model.addCons(
-                    unavailable <= quicksum(columns[idx] for idx in indices),
-                    name=f"large_pair_loss_exact_{self._key_name(pair)}",
-                )
-            else:
-                model.addCons(unavailable == 0.0, name=f"large_pair_loss_zero_{self._key_name(pair)}")
-
-        reservation = {}
-        import_large_by_area: Counter[str] = Counter()
-        import_45_by_area: Counter[str] = Counter()
-        for (area_no, size), qty in self.import_area_size_reservation.items():
-            if size in {"40", "45"} and int(qty) > 0:
-                import_large_by_area[str(area_no)] += int(qty)
-            if size == "45" and int(qty) > 0:
-                import_45_by_area[str(area_no)] += int(qty)
-        for area_no, required in sorted(import_large_by_area.items()):
-            pairs = [
-                (pair, capacity)
-                for pair, capacity in self.large_pair_capacity.items()
-                if self.bays[pair[0]].area_no == area_no
-            ]
-            reservation[area_no] = model.addCons(
-                quicksum(int(capacity) * (1.0 - unavailable_by_pair[pair]) for pair, capacity in pairs)
-                >= int(required),
-                name=f"import_large_pair_reservation_{area_no}",
+            neg = model.addVar(
+                lb=0.0,
+                obj=penalty,
+                name=f"import_guide_neg_{flow}_{area_no}_{size}",
             )
-            required_45 = int(import_45_by_area.get(area_no, 0))
-            if required_45 > 0:
-                reservation[(area_no, "45")] = model.addCons(
-                    quicksum(
-                        int(self.large_pair_capacity_45.get(pair, 0)) * (1.0 - unavailable_by_pair[pair])
-                        for pair, _capacity in pairs
-                    )
-                    >= required_45,
-                    name=f"import_45_pair_reservation_{area_no}",
-                )
-        return {"loss_link": loss_link, "reservation": reservation}
+            actual = quicksum(import_by_flow_area_size.get((flow, area_no, size), []))
+            balance[(flow, area_no, size)] = model.addCons(
+                actual - target == pos - neg,
+                name=f"import_guide_balance_{flow}_{area_no}_{size}",
+            )
+        return balance
 
 
 
@@ -1737,29 +1822,6 @@ class ColumnGenerationPlanner:
         return tuple(str(attr) for attr in attrs if str(attr))
 
     @staticmethod
-    def _infer_import_voyages(problem: ProblemData) -> set[str]:
-        declared_exports = getattr(problem, "export_voyages", None)
-        if declared_exports is not None:
-            all_voyages = {str(voyage_id) for voyage_id in getattr(problem, "target_voyages", []) if str(voyage_id)}
-            all_voyages.update(
-                str(group.voyage_id)
-                for group in list(getattr(problem, "groups", []) or [])
-                + list(getattr(problem, "small_groups", []) or [])
-                if str(group.voyage_id)
-            )
-            return all_voyages - {str(voyage_id) for voyage_id in declared_exports if str(voyage_id)}
-        flows_by_voyage: defaultdict[str, set[str]] = defaultdict(set)
-        for row in getattr(problem, "big_plan", []) or []:
-            flows_by_voyage[str(row.voyage_id)].add(str(row.flow))
-        for group in list(getattr(problem, "groups", []) or []) + list(getattr(problem, "small_groups", []) or []):
-            flows_by_voyage[str(group.voyage_id)].add(str(group.status))
-        return {
-            voyage_id
-            for voyage_id, flows in flows_by_voyage.items()
-            if flows and not any(flow in EXPORT_FLOWS for flow in flows)
-        }
-
-    @staticmethod
     def _infer_export_voyages(problem: ProblemData) -> set[str]:
         declared = getattr(problem, "export_voyages", None)
         if declared is not None:
@@ -2052,6 +2114,123 @@ class ColumnGenerationPlanner:
 
 
 
+    def _greedy_import_reservation(self, state: dict) -> Counter[tuple[str, str, str]]:
+        """Construct a feasible anonymous reserve for the non-Gurobi fallback."""
+        reserved: Counter[tuple[str, str, str]] = Counter()
+        keys = sorted(
+            self.import_total_by_flow_size,
+            key=lambda key: (
+                0 if key[1] == "40" else 1,
+                len(self.import_reservation_candidates.get(key, [])),
+                key,
+            ),
+        )
+        for flow, size in keys:
+            required = int(self.import_total_by_flow_size[(flow, size)])
+            candidates = list(self.import_reservation_candidates.get((flow, size), []))
+            by_area: defaultdict[str, list[tuple[str, int]]] = defaultdict(list)
+            for bay_key, capacity in candidates:
+                by_area[self.bays[bay_key].area_no].append((bay_key, capacity))
+            reference_by_area = Counter(
+                {
+                    area_no: int(qty)
+                    for (reference_flow, area_no, reference_size), qty in self.import_area_size_reference.items()
+                    if reference_flow == flow and reference_size == size and int(qty) > 0
+                }
+            )
+            remaining = required
+            for area_no, target in sorted(reference_by_area.items(), key=lambda item: (-item[1], item[0])):
+                area_need = min(remaining, int(target))
+                for bay_key, _capacity in by_area.get(area_no, []):
+                    available = self._remaining_import_reservation_capacity(bay_key, size, state)
+                    qty = min(area_need, available)
+                    if qty <= 0:
+                        continue
+                    reserved[(flow, size, bay_key)] += qty
+                    self._apply_import_reservation_quantity(bay_key, size, qty, state)
+                    area_need -= qty
+                    remaining -= qty
+                    if area_need <= 0:
+                        break
+            if remaining > 0:
+                for bay_key, _capacity in sorted(
+                    candidates,
+                    key=lambda item: (
+                        self.bays[item[0]].area_no in reference_by_area,
+                        self.bays[item[0]].area_no,
+                        self.bays[item[0]].bay_order,
+                    ),
+                ):
+                    available = self._remaining_import_reservation_capacity(bay_key, size, state)
+                    qty = min(remaining, available)
+                    if qty <= 0:
+                        continue
+                    reserved[(flow, size, bay_key)] += qty
+                    self._apply_import_reservation_quantity(bay_key, size, qty, state)
+                    remaining -= qty
+                    if remaining <= 0:
+                        break
+            if remaining > 0:
+                raise ValueError(
+                    "insufficient function- and size-compatible capacity for imports: "
+                    f"flow={flow}, size={size}, required={required}, reserved={required - remaining}"
+                )
+        return reserved
+
+    def _remaining_import_reservation_capacity(self, bay_key: str, size: str, state: dict) -> int:
+        capacity = self._import_reservation_capacity(bay_key, size)
+        footprint = self._placement_footprint_keys(bay_key, size)
+        for key in footprint:
+            capacity = min(
+                capacity,
+                int(self.bays[key].physical_capacity) - int(state["bay_load"][key]),
+            )
+        capacity = min(
+            capacity,
+            int(self.bays[bay_key].cap_by_size.get(size, 0))
+            - int(state["bay_size_load"][(bay_key, size)]),
+        )
+        return max(0, int(capacity))
+
+    def _apply_import_reservation_quantity(
+        self,
+        bay_key: str,
+        size: str,
+        quantity: int,
+        state: dict,
+    ) -> None:
+        if quantity <= 0:
+            return
+        footprint = self._placement_footprint_keys(bay_key, size)
+        state["area_slot_load"][self.bays[bay_key].area_no] += int(quantity) * len(footprint)
+        for key in footprint:
+            state["bay_load"][key] += int(quantity)
+        state["bay_size_load"][(bay_key, size)] += int(quantity)
+
+    def _apply_import_reservation_to_state(
+        self,
+        reservation: Counter[tuple[str, str, str]],
+        state: dict,
+    ) -> None:
+        candidate_keys = {
+            (flow, size, bay_key)
+            for (flow, size), candidates in self.import_reservation_candidates.items()
+            for bay_key, _capacity in candidates
+        }
+        for (flow, size, bay_key), qty in sorted(reservation.items()):
+            if qty <= 0:
+                continue
+            if (flow, size, bay_key) not in candidate_keys:
+                raise RuntimeError(
+                    f"invalid import reserve option: flow={flow}, size={size}, bay={bay_key}"
+                )
+            if int(qty) > self._remaining_import_reservation_capacity(bay_key, size, state):
+                raise RuntimeError(
+                    f"import reserve exceeds bay capacity: flow={flow}, size={size}, "
+                    f"bay={bay_key}, quantity={qty}"
+                )
+            self._apply_import_reservation_quantity(bay_key, size, int(qty), state)
+
     def _apply_stack_usage_to_state(self, group: SmallBoxGroup, bay_key: str, quantity: int, state: dict) -> None:
         row_mix_key = self._row_mix_key_for_group(group)
         for footprint_key in self._placement_footprint_keys(bay_key, group.size):
@@ -2069,6 +2248,7 @@ class ColumnGenerationPlanner:
         selected: Counter[int] = Counter()
         placed: Counter[str] = Counter()
         state = self._empty_selection_state()
+        self._final_import_reservation = self._greedy_import_reservation(state)
         indices_by_group: defaultdict[str, list[int]] = defaultdict(list)
         for idx, column in enumerate(self._columns):
             indices_by_group[column.group_id].append(idx)
@@ -2109,6 +2289,7 @@ class ColumnGenerationPlanner:
         repaired: Counter[int] = Counter()
         placed: Counter[str] = Counter()
         state = self._empty_selection_state()
+        self._apply_import_reservation_to_state(self._final_import_reservation, state)
         for idx, chosen in sorted(selected.items()):
             if chosen <= 0 or idx < 0 or idx >= len(self._columns):
                 continue
@@ -2139,7 +2320,6 @@ class ColumnGenerationPlanner:
             "row_used_attrs": {},
             "bay_used_size": {},
             "bay_used_attrs": {},
-            "twenty_segment_used_bays": set(),
             "used_group_area": set(),
             "used_voyage_area": set(),
             "big_plan_quota_used": Counter(),
@@ -2213,59 +2393,11 @@ class ColumnGenerationPlanner:
             return 0
         if not self._bay_state_attrs_allow_group(group, footprint, state):
             return 0
-        if group.size == "20":
-            pair = self.large_pair_by_member.get(bay_key)
-            used_twenty = set(state.get("twenty_segment_used_bays", set()))
-            if pair is not None and pair[0] not in used_twenty and pair[1] not in used_twenty:
-                base_capacity = sum(
-                    capacity
-                    for candidate, capacity in self.large_pair_capacity.items()
-                    if self.bays[candidate[0]].area_no == bay.area_no
-                )
-                current_loss = self._large_pair_capacity_loss(used_twenty, area_no=bay.area_no)
-                required = sum(
-                    int(qty)
-                    for (area_no, size), qty in self.import_area_size_reservation.items()
-                    if area_no == bay.area_no and size in {"40", "45"}
-                )
-                if base_capacity - current_loss - self.large_pair_capacity[pair] < required:
-                    return 0
-                required_45 = sum(
-                    int(qty)
-                    for (area_no, size), qty in self.import_area_size_reservation.items()
-                    if area_no == bay.area_no and size == "45"
-                )
-                if required_45 > 0:
-                    base_45 = sum(
-                        capacity
-                        for candidate, capacity in self.large_pair_capacity_45.items()
-                        if self.bays[candidate[0]].area_no == bay.area_no
-                    )
-                    current_45_loss = sum(
-                        capacity
-                        for candidate, capacity in self.large_pair_capacity_45.items()
-                        if self.bays[candidate[0]].area_no == bay.area_no
-                        and (candidate[0] in used_twenty or candidate[1] in used_twenty)
-                    )
-                    if base_45 - current_45_loss - self.large_pair_capacity_45.get(pair, 0) < required_45:
-                        return 0
         capacity = int(remaining)
         for key in footprint:
             capacity = min(capacity, self.bays[key].physical_capacity - state["bay_load"][key])
         capacity = min(capacity, bay.cap_by_size.get(group.size, 0) - state["bay_size_load"][(bay_key, group.size)])
         capacity = min(capacity, self._row_capacity_for_column(group, bay_key, state=state))
-        area_physical_capacity = sum(
-            int(item.physical_capacity) for item in self.bays.values() if item.area_no == bay.area_no
-        )
-        reserved_units = sum(
-            int(qty) * (2 if size in {"40", "45"} else 1)
-            for (area_no, size), qty in (
-                self.import_area_size_reservation
-            ).items()
-            if area_no == bay.area_no
-        )
-        area_remaining_units = max(0, area_physical_capacity - reserved_units - state["area_slot_load"][bay.area_no])
-        capacity = min(capacity, area_remaining_units // max(1, len(footprint)))
         return max(0, int(capacity))
 
     def _apply_column_to_state(self, col: PlacementColumn, state: dict) -> None:
@@ -2292,8 +2424,6 @@ class ColumnGenerationPlanner:
                 state["row_used_attrs"][state_key] = self._column_attr_value(col, attr)
         state["used_group_area"].add((col.group_key, col.area_no))
         state["used_voyage_area"].add((col.voyage_id, col.area_no))
-        if col.size == "20":
-            state.setdefault("twenty_segment_used_bays", set()).add(col.bay_key)
         state["big_plan_quota_used"][col.quota_key] += col.quantity
 
 
@@ -2342,7 +2472,6 @@ class ColumnGenerationPlanner:
         )
 
     def _candidate_area_base_scope(self, group: SmallBoxGroup, area_no: str, scope: str) -> bool:
-        big_size = self._big_plan_size(group.size)
         return True
 
 
@@ -2396,9 +2525,8 @@ class ColumnGenerationPlanner:
             * self._normalized_existing_proximity(group, bay_key)
             / self._objective_scale("existing_group_proximity")
         )
-        # The exact 20-ft opportunity loss is modeled jointly through
-        # large-pair loss variables in the master problem. Do not add a second
-        # per-column proxy cost here.
+        # Import capacity is represented by joint master constraints and has
+        # no pair-loss or other per-column objective cost.
         return cost
 
 
@@ -2436,8 +2564,6 @@ class ColumnGenerationPlanner:
                 self.block_bay_nos[block_id] = tuple(self.bays[bay_key].bay_no for bay_key in members)
                 for bay_key in members:
                     self.block_by_bay[(area_no, bay_key)] = block_id
-        self._prepare_large_segment_preservation_indexes()
-        self._prepare_large_pair_capacity_indexes()
         heights_by_size: defaultdict[str, set[str]] = defaultdict(set)
         for group in self.groups:
             heights_by_size[group.size].add(group.height)
@@ -2456,138 +2582,41 @@ class ColumnGenerationPlanner:
                     self.area_size_height_cap[(bay.area_no, size, height)] += cap
 
 
-    def _prepare_large_segment_preservation_indexes(self) -> None:
-        self.large_segment_by_bay.clear()
-        self.large_segment_base_pairs.clear()
-        self.large_segment_static_loss_by_bay.clear()
 
-        def flush(segment: list[str]) -> None:
-            if len(segment) < 2:
-                return
-            segment_key = tuple(segment)
-            base_pairs = self._segment_pair_capacity(segment_key)
-            self.large_segment_base_pairs[segment_key] = base_pairs
-            for key in segment_key:
-                self.large_segment_by_bay[key] = segment_key
-                self.large_segment_static_loss_by_bay[key] = max(
-                    0,
-                    base_pairs - self._segment_pair_capacity_after_removed(segment_key, {key}),
-                )
 
-        for area_no, keys in self.bays_by_area.items():
-            segment: list[str] = []
-            for bay_key in keys:
-                if not self._bay_can_participate_in_large_segment(bay_key):
-                    flush(segment)
-                    segment = []
+
+
+
+
+
+    def _prepare_import_reservation_candidates(self) -> None:
+        """Build anonymous import reserve options using only flow and size."""
+        self.import_reservation_candidates.clear()
+        for flow, size in sorted(self.import_total_by_flow_size):
+            candidates: list[tuple[str, int]] = []
+            for area_no in sorted(self.bays_by_area):
+                if flow not in self.problem.area_functions.get(area_no, set()):
                     continue
-                if segment and not self._segment_bays_are_consecutive(segment[-1], bay_key):
-                    flush(segment)
-                    segment = []
-                segment.append(bay_key)
-            flush(segment)
+                for bay_key in self.bays_by_area[area_no]:
+                    capacity = self._import_reservation_capacity(bay_key, size)
+                    if capacity > 0:
+                        candidates.append((bay_key, capacity))
+            self.import_reservation_candidates[(flow, size)] = candidates
 
-    def _prepare_large_pair_capacity_indexes(self) -> None:
-        """Index physical 40/45-ft pairs for reservation and loss accounting."""
-        self.large_pair_capacity.clear()
-        self.large_pair_capacity_45.clear()
-        self.large_pair_by_member.clear()
-        for bay_key, bay in self.bays.items():
-            partner_key = str(getattr(bay, "large_bay_partner_key", "") or "")
-            if not partner_key or partner_key not in self.bays:
-                continue
-            pair = (bay_key, partner_key)
-            capacity = max(
-                int(bay.cap_by_size.get("40", 0) or 0),
-                int(bay.cap_by_size.get("45", 0) or 0),
-            )
-            if capacity <= 0:
-                continue
-            self.large_pair_capacity[pair] = capacity
-            self.large_pair_capacity_45[pair] = int(bay.cap_by_size.get("45", 0) or 0)
-            self.large_pair_by_member[bay_key] = pair
-            self.large_pair_by_member[partner_key] = pair
-
-    def _bay_can_participate_in_large_segment(self, bay_key: str) -> bool:
+    def _import_reservation_capacity(self, bay_key: str, size: str) -> int:
+        """Capacity using only physical footprint and enabled bay size."""
         bay = self.bays.get(bay_key)
-        if bay is None or int(getattr(bay, "physical_capacity", 0) or 0) <= 0:
-            return False
-        existing_sizes = self._bay_existing_size_modes(bay_key)
-        if "20" in existing_sizes:
-            return False
-        if "40" in existing_sizes and "45" in existing_sizes:
-            return False
-        if existing_sizes & {"40", "45"}:
-            return True
-        if int(bay.cap_by_size.get("40", 0) or 0) > 0 or int(bay.cap_by_size.get("45", 0) or 0) > 0:
-            return True
-        for size in ("40", "45"):
-            if any(int(value or 0) > 0 for value in (bay.row_cap_by_size.get(size, {}) or {}).values()):
-                return True
-        return False
-
-    def _segment_bays_are_consecutive(self, left_key: str, right_key: str) -> bool:
-        left = self.bays.get(left_key)
-        right = self.bays.get(right_key)
-        if left is None or right is None or left.area_no != right.area_no:
-            return False
-        try:
-            return int(left.bay_no) + 2 == int(right.bay_no)
-        except (TypeError, ValueError):
-            return int(right.bay_order) - int(left.bay_order) == 1
-
-    def _segment_pair_capacity(self, bay_keys: Iterable[str]) -> int:
-        ordered = sorted(
-            (key for key in bay_keys if key in self.bays),
-            key=lambda key: (self.bays[key].area_no, self.bays[key].bay_order, key),
-        )
-        total = 0
-        run_len = 0
-        prev_key: str | None = None
-        for key in ordered:
-            if prev_key is not None and self._segment_bays_are_consecutive(prev_key, key):
-                run_len += 1
-            else:
-                total += run_len // 2
-                run_len = 1
-            prev_key = key
-        total += run_len // 2
-        return total
-
-    def _segment_pair_capacity_after_removed(self, segment: tuple[str, ...], removed_bays: set[str]) -> int:
-        if not removed_bays:
-            return self.large_segment_base_pairs.get(segment, self._segment_pair_capacity(segment))
-        return self._segment_pair_capacity(key for key in segment if key not in removed_bays)
-
-
-
-
-
-
-
-
-    def _bay_existing_size_modes(self, bay_key: str) -> set[str]:
-        bay = self.bays.get(bay_key)
-        if bay is None:
-            return set()
-        return {str(size) for size in getattr(bay, "existing_size_modes", set()) if str(size)}
-
-
-
-
-    def _large_pair_capacity_loss(self, used_twenty_bays: set[str], area_no: str | None = None) -> int:
-        return sum(
-            int(capacity)
-            for pair, capacity in self.large_pair_capacity.items()
-            if (area_no is None or self.bays[pair[0]].area_no == area_no)
-            if pair[0] in used_twenty_bays or pair[1] in used_twenty_bays
-        )
-
-
-    def _twenty_segment_loss_penalty(self) -> float:
-        return (
-            float(self.config.large_pair_capacity_weight)
-            / self._objective_scale("large_pair_capacity")
+        if bay is None or size not in {"20", "40"}:
+            return 0
+        footprint = self._placement_footprint_keys(bay_key, size)
+        if not footprint:
+            return 0
+        return max(
+            0,
+            min(
+                int(bay.cap_by_size.get(size, 0) or 0),
+                *(int(self.bays[key].physical_capacity) for key in footprint),
+            ),
         )
 
 
@@ -2735,7 +2764,6 @@ class ColumnGenerationPlanner:
             "row_dispersion": float(self.config.row_dispersion_weight),
             "existing_group_proximity": float(self.config.existing_group_proximity_weight),
             "area_guidance": float(self.config.area_guidance_weight),
-            "large_pair_capacity": float(self.config.large_pair_capacity_weight),
             "berth_distance": float(self.config.berth_distance_weight),
         }
 
@@ -2766,8 +2794,8 @@ class ColumnGenerationPlanner:
             return max(1.0, float(self._objective_scales[key]))
         fallback = {
             "existing_group_proximity": self._anchored_group_demand(),
-            "area_guidance_l1": 2 * self._guided_demand(),
-            "large_pair_capacity": sum(self.large_pair_capacity.values()),
+            "area_guidance_l1": 2
+            * (self._guided_demand() + sum(self.import_total_by_flow_size.values())),
             "berth_distance": sum(group.demand for group in self.groups),
         }.get(key, 1.0)
         return max(1.0, float(fallback))
@@ -2795,8 +2823,16 @@ class ColumnGenerationPlanner:
             "area_dispersion": float(max(1, area_scale)),
             "row_dispersion": float(max(1, row_scale)),
             "existing_group_proximity": float(max(1, self._anchored_group_demand())),
-            "area_guidance_l1": float(max(1, 2 * self._guided_demand())),
-            "large_pair_capacity": float(max(1, sum(self.large_pair_capacity.values()))),
+            "area_guidance_l1": float(
+                max(
+                    1,
+                    2
+                    * (
+                        self._guided_demand()
+                        + sum(self.import_total_by_flow_size.values())
+                    ),
+                )
+            ),
             "berth_distance": float(max(1, sum(group.demand for group in self.groups))),
         }
 
