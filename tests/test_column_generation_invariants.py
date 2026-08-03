@@ -2,13 +2,19 @@ from __future__ import annotations
 
 import unittest
 import csv
+import importlib.util
 from collections import defaultdict
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-from yard_planning.models import AttributeRules, Bay, ExportGroup
-from yard_planning.planner import ColumnGenerationConfig, ColumnGenerationPlanner, PlacementColumn
+from yard_planning.models import AttributeRules, Bay, ExportGroup, ProblemData
+from yard_planning.planner import (
+    ColumnGenerationConfig,
+    ColumnGenerationPlanner,
+    PlacementColumn,
+    _GurobiModelAdapter,
+)
 from yard_planning.output_validator import _parse_integer, validate_output_files
 
 
@@ -24,11 +30,95 @@ def make_group(size: str) -> ExportGroup:
     )
 
 
+def make_bay(
+    area: str,
+    bay_no: str,
+    row_caps: dict[str, int],
+    *,
+    physical_capacity: int | None = None,
+) -> Bay:
+    capacity = int(physical_capacity if physical_capacity is not None else sum(row_caps.values()))
+    return Bay(
+        area_no=area,
+        bay_no=bay_no,
+        bay_key=f"{area}|{bay_no}",
+        bay_order=int(bay_no),
+        cap_by_size={"20": capacity},
+        physical_capacity=capacity,
+        row_cap_by_size={"20": dict(row_caps)},
+        row_physical_capacity=dict(row_caps),
+    )
+
+
+def make_small_problem() -> ProblemData:
+    groups = [
+        ExportGroup(
+            group_id="G1",
+            voyage_id="V1",
+            status="OF",
+            port="P1",
+            size="20",
+            height="96",
+            demand=3,
+        ),
+        ExportGroup(
+            group_id="G2",
+            voyage_id="V1",
+            status="OF",
+            port="P2",
+            size="20",
+            height="96",
+            demand=2,
+        ),
+    ]
+    bays = {
+        bay.bay_key: bay
+        for bay in (
+            make_bay("A", "01", {"1": 2}),
+            make_bay("A", "03", {"1": 2}),
+            make_bay("B", "01", {"1": 2}),
+            make_bay("B", "03", {"1": 2}),
+        )
+    }
+    return ProblemData(
+        export_groups=groups,
+        bays=bays,
+        area_guidance_target={
+            ("V1", "OF", "A", "20"): 3,
+            ("V1", "OF", "B", "20"): 2,
+        },
+        area_functions={"A": {"OF"}, "B": {"OF"}},
+        target_voyages=["V1"],
+        export_voyages={"V1"},
+        berth_distances={("A", "Q1"): 1.0, ("B", "Q1"): 2.0},
+        berth_by_voyage={"V1": "Q1"},
+    )
+
+
 class ColumnGenerationInvariantTests(unittest.TestCase):
     def test_pricing_configuration_requires_negative_reduced_cost(self) -> None:
         config = ColumnGenerationConfig()
+        self.assertGreater(config.min_columns_per_group_per_iteration, 0)
         self.assertGreater(config.max_columns_per_group_per_iteration, 0)
+        self.assertGreaterEqual(
+            config.max_columns_per_group_per_iteration,
+            config.min_columns_per_group_per_iteration,
+        )
+        self.assertGreater(config.adaptive_pricing_fraction, 0.0)
         self.assertGreater(config.reduced_cost_tolerance, 0.0)
+
+    def test_adaptive_pricing_batch_respects_fraction_and_bounds(self) -> None:
+        planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
+        planner.config = ColumnGenerationConfig(
+            min_columns_per_group_per_iteration=2,
+            max_columns_per_group_per_iteration=8,
+            adaptive_pricing_fraction=0.25,
+        )
+        self.assertEqual(0, planner._adaptive_pricing_batch_size(0))
+        self.assertEqual(1, planner._adaptive_pricing_batch_size(1))
+        self.assertEqual(2, planner._adaptive_pricing_batch_size(4))
+        self.assertEqual(5, planner._adaptive_pricing_batch_size(20))
+        self.assertEqual(8, planner._adaptive_pricing_batch_size(100))
 
     def test_stage_two_has_no_unplaced_penalty(self) -> None:
         planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
@@ -103,6 +193,72 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         self.assertEqual(5, planner._max_quantity_in_bay(make_group("20"), "edge"))
         self.assertEqual(0, planner._max_quantity_in_bay(make_group("45"), "middle"))
         self.assertEqual(5, planner._max_quantity_in_bay(make_group("45"), "edge"))
+
+    def test_big_plan_guidance_cannot_override_area_function(self) -> None:
+        group = make_group("20")
+        bays = {
+            "A|01": make_bay("A", "01", {"1": 2}),
+            "B|01": make_bay("B", "01", {"1": 2}),
+        }
+        problem = ProblemData(
+            export_groups=[group],
+            bays=bays,
+            area_guidance_target={("V1", "OF", "B", "20"): 5},
+            area_functions={"A": {"OF"}, "B": {"IF"}},
+            target_voyages=["V1"],
+            export_voyages={"V1"},
+            berth_distances={("A", "Q1"): 1.0},
+            berth_by_voyage={"V1": "Q1"},
+        )
+        planner = ColumnGenerationPlanner(problem, ColumnGenerationConfig(verbose=False))
+        self.assertEqual(["A"], planner._candidate_areas_for_group(group))
+
+    def test_unreachable_existing_anchor_is_objective_neutral(self) -> None:
+        group = make_group("20")
+        anchor_key = (
+            "V1",
+            "flow=OF",
+            "IYC_CSZ_CSIZECD=20",
+            "IYC_POT_UNLDPORT=P1",
+            "IYC_CHEIGHTCD=96",
+        )
+        open_bay = make_bay("A", "01", {"1": 5})
+        full_anchor_bay = make_bay("Z", "01", {}, physical_capacity=0)
+        problem = ProblemData(
+            export_groups=[group],
+            bays={open_bay.bay_key: open_bay, full_anchor_bay.bay_key: full_anchor_bay},
+            area_guidance_target={("V1", "OF", "A", "20"): 5},
+            area_functions={"A": {"OF"}, "Z": {"OF"}},
+            target_voyages=["V1"],
+            export_voyages={"V1"},
+            existing_group_area_load={anchor_key + ("Z",): 1},
+            existing_group_bay_load={anchor_key + ("Z", "Z|01"): 1},
+            berth_distances={("A", "Q1"): 1.0},
+            berth_by_voyage={"V1": "Q1"},
+        )
+        planner = ColumnGenerationPlanner(problem, ColumnGenerationConfig(verbose=False))
+        self.assertNotIn(group.group_id, planner.reachable_anchor_group_ids)
+        self.assertEqual(0, planner._anchored_group_demand())
+        self.assertEqual(0.0, planner._normalized_existing_proximity(group, "A|01"))
+
+    def test_group_area_big_m_uses_feasible_group_capacity(self) -> None:
+        group = ExportGroup(**{**make_group("20").__dict__, "demand": 10})
+        bay = make_bay("A", "01", {"1": 3}, physical_capacity=100)
+        bay.cap_by_size["20"] = 100
+        problem = ProblemData(
+            export_groups=[group],
+            bays={bay.bay_key: bay},
+            area_guidance_target={("V1", "OF", "A", "20"): 10},
+            area_functions={"A": {"OF"}},
+            target_voyages=["V1"],
+            export_voyages={"V1"},
+            berth_distances={("A", "Q1"): 1.0},
+            berth_by_voyage={"V1": "Q1"},
+        )
+        planner = ColumnGenerationPlanner(problem, ColumnGenerationConfig(verbose=False))
+        planner._prepare_master_index_sets()
+        key = (planner._operational_group_key(group), "A")
+        self.assertEqual(3, planner._master_group_area_big_m[key])
 
     def test_pricing_enumerates_candidates_without_materializing_universe(self) -> None:
         planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
@@ -187,6 +343,96 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
 
         self.assertAlmostEqual(-56.0, reduced_cost)
 
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_column_generation_lp_matches_complete_column_lp(self) -> None:
+        from gurobipy import quicksum
+
+        problem = make_small_problem()
+        config = ColumnGenerationConfig(
+            min_columns_per_group_per_iteration=1,
+            max_columns_per_group_per_iteration=1,
+            adaptive_pricing_fraction=1.0,
+            max_iterations=30,
+            mip_gap=0.0,
+            complete_integer_verification_max_columns=0,
+            verbose=False,
+        )
+        priced = ColumnGenerationPlanner(problem, config)
+        priced_result = priced.solve()
+
+        complete = ColumnGenerationPlanner(problem, config)
+        complete._initialize_column_generation()
+        complete._prepare_master_index_sets()
+        complete._prepare_objective_normalization()
+        complete._materialize_complete_unit_flow_universe()
+        phase1, phase1_vars, _ = complete._build_restricted_master(
+            _GurobiModelAdapter,
+            quicksum,
+            relax=True,
+            objective_mode="min_unplaced",
+        )
+        try:
+            phase1.optimize()
+            self.assertEqual("optimal", complete._gurobi_status_name(phase1))
+            phase1_unplaced = sum(
+                complete._gurobi_value(phase1, var)
+                for var in phase1_vars["unplaced"].values()
+            )
+        finally:
+            complete._free_gurobi_model(phase1)
+
+        phase2, _phase2_vars, _ = complete._build_restricted_master(
+            _GurobiModelAdapter,
+            quicksum,
+            relax=True,
+            objective_mode="full",
+            fixed_unplaced_total=phase1_unplaced,
+        )
+        try:
+            phase2.optimize()
+            self.assertEqual("optimal", complete._gurobi_status_name(phase2))
+            complete_objective = complete._gurobi_objective_value(phase2)
+        finally:
+            complete._free_gurobi_model(phase2)
+
+        diagnostics = priced_result.diagnostics
+        self.assertAlmostEqual(
+            phase1_unplaced,
+            diagnostics["pricing_phase1_lp_unplaced_boxes"],
+            places=8,
+        )
+        self.assertAlmostEqual(
+            complete_objective,
+            diagnostics["pricing_phase2_lp_objective"],
+            places=8,
+        )
+        self.assertEqual(
+            "two_phase_reduced_cost_convergence",
+            diagnostics["pricing_stop_reason"],
+        )
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_small_case_complete_integer_verification_reports_full_scope(self) -> None:
+        planner = ColumnGenerationPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(
+                complete_integer_verification_max_columns=100,
+                mip_gap=0.0,
+                verbose=False,
+            ),
+        )
+        diagnostics = planner.solve().diagnostics
+        self.assertTrue(diagnostics["complete_integer_verification"]["performed"])
+        self.assertEqual(
+            diagnostics["potential_unit_flow_count"],
+            diagnostics["complete_integer_verification"]["complete_column_count"],
+        )
+        self.assertEqual("complete_unit_flow_universe", diagnostics["master_bound_scope"])
+        self.assertEqual(
+            "complete_integer_master",
+            diagnostics["complete_model_certified_gap_source"],
+        )
+
     def test_written_output_is_validated_independently(self) -> None:
         group = make_group("20")
         bay = Bay(
@@ -250,6 +496,47 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             unplaced_path.touch()
             import_path.touch()
             with self.assertRaisesRegex(ValueError, "group identity mismatch"):
+                validate_output_files(problem, plan_path, unplaced_path, import_path)
+
+    def test_output_validation_rejects_guided_area_function_violation(self) -> None:
+        group = ExportGroup(**{**make_group("20").__dict__, "demand": 1})
+        bay = make_bay("B", "01", {"1": 1})
+        problem = ProblemData(
+            export_groups=[group],
+            bays={bay.bay_key: bay},
+            area_guidance_target={("V1", "OF", "B", "20"): 1},
+            area_functions={"B": {"IF"}},
+            target_voyages=["V1"],
+            export_voyages={"V1"},
+        )
+        with TemporaryDirectory() as directory:
+            plan_path = Path(directory) / "plan.csv"
+            unplaced_path = Path(directory) / "unplaced.csv"
+            import_path = Path(directory) / "import.csv"
+            with plan_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=[
+                    "group_id", "planned_boxes", "area_no", "bay_key", "bay_no",
+                    "row_no", "row_allocation", "flow", "size", "height",
+                    "voyage_id", "port",
+                ])
+                writer.writeheader()
+                writer.writerow({
+                    "group_id": group.group_id,
+                    "planned_boxes": 1,
+                    "area_no": "B",
+                    "bay_key": "B|01",
+                    "bay_no": "01",
+                    "row_no": "1",
+                    "row_allocation": "B|01:1:1",
+                    "flow": "OF",
+                    "size": "20",
+                    "height": "96",
+                    "voyage_id": "V1",
+                    "port": "P1",
+                })
+            unplaced_path.touch()
+            import_path.touch()
+            with self.assertRaisesRegex(ValueError, "area-function"):
                 validate_output_files(problem, plan_path, unplaced_path, import_path)
 
     def test_output_validation_rejects_row_footprint_tampering(self) -> None:

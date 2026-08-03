@@ -37,6 +37,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total-time-limit", type=float, default=240.0)
     parser.add_argument("--mip-time-limit", type=float, default=120.0)
     parser.add_argument("--mip-gap", type=float, default=0.01)
+    parser.add_argument("--pricing-min-batch", type=int, default=32)
+    parser.add_argument("--pricing-max-batch", type=int, default=128)
+    parser.add_argument("--pricing-fraction", type=float, default=0.25)
+    parser.add_argument(
+        "--solver-threads",
+        type=int,
+        default=0,
+        help="0 lets Gurobi choose; use a fixed positive value for experiments.",
+    )
+    parser.add_argument(
+        "--complete-integer-verification-max-columns",
+        type=int,
+        default=10_000,
+        help="Complete the unit-flow universe and verify the integer master when its size is at most this value; 0 disables it.",
+    )
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
 
@@ -76,6 +91,13 @@ def main() -> None:
         total_time_limit=args.total_time_limit,
         mip_time_limit=args.mip_time_limit,
         mip_gap=args.mip_gap,
+        min_columns_per_group_per_iteration=args.pricing_min_batch,
+        max_columns_per_group_per_iteration=args.pricing_max_batch,
+        adaptive_pricing_fraction=args.pricing_fraction,
+        solver_threads=args.solver_threads,
+        complete_integer_verification_max_columns=(
+            args.complete_integer_verification_max_columns
+        ),
         verbose=not args.quiet,
     )
     stage_start = perf_counter()
@@ -126,6 +148,16 @@ def main() -> None:
             "unplaced_boxes": result.diagnostics.get("unplaced_boxes"),
             "algorithm": result.diagnostics.get("algorithm"),
             "master_status": result.diagnostics.get("master_status"),
+            "master_bound_scope": result.diagnostics.get("master_bound_scope"),
+            "restricted_master_mip_gap": result.diagnostics.get(
+                "restricted_master_mip_gap"
+            ),
+            "complete_model_certified_gap": result.diagnostics.get(
+                "complete_model_certified_gap"
+            ),
+            "complete_model_certified_gap_source": result.diagnostics.get(
+                "complete_model_certified_gap_source"
+            ),
             "runtime_breakdown_seconds": runtime_breakdown,
         },
     )

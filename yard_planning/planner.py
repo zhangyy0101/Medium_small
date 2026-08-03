@@ -36,6 +36,14 @@ class _GurobiModelAdapter:
     def addVar(self, **kwargs):
         return self._model.addVar(**kwargs)
 
+    def addPricedVar(self, terms: Iterable[tuple[float, object]], **kwargs):
+        """Add one variable with coefficients in existing master rows."""
+        column = self._gp.Column()
+        for coefficient, constraint in terms:
+            if constraint is not None and abs(float(coefficient)) > 0.0:
+                column.addTerms(float(coefficient), constraint)
+        return self._model.addVar(column=column, **kwargs)
+
     def addCons(self, expression, name: str | None = None):
         return self._model.addConstr(expression, name=name or "")
 
@@ -136,11 +144,17 @@ class PlacementColumn:
 @dataclass
 class ColumnGenerationConfig:
     max_iterations: int = 30
-    max_columns_per_group_per_iteration: int = 32
+    min_columns_per_group_per_iteration: int = 32
+    max_columns_per_group_per_iteration: int = 128
+    adaptive_pricing_fraction: float = 0.25
     reduced_cost_tolerance: float = 1e-7
     total_time_limit: float = 240.0
     mip_time_limit: float = 120.0
     mip_gap: float = 0.01
+    lp_method: int = 1
+    solver_seed: int = 0
+    solver_threads: int = 0
+    complete_integer_verification_max_columns: int = 10_000
     verbose: bool = True
     # Stage-2 policy weights. Every component is first mapped to a natural
     # dimensionless scale, so these values express policy preference only.
@@ -183,9 +197,6 @@ class ColumnGenerationPlanner:
         self.attribute_rules = problem.attribute_rules
         self.bays_by_area: dict[str, list[str]] = defaultdict(list)
         self.area_edge_bays: dict[str, set[str]] = defaultdict(set)
-        self.area_size_height_cap: Counter[tuple[str, str, str]] = Counter()
-        self.area_group_cap: Counter[tuple[str, str]] = Counter()
-        self._area_group_cap_computed: set[tuple[str, str]] = set()
         self.quota_by_key: Counter[tuple[str, str, str, str]] = Counter()
         self.import_area_size_reference: Counter[tuple[str, str, str]] = Counter(
             {
@@ -213,6 +224,7 @@ class ColumnGenerationPlanner:
         )
         self.existing_group_bays: defaultdict[tuple[str, ...], set[str]] = defaultdict(set)
         self.existing_group_area_bays: defaultdict[tuple[str, ...], set[str]] = defaultdict(set)
+        self.reachable_anchor_group_ids: set[str] = set()
         self.import_reservation_candidates: dict[
             tuple[str, str], list[tuple[str, int]]
         ] = {}
@@ -226,8 +238,7 @@ class ColumnGenerationPlanner:
         self.voyage_flow_size_demand: Counter[tuple[str, str, str]] = Counter()
         self._columns: list[PlacementColumn] = []
         self._column_keys: set[tuple[str, str, int, tuple[tuple[str, str, int], ...]]] = set()
-        self._candidate_cache: dict[tuple[str, str], list[tuple[str, int, float]]] = {}
-        self._candidate_scope = "all"
+        self._candidate_cache: dict[str, list[tuple[str, int, float]]] = {}
         self._objective_scales: dict[str, float] = {}
         self._berth_distance_bounds: dict[str, tuple[float, float]] = {}
         self._initial_unplaced_start: Counter[str] = Counter()
@@ -248,9 +259,11 @@ class ColumnGenerationPlanner:
         self._master_row_attr_big_m: dict[tuple[str, str, str, str, str], int] = {}
         self._master_group_area_big_m: dict[tuple[tuple[str, ...], str], int] = {}
         self._master_group_row_big_m: dict[tuple[tuple[str, ...], str, str], int] = {}
+        self._validate_column_generation_config()
         self._prepare_yard_indexes()
         self._prepare_import_reservation_candidates()
         self._prepare_quota()
+        self._prepare_reachable_anchor_groups()
         self._validate_objective_weights()
         self._prepare_berth_distance_bounds()
         for group in self.groups:
@@ -259,6 +272,25 @@ class ColumnGenerationPlanner:
     @property
     def columns(self) -> list[PlacementColumn]:
         return self._columns
+
+    def _validate_column_generation_config(self) -> None:
+        minimum = int(self.config.min_columns_per_group_per_iteration)
+        maximum = int(self.config.max_columns_per_group_per_iteration)
+        fraction = float(self.config.adaptive_pricing_fraction)
+        if minimum <= 0 or maximum < minimum:
+            raise ValueError(
+                "adaptive pricing batch bounds must satisfy "
+                f"0 < minimum <= maximum, got minimum={minimum}, maximum={maximum}"
+            )
+        if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+            raise ValueError(
+                "adaptive_pricing_fraction must be in (0, 1], "
+                f"got {fraction}"
+            )
+        if int(self.config.max_iterations) <= 0:
+            raise ValueError("max_iterations must be positive")
+        if int(self.config.complete_integer_verification_max_columns) < 0:
+            raise ValueError("complete_integer_verification_max_columns cannot be negative")
 
     def _build_planning_groups(self) -> list[ExportGroup]:
         """Return declared, not-yet-arrived export groups only."""
@@ -343,6 +375,23 @@ class ColumnGenerationPlanner:
             "initial_column_count": 0,
             "potential_unit_flow_count": self._potential_unit_flow_count,
             "exact_unit_flow_pricing": True,
+            "pricing_configuration": {
+                "persistent_restricted_master": True,
+                "lp_method": int(self.config.lp_method),
+                "solver_seed": int(self.config.solver_seed),
+                "solver_threads": int(self.config.solver_threads),
+                "adaptive_batch": {
+                    "minimum_per_group": int(
+                        self.config.min_columns_per_group_per_iteration
+                    ),
+                    "maximum_per_group": int(
+                        self.config.max_columns_per_group_per_iteration
+                    ),
+                    "negative_candidate_fraction": float(
+                        self.config.adaptive_pricing_fraction
+                    ),
+                },
+            },
             "restricted_master_contains_generated_columns_only": True,
             "complete_unit_flow_universe_materialized": False,
             **seed_stats,
@@ -359,6 +408,15 @@ class ColumnGenerationPlanner:
                 "area_key_count": len(self.existing_group_area_load),
                 "bay_key_count": len(self.existing_group_bay_load),
                 "box_count": int(sum(self.existing_group_bay_load.values())),
+                "reachable_group_count": len(self.reachable_anchor_group_ids),
+                "reachable_group_demand": self._anchored_group_demand(),
+                "unreachable_anchor_groups": sorted(
+                    group.group_id
+                    for group in self.groups
+                    if self.existing_group_bays.get(self._existing_anchor_key(group))
+                    and group.group_id not in self.reachable_anchor_group_ids
+                ),
+                "unreachable_anchor_policy": "neutral_excluded_from_objective_scale",
             },
             "objective_coefficients": {
                 "phase2_unplaced_coefficient": 0.0,
@@ -812,50 +870,61 @@ class ColumnGenerationPlanner:
         ) -> tuple[float, Counter[str]]:
             last_objective = 0.0
             last_unplaced: Counter[str] = Counter()
-            for iteration in range(max(1, int(self.config.max_iterations))):
-                model, variables, constraints = self._build_restricted_master(
-                    Model,
-                    quicksum,
-                    relax=True,
-                    objective_mode=objective_mode,
-                    fixed_unplaced_total=fixed_unplaced_total,
-                )
-                self._set_gurobi_param(model, "TimeLimit", float(self.config.mip_time_limit))
-                model.optimize()
-                status = self._gurobi_status_name(model)
-                if status != "optimal":
-                    self._free_gurobi_model(model)
-                    raise RuntimeError(
-                        f"Strict {phase_name} pricing LP is not optimal: {status}"
+            model, variables, constraints = self._build_restricted_master(
+                Model,
+                quicksum,
+                relax=True,
+                objective_mode=objective_mode,
+                fixed_unplaced_total=fixed_unplaced_total,
+            )
+            self._set_gurobi_param(model, "TimeLimit", float(self.config.mip_time_limit))
+            try:
+                for iteration in range(int(self.config.max_iterations)):
+                    model.optimize()
+                    status = self._gurobi_status_name(model)
+                    if status != "optimal":
+                        raise RuntimeError(
+                            f"Strict {phase_name} pricing LP is not optimal: {status}"
+                        )
+                    last_objective = self._gurobi_objective_value(model)
+                    last_unplaced = Counter(
+                        {
+                            group_id: self._gurobi_value(model, var)
+                            for group_id, var in variables["unplaced"].items()
+                            if self._gurobi_value(model, var) > 1e-8
+                        }
                     )
-                last_objective = self._gurobi_objective_value(model)
-                last_unplaced = Counter(
-                    {
-                        group_id: self._gurobi_value(model, var)
-                        for group_id, var in variables["unplaced"].items()
-                        if self._gurobi_value(model, var) > 1e-8
-                    }
-                )
-                pricing = self._price_unit_flow_columns(
-                    model,
-                    constraints,
-                    phase_name,
-                    objective_mode,
-                )
-                stats["pricing_iterations"].append(
-                    {
-                        "phase": phase_name,
-                        "iteration": iteration,
-                        "lp_objective": last_objective,
-                        "lp_unplaced_boxes": float(
-                            sum(self._gurobi_value(model, var) for var in variables["unplaced"].values())
-                        ),
-                        **pricing,
-                    }
-                )
+                    pricing, new_indices = self._price_unit_flow_columns(
+                        model,
+                        constraints,
+                        phase_name,
+                        objective_mode,
+                    )
+                    stats["pricing_iterations"].append(
+                        {
+                            "phase": phase_name,
+                            "iteration": iteration,
+                            "lp_objective": last_objective,
+                            "lp_unplaced_boxes": float(
+                                sum(
+                                    self._gurobi_value(model, var)
+                                    for var in variables["unplaced"].values()
+                                )
+                            ),
+                            **pricing,
+                        }
+                    )
+                    if not new_indices:
+                        return last_objective, last_unplaced
+                    self._add_columns_to_restricted_master(
+                        model,
+                        variables,
+                        constraints,
+                        new_indices,
+                        objective_mode,
+                    )
+            finally:
                 self._free_gurobi_model(model)
-                if pricing["new_columns"] == 0:
-                    return last_objective, last_unplaced
             raise RuntimeError(
                 f"Strict {phase_name} pricing exceeded max_iterations="
                 f"{self.config.max_iterations}"
@@ -884,31 +953,118 @@ class ColumnGenerationPlanner:
         )
 
         integer_start = perf_counter()
-        selected, unplaced, integer_stats = self._solve_lexicographic_integer_master(
+        pricing_generated_column_count = len(self._columns)
+        selected, unplaced, restricted_integer_stats = self._solve_lexicographic_integer_master(
             Counter(),
             Counter(self._initial_unplaced_start),
             float(self.config.total_time_limit) if self.config.total_time_limit > 0 else None,
         )
+        if not restricted_integer_stats.get("lexicographic_integer_master_used"):
+            raise RuntimeError(
+                "The final two-stage integer master did not produce a stage-2 solution"
+            )
+
+        restricted_integer_summary = {
+            "column_count": pricing_generated_column_count,
+            "objective": restricted_integer_stats.get("lexicographic_stage2_objective"),
+            "bound": restricted_integer_stats.get("lexicographic_stage2_bound"),
+            "mip_gap": restricted_integer_stats.get("lexicographic_stage2_gap"),
+            "stage1_unplaced_boxes": restricted_integer_stats.get(
+                "lexicographic_stage1_unplaced_boxes"
+            ),
+        }
+        verification_limit = int(self.config.complete_integer_verification_max_columns)
+        verification_enabled = (
+            verification_limit > 0
+            and self._potential_unit_flow_count <= verification_limit
+        )
+        verification_stats: dict[str, object] = {
+            "enabled": verification_enabled,
+            "threshold": verification_limit,
+            "potential_column_count": self._potential_unit_flow_count,
+            "pricing_generated_column_count": pricing_generated_column_count,
+            "performed": False,
+        }
+        integer_stats = restricted_integer_stats
+        master_bound_scope = "generated_columns_at_lp_reduced_cost_convergence"
+        if verification_enabled:
+            verification_start = perf_counter()
+            added = self._materialize_complete_unit_flow_universe()
+            if added > 0:
+                selected, unplaced, integer_stats = self._solve_lexicographic_integer_master(
+                    selected,
+                    unplaced,
+                    float(self.config.total_time_limit)
+                    if self.config.total_time_limit > 0
+                    else None,
+                )
+                if not integer_stats.get("lexicographic_integer_master_used"):
+                    raise RuntimeError(
+                        "Complete-column integer verification did not produce a stage-2 solution"
+                    )
+            master_bound_scope = "complete_unit_flow_universe"
+            verification_stats.update(
+                {
+                    "performed": True,
+                    "added_columns": added,
+                    "complete_column_count": len(self._columns),
+                    "objective": integer_stats.get("lexicographic_stage2_objective"),
+                    "bound": integer_stats.get("lexicographic_stage2_bound"),
+                    "mip_gap": integer_stats.get("lexicographic_stage2_gap"),
+                    "elapsed_seconds": round(perf_counter() - verification_start, 3),
+                }
+            )
+
         stats.update(integer_stats)
+        final_objective = self._selected_solution_energy(selected, unplaced)
+        final_integer_unplaced = int(sum(unplaced.values()))
+        lp_bound_gap: float | None = None
+        lp_bound_gap_reason = "available"
+        if abs(float(phase1_unplaced_total) - final_integer_unplaced) <= 1e-7:
+            denominator = max(abs(float(final_objective)), 1e-12)
+            lp_bound_gap = max(
+                0.0,
+                (float(final_objective) - float(phase2_objective)) / denominator,
+            )
+        else:
+            lp_bound_gap_reason = (
+                "phase2 LP and final integer master fix different unplaced totals"
+            )
+        if verification_stats["performed"]:
+            certified_gap = integer_stats.get("lexicographic_stage2_gap")
+            certified_gap_source = "complete_integer_master"
+        else:
+            certified_gap = lp_bound_gap
+            certified_gap_source = "complete_column_generation_lp_lower_bound"
         stats.update(
             {
-                "master_algorithm": "two_phase_dual_priced_column_generation_then_integer_rmp",
-                "master_bound_scope": "generated_columns_at_lp_reduced_cost_convergence",
+                "master_algorithm": (
+                    "two_phase_dual_priced_column_generation_then_complete_integer_verification"
+                    if verification_stats["performed"]
+                    else "two_phase_dual_priced_column_generation_then_integer_rmp"
+                ),
+                "master_bound_scope": master_bound_scope,
                 "master_status": (
                     "lexicographic_integer_master"
                     if integer_stats.get("lexicographic_integer_master_used")
                     else "integer_master_incomplete"
                 ),
                 "master_solve_seconds": round(perf_counter() - integer_start, 3),
-                "master_objective": self._selected_solution_energy(selected, unplaced),
+                "master_objective": final_objective,
                 "master_mip_gap": integer_stats.get("lexicographic_stage2_gap"),
+                "restricted_master_mip_gap": restricted_integer_stats.get(
+                    "lexicographic_stage2_gap"
+                ),
+                "restricted_integer_master": restricted_integer_summary,
+                "complete_integer_verification": verification_stats,
+                "complete_lp_lower_bound": phase2_objective,
+                "complete_model_lp_bound_gap": lp_bound_gap,
+                "complete_model_lp_bound_gap_reason": lp_bound_gap_reason,
+                "complete_model_certified_gap": certified_gap,
+                "complete_model_certified_gap_source": certified_gap_source,
                 "restricted_master_lp_unplaced_boxes": float(sum(phase2_unplaced.values())),
             }
         )
-        if not integer_stats.get("lexicographic_integer_master_used"):
-            raise RuntimeError(
-                "The final two-stage integer master did not produce a stage-2 solution"
-            )
         return selected, unplaced, stats
 
     def _price_unit_flow_columns(
@@ -917,7 +1073,7 @@ class ColumnGenerationPlanner:
         constraints: dict,
         phase_name: str,
         objective_mode: str,
-    ) -> dict:
+    ) -> tuple[dict, list[int]]:
         """Solve every group pricing problem from restricted-master duals.
 
         A feasible column is a single group/bay/row unit flow, so each pricing
@@ -926,12 +1082,13 @@ class ColumnGenerationPlanner:
         reduced cost is negative.
         """
         tolerance = max(1e-12, float(self.config.reduced_cost_tolerance))
-        limit = max(1, int(self.config.max_columns_per_group_per_iteration))
         evaluated = 0
         negative = 0
         entering: list[tuple[float, str, PlacementColumn]] = []
         minimum_reduced_cost = math.inf
         minimum_by_group: dict[str, float] = {}
+        adaptive_batch_by_group: dict[str, int] = {}
+        negative_by_group: dict[str, int] = {}
 
         for group in self.groups:
             group_candidates: list[tuple[float, str, PlacementColumn]] = []
@@ -956,15 +1113,22 @@ class ColumnGenerationPlanner:
             if math.isfinite(group_minimum):
                 minimum_by_group[group.group_id] = group_minimum
             group_candidates.sort(key=lambda item: (item[0], item[1]))
-            entering.extend(group_candidates[:limit])
+            batch_size = self._adaptive_pricing_batch_size(len(group_candidates))
+            negative_by_group[group.group_id] = len(group_candidates)
+            adaptive_batch_by_group[group.group_id] = batch_size
+            entering.extend(group_candidates[:batch_size])
 
         entering.sort(key=lambda item: (item[0], item[1]))
+        new_indices: list[int] = []
         for _reduced_cost, _tie_key, candidate in entering:
-            self._append_generated_column(candidate)
+            new_indices.append(self._append_generated_column(candidate))
         return {
             "new_columns": len(entering),
             "pricing_mode": "exact_group_reduced_cost_enumeration",
             "exact_pricing": True,
+            "adaptive_batch": True,
+            "negative_candidates_by_group": negative_by_group,
+            "selected_batch_by_group": adaptive_batch_by_group,
             "pricing_candidates_evaluated": evaluated,
             "negative_reduced_cost_candidates": negative,
             "generated_column_count": len(self._columns),
@@ -975,7 +1139,111 @@ class ColumnGenerationPlanner:
                 key: value for key, value in sorted(minimum_by_group.items())
             },
             "phase": phase_name,
-        }
+        }, new_indices
+
+    def _adaptive_pricing_batch_size(self, negative_count: int) -> int:
+        count = max(0, int(negative_count))
+        if count == 0:
+            return 0
+        proportional = int(math.ceil(count * float(self.config.adaptive_pricing_fraction)))
+        target = max(int(self.config.min_columns_per_group_per_iteration), proportional)
+        return min(count, int(self.config.max_columns_per_group_per_iteration), target)
+
+    def _add_columns_to_restricted_master(
+        self,
+        model,
+        variables: dict,
+        constraints: dict,
+        column_indices: Iterable[int],
+        objective_mode: str,
+    ) -> None:
+        """Insert priced variables into a persistent LP master and keep its basis."""
+
+        def term(terms: list[tuple[float, object]], section: str, key: object, value: float) -> None:
+            constraint = constraints.get(section, {}).get(key)
+            if constraint is not None and abs(float(value)) > 0.0:
+                terms.append((float(value), constraint))
+
+        fixed = constraints.get("fixed_use_objective_limit", {})
+        for idx in column_indices:
+            col = self._columns[int(idx)]
+            quantity = float(col.quantity)
+            terms: list[tuple[float, object]] = []
+            term(terms, "group_cover", col.group_id, quantity)
+            footprint = self._placement_footprint_keys(col.bay_key, col.size)
+            stack_value = self._row_mix_key_for_column(col)
+            for footprint_key in footprint:
+                term(terms, "bay_capacity_limit", footprint_key, quantity)
+                term(
+                    terms,
+                    "bay_port_stack_link",
+                    (footprint_key, stack_value, col.size),
+                    quantity,
+                )
+                for attr in self._bay_no_mix_attrs_for_column(col):
+                    scope = self._attr_voyage_scope(attr, col.voyage_id)
+                    term(
+                        terms,
+                        "bay_attr_link",
+                        (
+                            footprint_key,
+                            attr,
+                            scope,
+                            self._column_attr_value(col, attr),
+                        ),
+                        1.0,
+                    )
+            term(terms, "bay_size_limit", (col.bay_key, col.size), quantity)
+            for footprint_key, row_no, row_quantity in col.row_allocation:
+                term(
+                    terms,
+                    "row_capacity_limit",
+                    (footprint_key, row_no),
+                    float(row_quantity),
+                )
+                term(
+                    terms,
+                    "row_size_limit",
+                    (footprint_key, row_no, col.size),
+                    float(row_quantity),
+                )
+                for attr in self._row_no_mix_attrs_for_column(col):
+                    scope = self._attr_voyage_scope(attr, col.voyage_id)
+                    term(
+                        terms,
+                        "row_attr_link",
+                        (
+                            footprint_key,
+                            row_no,
+                            attr,
+                            scope,
+                            self._column_attr_value(col, attr),
+                        ),
+                        1.0,
+                    )
+            term(terms, "area_guidance_balance", col.quota_key, quantity)
+            anchor_row = next(
+                row_no
+                for bay_key, row_no, _qty in col.row_allocation
+                if bay_key == col.bay_key
+            )
+            for key, coefficient in (
+                (("group_area", col.group_key, col.area_no), quantity),
+                (("group_row", col.group_key, col.bay_key, anchor_row), 1.0),
+                (("group_used_upper",) + col.group_key, 1.0),
+                (("group_used_lower",) + col.group_key, -1.0),
+            ):
+                constraint = fixed.get(key)
+                if constraint is not None:
+                    terms.append((coefficient, constraint))
+            variables["column"][idx] = model.addPricedVar(
+                terms,
+                lb=0.0,
+                ub=float(self.group_demand[col.group_id]),
+                vtype="C",
+                obj=0.0 if objective_mode == "min_unplaced" else col.intrinsic_cost,
+                name=f"col_{idx}",
+            )
 
     def _solve_lexicographic_integer_master(
         self,
@@ -1194,6 +1462,11 @@ class ColumnGenerationPlanner:
     ):
         model = Model("yard_export_row_column_generation_gurobi")
         self._configure_gurobi_output(model)
+        self._set_gurobi_param(model, "Seed", int(self.config.solver_seed))
+        if int(self.config.solver_threads) > 0:
+            self._set_gurobi_param(model, "Threads", int(self.config.solver_threads))
+        if relax:
+            self._set_gurobi_param(model, "Method", int(self.config.lp_method))
         try:
             model.setMinimize()
         except Exception:
@@ -1372,7 +1645,6 @@ class ColumnGenerationPlanner:
         # Big-plan allocations are soft inheritance targets. Hard upper bounds
         # are intentionally omitted so detailed declared boxes can recover from
         # stale or physically incompatible upstream allocations.
-        quota_limit = {}
         lexicographic_unplaced_limit = None
         if fixed_unplaced_total is not None:
             lexicographic_unplaced_limit = model.addCons(
@@ -1422,7 +1694,6 @@ class ColumnGenerationPlanner:
             "bay_port_stack_link": bay_port_stack_link,
             "bay_port_stack_limit": bay_port_stack_limit,
             "bay_stack_total_limit": bay_stack_total_limit,
-            "quota_limit": quota_limit,
             "lexicographic_unplaced_limit": lexicographic_unplaced_limit,
             **bay_compatibility_constraints,
             **row_compatibility_constraints,
@@ -1714,6 +1985,49 @@ class ColumnGenerationPlanner:
                     ),
                 )
 
+    def _feasible_bay_capacity_without_demand(self, group: ExportGroup, bay_key: str) -> int:
+        footprint = self._placement_footprint_keys(bay_key, group.size)
+        if not footprint:
+            return 0
+        bay = self.bays[bay_key]
+        return max(
+            0,
+            min(
+                int(bay.cap_by_size.get(group.size, 0)),
+                *(int(self.bays[key].physical_capacity) for key in footprint),
+                *(
+                    self._stack_count_for_group(key, group.size, group)
+                    * self._stack_unit_capacity_for_group(key, group.size, group)
+                    for key in footprint
+                ),
+            ),
+        )
+
+    def _unit_flow_location_capacity(
+        self,
+        group: ExportGroup,
+        column: PlacementColumn,
+    ) -> int:
+        row_capacities: list[int] = []
+        for footprint_key, row_no, _quantity in column.row_allocation:
+            row_cap = dict(
+                self._row_capacity_items_for_group(
+                    footprint_key,
+                    group.size,
+                    group,
+                )
+            ).get(str(row_no), 0)
+            row_capacities.append(int(row_cap))
+        if not row_capacities:
+            return 0
+        return max(
+            0,
+            min(
+                self._feasible_bay_capacity_without_demand(group, column.bay_key),
+                *row_capacities,
+            ),
+        )
+
     @staticmethod
     def _column_identity(
         column: PlacementColumn,
@@ -1734,6 +2048,22 @@ class ColumnGenerationPlanner:
         self._columns.append(column)
         self._column_keys.add(key)
         return index
+
+    def _materialize_complete_unit_flow_universe(self) -> int:
+        """Append every missing feasible unit-flow column for small-case verification."""
+        added = 0
+        for group in self.groups:
+            for candidate in self._iter_feasible_unit_flow_columns(group):
+                if self._column_identity(candidate) in self._column_keys:
+                    continue
+                self._append_generated_column(candidate)
+                added += 1
+        if len(self._columns) != self._potential_unit_flow_count:
+            raise RuntimeError(
+                "complete unit-flow materialization count mismatch: "
+                f"materialized={len(self._columns)}, expected={self._potential_unit_flow_count}"
+            )
+        return added
 
     def _prepare_master_index_sets(self) -> None:
         """Create the fixed row index set shared by every restricted master."""
@@ -1758,6 +2088,13 @@ class ColumnGenerationPlanner:
         row_attr_groups: defaultdict[tuple[str, str, str, str, str], set[str]] = defaultdict(set)
         group_area_groups: defaultdict[tuple[tuple[str, ...], str], set[str]] = defaultdict(set)
         group_row_groups: defaultdict[tuple[tuple[str, ...], str, str], set[str]] = defaultdict(set)
+        group_area_location_caps: defaultdict[
+            tuple[tuple[str, ...], str], dict[tuple[str, str], int]
+        ] = defaultdict(dict)
+        group_area_bay_caps: defaultdict[
+            tuple[tuple[str, ...], str], dict[str, int]
+        ] = defaultdict(dict)
+        group_row_location_caps: dict[tuple[tuple[str, ...], str, str], int] = {}
 
         for group in self.groups:
             group_key = self._operational_group_key(group)
@@ -1813,6 +2150,25 @@ class ColumnGenerationPlanner:
                 group_row_key = (group_key, column.bay_key, anchor_row)
                 self._master_group_row_keys.add(group_row_key)
                 group_row_groups[group_row_key].add(group.group_id)
+                location_capacity = self._unit_flow_location_capacity(group, column)
+                if location_capacity <= 0:
+                    raise ValueError(
+                        "feasible unit-flow column has no positive location capacity: "
+                        f"group={group.group_id}, bay={column.bay_key}, row={anchor_row}"
+                    )
+                location_key = (column.bay_key, anchor_row)
+                group_area_location_caps[group_area_key][location_key] = max(
+                    group_area_location_caps[group_area_key].get(location_key, 0),
+                    location_capacity,
+                )
+                group_area_bay_caps[group_area_key][column.bay_key] = max(
+                    group_area_bay_caps[group_area_key].get(column.bay_key, 0),
+                    self._feasible_bay_capacity_without_demand(group, column.bay_key),
+                )
+                group_row_location_caps[group_row_key] = max(
+                    group_row_location_caps.get(group_row_key, 0),
+                    location_capacity,
+                )
 
         for key, group_ids in bay_attr_groups.items():
             bay_key, _attr, _scope, _value = key
@@ -1835,28 +2191,23 @@ class ColumnGenerationPlanner:
                 row_capacity,
             )
         for key, group_ids in group_area_groups.items():
-            _group_key, area_no = key
             relevant_demand = sum(self.group_demand[group_id] for group_id in group_ids)
-            area_capacity = sum(
-                int(self.bays[bay_key].physical_capacity)
-                for bay_key in self.bays_by_area.get(area_no, [])
+            row_caps_by_bay: defaultdict[str, int] = defaultdict(int)
+            for (bay_key, _row_no), capacity in group_area_location_caps[key].items():
+                row_caps_by_bay[bay_key] += int(capacity)
+            feasible_area_capacity = sum(
+                min(int(bay_capacity), int(row_caps_by_bay.get(bay_key, 0)))
+                for bay_key, bay_capacity in group_area_bay_caps[key].items()
             )
             self._master_group_area_big_m[key] = self._tight_link_bound(
                 relevant_demand,
-                area_capacity,
+                feasible_area_capacity,
             )
         for key, group_ids in group_row_groups.items():
-            _group_key, bay_key, row_no = key
             relevant_demand = sum(self.group_demand[group_id] for group_id in group_ids)
-            row_capacity = int(
-                self.bays[bay_key].row_physical_capacity.get(
-                    row_no,
-                    self.bays[bay_key].physical_capacity,
-                )
-            )
             self._master_group_row_big_m[key] = self._tight_link_bound(
                 relevant_demand,
-                row_capacity,
+                group_row_location_caps[key],
             )
 
         for key, qty in self.quota_by_key.items():
@@ -1898,7 +2249,10 @@ class ColumnGenerationPlanner:
     def _big_m_diagnostics(self) -> dict[str, object]:
         return {
             "previous_global_bound": int(sum(group.demand for group in self.groups)),
-            "method": "min(relevant_group_demand, location_capacity)",
+            "method": (
+                "min(relevant_group_demand, feasible_group_specific_capacity); "
+                "group-area bounds aggregate feasible bay-row capacities"
+            ),
             "bay_attribute_links": self._bound_summary(self._master_bay_attr_big_m.values()),
             "row_attribute_links": self._bound_summary(self._master_row_attr_big_m.values()),
             "group_area_links": self._bound_summary(self._master_group_area_big_m.values()),
@@ -2499,15 +2853,12 @@ class ColumnGenerationPlanner:
         state["used_voyage_area"].add((col.voyage_id, col.area_no))
         state["big_plan_quota_used"][col.quota_key] += col.quantity
 
-    def _candidate_bays_for_group(self, group: ExportGroup, scope: str | None = None) -> list[tuple[str, int, float]]:
-        scope = scope or self._candidate_scope
-
-        cache_key = (scope, group.group_id)
-        cached = self._candidate_cache.get(cache_key)
+    def _candidate_bays_for_group(self, group: ExportGroup) -> list[tuple[str, int, float]]:
+        cached = self._candidate_cache.get(group.group_id)
         if cached is not None:
             return cached
         out: list[tuple[str, int, float]] = []
-        for area_no in self._candidate_areas_for_group(group, scope=scope):
+        for area_no in self._candidate_areas_for_group(group):
             for bay_key in self.bays_by_area.get(area_no, []):
                 max_qty = self._max_quantity_in_bay(group, bay_key)
                 if max_qty <= 0:
@@ -2524,18 +2875,15 @@ class ColumnGenerationPlanner:
                 self.bays[item[0]].bay_order,
             )
         )
-        self._candidate_cache[cache_key] = out
+        self._candidate_cache[group.group_id] = out
         return out
 
-    def _candidate_areas_for_group(self, group: ExportGroup, scope: str | None = None) -> list[str]:
-        scope = scope or self._candidate_scope
-
+    def _candidate_areas_for_group(self, group: ExportGroup) -> list[str]:
         return sorted(
             [
                 area_no
                 for area_no in self.bays_by_area
-                if self._candidate_area_base_scope(group, area_no, scope)
-                and self._area_supports_group_flow(group, area_no)
+                if self._area_supports_group_flow(group, area_no)
             ],
             key=lambda area_no: (
                 0 if self._is_big_plan_area_for_group(group, area_no) else 1,
@@ -2543,12 +2891,7 @@ class ColumnGenerationPlanner:
             ),
         )
 
-    def _candidate_area_base_scope(self, group: ExportGroup, area_no: str, scope: str) -> bool:
-        return True
-
     def _area_supports_group_flow(self, group: ExportGroup, area_no: str) -> bool:
-        if self._is_big_plan_area_for_group(group, area_no):
-            return True
         functions = self.problem.area_functions.get(area_no, set())
         return _area_flow(group.status) in functions
 
@@ -2617,22 +2960,6 @@ class ColumnGenerationPlanner:
                         or self.bays[bay_key].large_bay_partner_key in boundary_keys
                     )
                 }
-        heights_by_size: defaultdict[str, set[str]] = defaultdict(set)
-        for group in self.groups:
-            heights_by_size[group.size].add(group.height)
-        for bay_key, bay in self.bays.items():
-            is_edge = bay_key in self.area_edge_bays.get(bay.area_no, set())
-            for size, heights in heights_by_size.items():
-                if size == "45" and not is_edge:
-                    continue
-                cap = bay.cap_by_size.get(size, 0)
-                if cap <= 0:
-                    continue
-                footprint = self._placement_footprint_keys(bay_key, size)
-                if not footprint:
-                    continue
-                for height in heights:
-                    self.area_size_height_cap[(bay.area_no, size, height)] += cap
 
     def _prepare_import_reservation_candidates(self) -> None:
         """Build anonymous import reserve options using only flow and size."""
@@ -2668,6 +2995,34 @@ class ColumnGenerationPlanner:
         for (voyage_id, flow, area_no, big_size), qty in self.problem.area_guidance_target.items():
             if qty > 0:
                 self.quota_by_key[(voyage_id, flow, area_no, big_size)] += int(qty)
+
+    def _prepare_reachable_anchor_groups(self) -> None:
+        """Keep proximity anchors only when their area remains feasible.
+
+        An incumbent anchor in a closed, function-incompatible, or completely
+        full area cannot guide the current decision. Charging every candidate
+        the same maximum distance would add a constant to the objective without
+        changing the allocation.
+        """
+        self.reachable_anchor_group_ids.clear()
+        for group in self.groups:
+            anchor_key = self._existing_anchor_key(group)
+            anchor_areas = {
+                str(key[-2])
+                for key, quantity in self.existing_group_bay_load.items()
+                if int(quantity) > 0 and tuple(key[:-2]) == anchor_key
+            }
+            if not anchor_areas:
+                continue
+            for area_no in anchor_areas:
+                if not self._area_supports_group_flow(group, area_no):
+                    continue
+                if any(
+                    self._max_quantity_in_bay(group, bay_key) > 0
+                    for bay_key in self.bays_by_area.get(area_no, ())
+                ):
+                    self.reachable_anchor_group_ids.add(group.group_id)
+                    break
 
     def _area_weights(self, group: ExportGroup) -> Counter[str]:
         weights: Counter[str] = Counter()
@@ -2719,6 +3074,8 @@ class ColumnGenerationPlanner:
         area without an anchor costs one. Groups without any incumbent anchor
         are neutral and therefore contribute zero.
         """
+        if group.group_id not in self.reachable_anchor_group_ids:
+            return 0.0
         bay = self.bays.get(bay_key)
         if bay is None:
             return 0.0
@@ -2790,7 +3147,7 @@ class ColumnGenerationPlanner:
         return sum(
             int(group.demand)
             for group in self.groups
-            if self.existing_group_bays.get(self._existing_anchor_key(group))
+            if group.group_id in self.reachable_anchor_group_ids
         )
 
     def _guided_demand(self) -> int:

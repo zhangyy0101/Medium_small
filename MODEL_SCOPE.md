@@ -74,6 +74,11 @@ All active grouping rules resolve to the single operational group above.
   This rule does not reserve every edge position for 45-ft containers and does
   not impose area-wide mutual exclusion between 45-ft and non-45-ft demand.
 
+Area-function compatibility is always hard. An area appearing in the upstream
+big plan is not exempt from its flow-function requirement; an incompatible
+upstream allocation contributes a soft guidance deviation but never creates a
+detailed-placement candidate.
+
 ## Retained objectives
 
 Each column is a feasible operational-group/bay/row unit flow. Its master
@@ -84,10 +89,15 @@ export placement column. In every lexicographic phase, the restricted-master
 LP is solved first and its row duals define an independent finite pricing
 problem for each export group. Feasible group/bay/row unit flows are generated
 transiently; only flows with reduced cost below the numerical tolerance enter
-the master. The complete compatible column universe is neither stored nor
-solved as one auxiliary model. Pricing stops only when every group pricing
-problem has no negative-reduced-cost flow. A time limit cannot silently
-terminate this certificate phase.
+the master. Each phase keeps one persistent Gurobi master and inserts priced
+variables with their master-row coefficients, preserving the simplex basis.
+Dual-simplex pricing is deterministic for a fixed solver configuration. The
+number of entering columns is adaptive by group: it is a bounded fraction of
+the currently negative candidates rather than a fixed batch. The complete
+compatible column universe is neither stored nor solved as one auxiliary model
+during pricing. Pricing stops only when every group pricing problem has no
+negative-reduced-cost flow. A time limit cannot silently terminate this
+certificate phase.
 
 The final integer restricted master over the generated columns is solved
 in two lexicographic stages. Stage 1
@@ -107,7 +117,10 @@ instance scale. Area and row dispersion count only activations beyond the first
 one used by each placed operational group, divided respectively by the maximum
 number of additional feasible areas and rows. Incumbent proximity is a
 quantity-weighted bay distance in `[0,1]`, divided by the demand of groups that
-have incumbent anchors. Big-plan deviation is divided by twice the sum of
+have a reachable incumbent anchor area. An anchor is neutral and excluded from
+the normalization scale when no function-compatible bay in its area has a
+feasible residual position; this removes decision-independent constant costs.
+Big-plan deviation is divided by twice the sum of
 guided export demand and import reservation demand, because moving one box
 creates one shortage and one excess in the L1 vector. For each voyage, berth
 distance is mapped from its closest and farthest compatible areas to `[0,1]`
@@ -129,16 +142,21 @@ The stage-1 optimum for total unplaced demand is imposed as an equality in
 every stage-2 restricted master. Consequently, stage-2 unplaced variables have
 zero objective coefficients; no artificial million-scale penalty is mixed
 with the normalized operational objective. Activation links use
-constraint-specific bounds rather than one global Big-M. Each bound is the
-minimum of the demand associated with that attribute/group state and the
-relevant area, bay, or row capacity.
+constraint-specific bounds rather than one global Big-M. In particular, an
+operational-group/area bound is the smaller of its relevant demand and its
+feasible bay-row capacity in that area, with each bay additionally capped by
+its size, footprint, and stack capacity. It does not use unrelated total area
+capacity.
 
 The no-negative-reduced-cost certificate applies to the LP relaxation over the
-complete compatible unit-flow universe. The final two-stage MIP uses the
-columns generated at LP convergence, so its reported MIP gap applies to that
-integer restricted master. This is standard column generation followed by
-integer recovery; it is not branch-and-price and does not claim a global
-integer optimality certificate for the complete column universe.
+complete compatible unit-flow universe. The code separately reports the
+restricted-master MIP gap and the valid gap between the integer incumbent and
+the complete column-generation LP lower bound. For small cases below a
+configured potential-column threshold, a verification layer appends every
+missing column, warm-starts a complete two-stage integer master, and reports
+its complete-universe MIP bound and gap. Larger cases retain standard column
+generation followed by integer recovery. This is not branch-and-price;
+without complete-column verification, no full integer optimality claim is made.
 
 The import variables are anonymous capacity reservations indexed only by flow,
 size, and bay. Their totals equal the corresponding import `new_qty`. Their

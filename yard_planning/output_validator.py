@@ -85,22 +85,6 @@ def _row_no_mix_attributes(problem: ProblemData, voyage_id: str) -> tuple[str, .
     return tuple(ordered)
 
 
-def _is_guided_export_area(problem: ProblemData, group: ExportGroup, area_no: str) -> bool:
-    big_size = "40" if group.size in {"40", "45"} else group.size
-    return any(
-        str(voyage) == str(group.voyage_id)
-        and str(flow) == str(group.status)
-        and str(area) == area_no
-        and str(size) == big_size
-        and float(quantity) > 0
-        for (voyage, flow, area, size), quantity in getattr(
-            problem,
-            "area_guidance_target",
-            {},
-        ).items()
-    )
-
-
 def _existing_bay_attribute_values(bay, attribute: str, voyage_id: str) -> set[str]:
     upper = str(attribute).strip().upper()
     if upper in SIZE_ATTRIBUTES:
@@ -254,13 +238,12 @@ def validate_output_files(
                 f"bay coordinates mismatch: key={bay_key}, output={area}|{bay_no}, "
                 f"input={bay.area_no}|{bay.bay_no}"
             )
-        if not _is_guided_export_area(problem, group, area):
-            required_flow = "OF" if group.status == "OF" else str(group.status)
-            if required_flow not in problem.area_functions.get(area, set()):
-                errors.append(
-                    f"export area-function violation: group={group_id}, "
-                    f"flow={required_flow}, area={area}"
-                )
+        required_flow = "OF" if group.status == "OF" else str(group.status)
+        if required_flow not in problem.area_functions.get(area, set()):
+            errors.append(
+                f"export area-function violation: group={group_id}, "
+                f"flow={required_flow}, area={area}"
+            )
         footprint = [bay_key]
         if size in {"40", "45"}:
             if (
