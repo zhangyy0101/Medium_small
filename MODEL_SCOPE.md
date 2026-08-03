@@ -125,6 +125,14 @@ post-solve intra-area row relayout or separate heuristic objective; row-level
 row assignments must be combinations of the declared unit flows and are
 selected by the same final master.
 
+The stage-1 optimum for total unplaced demand is imposed as an equality in
+every stage-2 restricted master. Consequently, stage-2 unplaced variables have
+zero objective coefficients; no artificial million-scale penalty is mixed
+with the normalized operational objective. Activation links use
+constraint-specific bounds rather than one global Big-M. Each bound is the
+minimum of the demand associated with that attribute/group state and the
+relevant area, bay, or row capacity.
+
 The no-negative-reduced-cost certificate applies to the LP relaxation over the
 complete compatible unit-flow universe. The final two-stage MIP uses the
 columns generated at LP convergence, so its reported MIP gap applies to that
@@ -146,6 +154,13 @@ in the detailed model must have a berth mapping, and every candidate area must
 have a positive finite distance to that berth. Missing or invalid values are
 input errors; the model neither imputes them nor silently excludes the travel
 criterion.
+
+The independent output validator reconstructs every export footprint from the
+input group and bay data. It checks group identity and dynamic attributes,
+area-function eligibility, 40/45-ft paired-row signatures, configured bay and
+row no-mix attributes (including incumbent conflicts), demand and unplaced
+balances, joint export/import capacities, anonymous import metadata, and the
+45-ft edge rule without consulting the solver incumbent.
 
 ## Removed from the paper model
 

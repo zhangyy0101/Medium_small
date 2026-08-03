@@ -7,9 +7,9 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-from yard_planning.models import Bay, ExportGroup
+from yard_planning.models import AttributeRules, Bay, ExportGroup
 from yard_planning.planner import ColumnGenerationConfig, ColumnGenerationPlanner, PlacementColumn
-from yard_planning.output_validator import validate_output_files
+from yard_planning.output_validator import _parse_integer, validate_output_files
 
 
 def make_group(size: str) -> ExportGroup:
@@ -29,6 +29,23 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         config = ColumnGenerationConfig()
         self.assertGreater(config.max_columns_per_group_per_iteration, 0)
         self.assertGreater(config.reduced_cost_tolerance, 0.0)
+
+    def test_stage_two_has_no_unplaced_penalty(self) -> None:
+        planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
+        group = make_group("20")
+        self.assertEqual(1.0, planner._unplaced_objective_for_group(group, "min_unplaced"))
+        self.assertEqual(0.0, planner._unplaced_objective_for_group(group, "full"))
+
+    def test_link_bound_uses_demand_capacity_minimum(self) -> None:
+        self.assertEqual(4, ColumnGenerationPlanner._tight_link_bound(100, 4))
+        self.assertEqual(3, ColumnGenerationPlanner._tight_link_bound(3, 20))
+        with self.assertRaises(ValueError):
+            ColumnGenerationPlanner._tight_link_bound(0, 20)
+
+    def test_output_quantities_must_be_exact_integers(self) -> None:
+        errors: list[str] = []
+        self.assertIsNone(_parse_integer("1.5", "planned_boxes", errors))
+        self.assertIn("non-integer field", errors[0])
 
     def test_normalized_policy_weights_sum_to_one_and_follow_priority(self) -> None:
         config = ColumnGenerationConfig()
@@ -187,18 +204,123 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             import_path = Path(directory) / "import.csv"
             with plan_path.open("w", encoding="utf-8", newline="") as handle:
                 writer = csv.DictWriter(handle, fieldnames=[
-                    "group_id", "planned_boxes", "area_no", "bay_no", "row_no",
-                    "size", "height", "voyage_id", "port",
+                    "group_id", "planned_boxes", "area_no", "bay_key", "bay_no", "row_no",
+                    "row_allocation", "flow", "size", "height", "voyage_id", "port",
                 ])
                 writer.writeheader()
                 writer.writerow({
                     "group_id": group.group_id, "planned_boxes": 5, "area_no": "A",
-                    "bay_no": "01", "row_no": "1", "size": "20", "height": "96",
+                    "bay_key": "A|01", "bay_no": "01", "row_no": "1",
+                    "row_allocation": "A|01:1:1", "flow": "OF", "size": "20", "height": "96",
                     "voyage_id": "V1", "port": "P1",
                 })
             unplaced_path.touch()
             import_path.touch()
             with self.assertRaisesRegex(ValueError, "capacity"):
+                validate_output_files(problem, plan_path, unplaced_path, import_path)
+
+    def test_output_validation_rejects_group_identity_tampering(self) -> None:
+        group = make_group("20")
+        bay = Bay(
+            area_no="A", bay_no="01", bay_key="A|01",
+            bay_order=0, cap_by_size={"20": 2}, physical_capacity=2,
+            row_cap_by_size={"20": {"1": 2}}, row_physical_capacity={"1": 2},
+        )
+        problem = SimpleNamespace(
+            export_groups=[group], bays={"A|01": bay}, export_voyages={"V1"},
+            import_area_size_reference={}, area_functions={"A": {"OF"}},
+            area_guidance_target={}, attribute_rules=AttributeRules(),
+        )
+        with TemporaryDirectory() as directory:
+            plan_path = Path(directory) / "plan.csv"
+            unplaced_path = Path(directory) / "unplaced.csv"
+            import_path = Path(directory) / "import.csv"
+            with plan_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=[
+                    "group_id", "planned_boxes", "area_no", "bay_key", "bay_no", "row_no",
+                    "row_allocation", "flow", "size", "height", "voyage_id", "port",
+                ])
+                writer.writeheader()
+                writer.writerow({
+                    "group_id": group.group_id, "planned_boxes": 5, "area_no": "A",
+                    "bay_key": "A|01", "bay_no": "01", "row_no": "1",
+                    "row_allocation": "A|01:1:1", "flow": "OF", "size": "20",
+                    "height": "86", "voyage_id": "V1", "port": "P1",
+                })
+            unplaced_path.touch()
+            import_path.touch()
+            with self.assertRaisesRegex(ValueError, "group identity mismatch"):
+                validate_output_files(problem, plan_path, unplaced_path, import_path)
+
+    def test_output_validation_rejects_row_footprint_tampering(self) -> None:
+        group = make_group("20")
+        bay = Bay(
+            area_no="A", bay_no="01", bay_key="A|01",
+            bay_order=0, cap_by_size={"20": 5}, physical_capacity=5,
+            row_cap_by_size={"20": {"1": 5}}, row_physical_capacity={"1": 5},
+        )
+        problem = SimpleNamespace(
+            export_groups=[group], bays={"A|01": bay}, export_voyages={"V1"},
+            import_area_size_reference={}, area_functions={"A": {"OF"}},
+            area_guidance_target={}, attribute_rules=AttributeRules(),
+        )
+        with TemporaryDirectory() as directory:
+            plan_path = Path(directory) / "plan.csv"
+            unplaced_path = Path(directory) / "unplaced.csv"
+            import_path = Path(directory) / "import.csv"
+            with plan_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=[
+                    "group_id", "planned_boxes", "area_no", "bay_key", "bay_no", "row_no",
+                    "row_allocation", "flow", "size", "height", "voyage_id", "port",
+                ])
+                writer.writeheader()
+                writer.writerow({
+                    "group_id": group.group_id, "planned_boxes": 5, "area_no": "A",
+                    "bay_key": "A|01", "bay_no": "01", "row_no": "1",
+                    "row_allocation": "A|99:1:1", "flow": "OF", "size": "20",
+                    "height": "96", "voyage_id": "V1", "port": "P1",
+                })
+            unplaced_path.touch()
+            import_path.touch()
+            with self.assertRaisesRegex(ValueError, "row footprint mismatch"):
+                validate_output_files(problem, plan_path, unplaced_path, import_path)
+
+    def test_output_validation_checks_configured_row_attribute_mix(self) -> None:
+        group_a = make_group("20")
+        group_a = ExportGroup(**{**group_a.__dict__, "group_id": "G-A", "demand": 1, "attributes": {"CUSTOM": "A"}})
+        group_b = ExportGroup(**{**group_a.__dict__, "group_id": "G-B", "attributes": {"CUSTOM": "B"}})
+        bay = Bay(
+            area_no="A", bay_no="01", bay_key="A|01",
+            bay_order=0, cap_by_size={"20": 2}, physical_capacity=2,
+            row_cap_by_size={"20": {"1": 2}}, row_physical_capacity={"1": 2},
+        )
+        problem = SimpleNamespace(
+            export_groups=[group_a, group_b], bays={"A|01": bay}, export_voyages={"V1"},
+            import_area_size_reference={}, area_functions={"A": {"OF"}},
+            area_guidance_target={},
+            attribute_rules=AttributeRules(row_no_mix_attributes=("CUSTOM",)),
+        )
+        with TemporaryDirectory() as directory:
+            plan_path = Path(directory) / "plan.csv"
+            unplaced_path = Path(directory) / "unplaced.csv"
+            import_path = Path(directory) / "import.csv"
+            with plan_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=[
+                    "group_id", "planned_boxes", "area_no", "bay_key", "bay_no", "row_no",
+                    "row_allocation", "flow", "size", "height", "voyage_id", "port", "CUSTOM",
+                ])
+                writer.writeheader()
+                for group in (group_a, group_b):
+                    writer.writerow({
+                        "group_id": group.group_id, "planned_boxes": 1, "area_no": "A",
+                        "bay_key": "A|01", "bay_no": "01", "row_no": "1",
+                        "row_allocation": "A|01:1:1", "flow": "OF", "size": "20",
+                        "height": "96", "voyage_id": "V1", "port": "P1",
+                        "CUSTOM": group.attributes["CUSTOM"],
+                    })
+            unplaced_path.touch()
+            import_path.touch()
+            with self.assertRaisesRegex(ValueError, "row attribute mixing"):
                 validate_output_files(problem, plan_path, unplaced_path, import_path)
 
     def test_import_reservation_does_not_inherit_existing_size_no_mix(self) -> None:
