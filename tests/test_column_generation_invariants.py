@@ -8,7 +8,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 from yard_planning.models import Bay, ExportGroup
-from yard_planning.planner import ColumnGenerationConfig, ColumnGenerationPlanner
+from yard_planning.planner import ColumnGenerationConfig, ColumnGenerationPlanner, PlacementColumn
 from yard_planning.output_validator import validate_output_files
 
 
@@ -25,8 +25,10 @@ def make_group(size: str) -> ExportGroup:
 
 
 class ColumnGenerationInvariantTests(unittest.TestCase):
-    def test_silent_solver_fallback_is_disabled_by_default(self) -> None:
-        self.assertFalse(ColumnGenerationConfig().allow_greedy_fallback)
+    def test_pricing_configuration_requires_negative_reduced_cost(self) -> None:
+        config = ColumnGenerationConfig()
+        self.assertGreater(config.max_columns_per_group_per_iteration, 0)
+        self.assertGreater(config.reduced_cost_tolerance, 0.0)
 
     def test_normalized_policy_weights_sum_to_one_and_follow_priority(self) -> None:
         config = ColumnGenerationConfig()
@@ -85,10 +87,10 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         self.assertEqual(0, planner._max_quantity_in_bay(make_group("45"), "middle"))
         self.assertEqual(5, planner._max_quantity_in_bay(make_group("45"), "edge"))
 
-    def test_unit_flows_cover_every_feasible_row_without_pattern_cap(self) -> None:
+    def test_pricing_enumerates_candidates_without_materializing_universe(self) -> None:
         planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
         planner.groups = [make_group("20")]
-        planner.config = ColumnGenerationConfig(initial_columns_per_group=1)
+        planner.config = ColumnGenerationConfig()
         planner.bays = {
             "A|01": Bay(
                 area_no="A", bay_no="01", bay_key="A|01",
@@ -98,19 +100,75 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         planner._columns = []
         planner._column_keys = set()
         planner._column_indices_by_triplet = defaultdict(list)
-        planner._active_column_indices = set()
         planner._candidate_bays_for_group = lambda group: [("A|01", 9, 0.0)]
         planner._placement_footprint_keys = lambda bay_key, size: (bay_key,)
         planner._row_capacity_items_for_group = lambda bay_key, size, group: [(str(i), 3) for i in range(1, 10)]
         planner._quota_key = lambda group, area: (group.voyage_id, group.status, area, group.size)
         planner._operational_group_key = lambda group: (group.voyage_id, group.status, group.port, group.size, group.height)
+        planner._column_base_cost = lambda group, bay: 0.0
         planner._berth_distance_cost = lambda voyage, area, qty: 0.0
 
-        planner._build_unit_flow_column_universe()
+        candidates = list(planner._iter_feasible_unit_flow_columns(planner.groups[0]))
 
-        self.assertEqual(9, len(planner._columns))
-        self.assertTrue(all(column.quantity == 1 for column in planner._columns))
-        self.assertEqual(set(range(9)), planner._active_column_indices)
+        self.assertEqual(9, len(candidates))
+        self.assertTrue(all(column.quantity == 1 for column in candidates))
+        self.assertEqual([], planner._columns)
+
+        index = planner._append_generated_column(candidates[0])
+        self.assertEqual(0, index)
+        self.assertEqual(1, len(planner._columns))
+        self.assertEqual("C0000001", planner._columns[0].column_id)
+
+    def test_pricing_reduced_cost_uses_master_row_duals(self) -> None:
+        planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
+        planner._placement_footprint_keys = lambda bay_key, size: (bay_key,)
+        planner._row_mix_key_for_column = lambda column: "mix"
+        planner._bay_no_mix_attrs_for_column = lambda column: ("height",)
+        planner._row_no_mix_attrs_for_column = lambda column: ("voyage",)
+        planner._attr_voyage_scope = lambda attr, voyage: "scope"
+        planner._column_attr_value = lambda column, attr: f"{attr}-value"
+        column = PlacementColumn(
+            column_id="",
+            group_id="G1",
+            voyage_id="V1",
+            flow="OF",
+            port="P1",
+            size="20",
+            big_plan_size="20",
+            height="96",
+            attributes={},
+            area_no="A",
+            bay_key="B1",
+            bay_no="01",
+            quantity=1,
+            stack_units=1,
+            row_allocation=(("B1", "R1", 1),),
+            quota_key=("V1", "OF", "A", "20"),
+            group_key=("V1", "OF", "P1", "20", "96"),
+            intrinsic_cost=100.0,
+        )
+        constraints = {
+            "group_cover": {"G1": 2.0},
+            "bay_capacity_limit": {"B1": 3.0},
+            "bay_port_stack_link": {("B1", "mix", "20"): 5.0},
+            "bay_attr_link": {("B1", "height", "scope", "height-value"): 7.0},
+            "bay_size_limit": {("B1", "20"): 11.0},
+            "row_capacity_limit": {("B1", "R1"): 13.0},
+            "row_size_limit": {("B1", "R1", "20"): 17.0},
+            "row_attr_link": {("B1", "R1", "voyage", "scope", "voyage-value"): 19.0},
+            "area_guidance_balance": {("V1", "OF", "A", "20"): 23.0},
+            "fixed_use_objective_limit": {
+                ("group_area", column.group_key, "A"): 29.0,
+                ("group_row", column.group_key, "B1", "R1"): 31.0,
+                ("group_used_upper", *column.group_key): 37.0,
+                ("group_used_lower", *column.group_key): 41.0,
+            },
+        }
+        model = SimpleNamespace(getDualsolLinear=lambda constraint: constraint)
+
+        reduced_cost = planner._column_reduced_cost(model, constraints, column, "full")
+
+        self.assertAlmostEqual(-56.0, reduced_cost)
 
     def test_written_output_is_validated_independently(self) -> None:
         group = make_group("20")

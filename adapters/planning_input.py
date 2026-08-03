@@ -40,8 +40,8 @@ def normalize_text(value: Any, default: str = "") -> str:
     return text or default
 
 
-def normalize_voyage(value: Any, fallback: str = "") -> str:
-    text = normalize_text(value, fallback)
+def normalize_voyage(value: Any, default: str = "") -> str:
+    text = normalize_text(value, default)
     try:
         return str(int(float(text)))
     except ValueError:
@@ -331,8 +331,8 @@ def read_vessel_info(input_guandong: InputAdapterGd) -> pd.DataFrame:
     frame["ie_flag"] = frame["VOY_IEFG"].map(normalize_code)
     frame["voyage_direction"] = frame["ie_flag"]
     frame["berth_no"] = frame.get("VBT_BTH_ABTHNO", pd.Series(index=frame.index)).map(normalize_code)
-    fallback_berth = frame.get("VBT_BTH_PBTHNO", pd.Series(index=frame.index)).map(normalize_code)
-    frame["berth_no"] = frame["berth_no"].where(frame["berth_no"].ne(""), fallback_berth)
+    secondary_berth = frame.get("VBT_BTH_PBTHNO", pd.Series(index=frame.index)).map(normalize_code)
+    frame["berth_no"] = frame["berth_no"].where(frame["berth_no"].ne(""), secondary_berth)
     frame["berth_key"] = frame["berth_no"].map(lambda value: f"B{value}" if value and not str(value).startswith("B") else value)
     cache["vessel_info"] = frame
     return frame.copy()

@@ -79,14 +79,17 @@ All active grouping rules resolve to the single operational group above.
 Each column is a feasible operational-group/bay/row unit flow. Its master
 variable is an integer container quantity, so arbitrary feasible integer row
 allocations are represented by combining unit-flow columns; there is no capped
-list of multi-row packing templates. The restricted master contains active
-columns only. In each lexicographic phase, an exact auxiliary pricing LP over
-the complete compatible unit-flow universe identifies the inactive flows used
-by the full relaxation and admits them to the restricted master. Pricing stops
-only when the restricted and oracle objectives agree within numerical
-tolerance. A time limit cannot silently terminate this certificate phase.
+list of multi-row packing templates. The initial restricted master contains no
+export placement column. In every lexicographic phase, the restricted-master
+LP is solved first and its row duals define an independent finite pricing
+problem for each export group. Feasible group/bay/row unit flows are generated
+transiently; only flows with reduced cost below the numerical tolerance enter
+the master. The complete compatible column universe is neither stored nor
+solved as one auxiliary model. Pricing stops only when every group pricing
+problem has no negative-reduced-cost flow. A time limit cannot silently
+terminate this certificate phase.
 
-The final integer master over the complete unit-flow universe is solved
+The final integer restricted master over the generated columns is solved
 in two lexicographic stages. Stage 1
 minimizes the number of unplaced declared containers. Stage 2 fixes that
 minimum exactly and minimizes the following operational criteria:
@@ -122,10 +125,12 @@ post-solve intra-area row relayout or separate heuristic objective; row-level
 row assignments must be combinations of the declared unit flows and are
 selected by the same final master.
 
-The pricing certificate applies to the complete unit-flow universe. The final
-two-stage MIP activates that universe, so its MIP gap is valid for the complete
-row-flow formulation. This is not a branch-and-price claim beyond the stated
-static planning model.
+The no-negative-reduced-cost certificate applies to the LP relaxation over the
+complete compatible unit-flow universe. The final two-stage MIP uses the
+columns generated at LP convergence, so its reported MIP gap applies to that
+integer restricted master. This is standard column generation followed by
+integer recovery; it is not branch-and-price and does not claim a global
+integer optimality certificate for the complete column universe.
 
 The import variables are anonymous capacity reservations indexed only by flow,
 size, and bay. Their totals equal the corresponding import `new_qty`. Their
@@ -155,10 +160,10 @@ criterion.
 - coarse/fine group-specific dispersion and balancing terms;
 - bay-count dispersion (replaced by row-count dispersion);
 - fixed maximum run length for consecutive 20 ft bays;
-- tiered fallback-area penalties;
+- tiered alternative-area penalties;
 - misplaced-bay exclusion ratio;
 - post-window loading rewards;
-- document-floor and forecast-fallback demand construction.
+- document-floor and forecast-substitution demand construction.
 - concurrent-operation conflict penalties.
 
 When an entire voyage-flow-size demand has no matching upstream allocation, it

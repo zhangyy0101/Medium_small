@@ -4,7 +4,7 @@ import csv
 import json
 import math
 from collections import Counter, defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from time import perf_counter
 from typing import Iterable
@@ -136,13 +136,12 @@ class PlacementColumn:
 @dataclass
 class ColumnGenerationConfig:
     max_iterations: int = 30
-    initial_columns_per_group: int = 8
+    max_columns_per_group_per_iteration: int = 32
+    reduced_cost_tolerance: float = 1e-7
     total_time_limit: float = 240.0
     mip_time_limit: float = 120.0
     mip_gap: float = 0.01
     verbose: bool = True
-    use_gurobi: bool = True
-    allow_greedy_fallback: bool = False
     pricing_unplaced_penalty: float = 1_000_000.0
     # Stage-2 policy weights. Every component is first mapped to a natural
     # dimensionless scale, so these values express policy preference only.
@@ -227,16 +226,25 @@ class ColumnGenerationPlanner:
         self.group_demand = {group.group_id: int(group.demand) for group in self.groups}
         self.voyage_flow_size_demand: Counter[tuple[str, str, str]] = Counter()
         self._columns: list[PlacementColumn] = []
-        self._active_column_indices: set[int] = set()
         self._column_keys: set[tuple[str, str, int, tuple[tuple[str, str, int], ...]]] = set()
         self._candidate_cache: dict[tuple[str, str], list[tuple[str, int, float]]] = {}
         self._candidate_scope = "all"
         self._objective_scales: dict[str, float] = {}
         self._berth_distance_bounds: dict[str, tuple[float, float]] = {}
-        self._master_seed_selected: Counter[int] = Counter()
-        self._master_seed_unplaced: Counter[str] = Counter()
-        self._master_start_selected: Counter[int] = Counter()
-        self._master_start_unplaced: Counter[str] = Counter()
+        self._initial_unplaced_start: Counter[str] = Counter()
+        self._potential_unit_flow_count = 0
+        self._master_bay_capacity_keys: set[str] = set()
+        self._master_bay_size_keys: set[tuple[str, str]] = set()
+        self._master_row_capacity_keys: set[tuple[str, str]] = set()
+        self._master_row_size_keys: set[tuple[str, str, str]] = set()
+        self._master_stack_keys: set[tuple[str, str, str]] = set()
+        self._master_stack_sample_group: dict[tuple[str, str, str], str] = {}
+        self._master_area_guidance_keys: set[tuple[str, str, str, str]] = set()
+        self._master_group_area_keys: set[tuple[tuple[str, ...], str]] = set()
+        self._master_group_row_keys: set[tuple[tuple[str, ...], str, str]] = set()
+        self._master_operational_group_keys: set[tuple[str, ...]] = set()
+        self._master_bay_attr_choice_keys: set[tuple[str, str, str, str]] = set()
+        self._master_row_attr_choice_keys: set[tuple[str, str, str, str, str]] = set()
         self._prepare_yard_indexes()
         self._prepare_import_reservation_candidates()
         self._prepare_quota()
@@ -266,21 +274,19 @@ class ColumnGenerationPlanner:
         }
         return groups
     def solve(self) -> ColumnGenerationResult:
-        self._build_unit_flow_column_universe()
+        self._initialize_column_generation()
+        self._prepare_master_index_sets()
         self._prepare_objective_normalization()
-        base_initial_column_count = len(self._active_column_indices)
-        self._master_seed_selected = Counter()
-        self._master_seed_unplaced = Counter(
+        self._initial_unplaced_start = Counter(
             {group.group_id: int(group.demand) for group in self.groups}
         )
         seed_stats = {
-            "seed_method": "all_unplaced_feasible_start",
-            "seed_selected_columns": 0,
-            "seed_unplaced_boxes": int(sum(self._master_seed_unplaced.values())),
+            "initialization": "artificial_unplaced_variables_only",
+            "initial_generated_columns": 0,
+            "initial_unplaced_boxes": int(sum(self._initial_unplaced_start.values())),
         }
-        initially_inactive_unit_flows = len(self._columns) - base_initial_column_count
         diagnostics: dict = {
-            "algorithm": "export_row_column_generation",
+            "algorithm": "dual_priced_restricted_master_column_generation",
             "model_scope": "export_declared_containers_row_allocation",
             "detailed_allocation_direction": "export_only",
             "target_voyages": self.problem.target_voyages,
@@ -331,15 +337,14 @@ class ColumnGenerationPlanner:
                     for (flow, size), candidates in sorted(self.import_reservation_candidates.items())
                 },
             },
-            "initial_column_count": len(self._active_column_indices),
-            "base_initial_column_count": base_initial_column_count,
+            "initial_column_count": 0,
+            "potential_unit_flow_count": self._potential_unit_flow_count,
             "exact_unit_flow_pricing": True,
-            "restricted_master_is_active_only": True,
-            "initially_inactive_unit_flow_count": initially_inactive_unit_flows,
+            "restricted_master_contains_generated_columns_only": True,
+            "complete_unit_flow_universe_materialized": False,
             **seed_stats,
             "pricing_iterations": [],
-            "gurobi_available": False,
-            "used_greedy_fallback": False,
+            "gurobi_available": True,
             "secondary_objective_normalization": {
                 "weights": self._objective_weights(),
                 "scales": dict(self._objective_scales),
@@ -360,22 +365,8 @@ class ColumnGenerationPlanner:
             },
         }
 
-        selected: Counter[int]
-        unplaced: Counter[str]
-        if not self.config.use_gurobi:
-            diagnostics["used_greedy_fallback"] = True
-            diagnostics["fallback_reason"] = "explicitly_disabled_gurobi"
-            selected, unplaced = self._greedy_fallback()
-        else:
-            try:
-                selected, unplaced, master_stats = self._solve_by_column_generation()
-                diagnostics.update(master_stats)
-            except Exception as exc:
-                if not self.config.allow_greedy_fallback:
-                    raise
-                diagnostics["used_greedy_fallback"] = True
-                diagnostics["gurobi_failure"] = f"{type(exc).__name__}: {exc}"
-                selected, unplaced = self._greedy_fallback()
+        selected, unplaced, master_stats = self._solve_by_column_generation()
+        diagnostics.update(master_stats)
 
         import_reservation_rows = self._make_import_reservation_rows()
         diagnostics["import_capacity_reservation"].update(
@@ -800,17 +791,17 @@ class ColumnGenerationPlanner:
         }
 
     def _solve_by_column_generation(self) -> tuple[Counter[int], Counter[str], dict]:
-        """Run exact two-phase LP pricing and solve the complete unit-flow MIP."""
+        """Solve two restricted-master LP phases with exact dual pricing."""
         from gurobipy import quicksum
 
         Model = _GurobiModelAdapter
         pricing_start = perf_counter()
         stats: dict = {
             "gurobi_available": True,
-            "pricing_method": "exact_auxiliary_lp_over_complete_unit_flow_universe",
+            "pricing_method": "independent_group_unit_flow_reduced_cost_pricing",
             "pricing_iterations": [],
             "pricing_stop_reason": "",
-            "full_unit_flow_count": len(self._columns),
+            "potential_unit_flow_count": self._potential_unit_flow_count,
         }
 
         def run_phase(
@@ -821,7 +812,7 @@ class ColumnGenerationPlanner:
             last_objective = 0.0
             last_unplaced: Counter[str] = Counter()
             for iteration in range(max(1, int(self.config.max_iterations))):
-                model, variables, _constraints = self._build_restricted_master(
+                model, variables, constraints = self._build_restricted_master(
                     Model,
                     quicksum,
                     relax=True,
@@ -844,13 +835,11 @@ class ColumnGenerationPlanner:
                         if self._gurobi_value(model, var) > 1e-8
                     }
                 )
-                pricing = self._solve_exact_pricing_oracle(
-                    Model,
-                    quicksum,
+                pricing = self._price_unit_flow_columns(
+                    model,
+                    constraints,
                     phase_name,
                     objective_mode,
-                    fixed_unplaced_total,
-                    last_objective,
                 )
                 stats["pricing_iterations"].append(
                     {
@@ -893,18 +882,17 @@ class ColumnGenerationPlanner:
             }
         )
 
-        self._active_column_indices = set(range(len(self._columns)))
         integer_start = perf_counter()
         selected, unplaced, integer_stats = self._solve_lexicographic_integer_master(
-            Counter(self._master_seed_selected),
-            Counter(self._master_seed_unplaced),
+            Counter(),
+            Counter(self._initial_unplaced_start),
             float(self.config.total_time_limit) if self.config.total_time_limit > 0 else None,
         )
         stats.update(integer_stats)
         stats.update(
             {
-                "master_algorithm": "strict_two_phase_column_generation_full_unit_flow_mip",
-                "master_bound_scope": "complete_unit_flow_universe",
+                "master_algorithm": "two_phase_dual_priced_column_generation_then_integer_rmp",
+                "master_bound_scope": "generated_columns_at_lp_reduced_cost_convergence",
                 "master_status": (
                     "lexicographic_integer_master"
                     if integer_stats.get("lexicographic_integer_master_used")
@@ -922,65 +910,70 @@ class ColumnGenerationPlanner:
             )
         return selected, unplaced, stats
 
-    def _solve_exact_pricing_oracle(
+    def _price_unit_flow_columns(
         self,
-        Model,
-        quicksum,
+        model,
+        constraints: dict,
         phase_name: str,
         objective_mode: str,
-        fixed_unplaced_total: float | None,
-        restricted_objective: float,
     ) -> dict:
-        """Solve the exact auxiliary LP over all not-yet-admitted unit flows.
+        """Solve every group pricing problem from restricted-master duals.
 
-        The restricted master itself contains active variables only. The
-        auxiliary pricing LP shares its constraints and objective but admits
-        the complete unit-flow universe. Any inactive flow used by its optimum
-        is a certificate that the restricted master is incomplete; admitting
-        those flows reproduces the oracle optimum in the next iteration.
+        A feasible column is a single group/bay/row unit flow, so each pricing
+        subproblem is an exact finite minimum-reduced-cost search. Candidate
+        placements are generated transiently and are stored only when their
+        reduced cost is negative.
         """
-        saved_active = set(self._active_column_indices)
-        self._active_column_indices = set(range(len(self._columns)))
-        oracle, oracle_vars, _constraints = self._build_restricted_master(
-            Model,
-            quicksum,
-            relax=True,
-            objective_mode=objective_mode,
-            fixed_unplaced_total=fixed_unplaced_total,
-        )
-        self._set_gurobi_param(oracle, "TimeLimit", float(self.config.mip_time_limit))
-        oracle.optimize()
-        status = self._gurobi_status_name(oracle)
-        if status != "optimal":
-            self._free_gurobi_model(oracle)
-            self._active_column_indices = saved_active
-            raise RuntimeError(f"Exact {phase_name} pricing oracle is not optimal: {status}")
-        oracle_objective = self._gurobi_objective_value(oracle)
-        improving = {
-            idx
-            for idx, var in oracle_vars["column"].items()
-            if idx not in saved_active and self._gurobi_value(oracle, var) > 1e-8
-        }
-        self._free_gurobi_model(oracle)
-        tolerance = 1e-7 * max(1.0, abs(float(restricted_objective)))
-        improvement = float(restricted_objective) - float(oracle_objective)
-        if improvement > tolerance and not improving:
-            self._active_column_indices = saved_active
-            raise RuntimeError(
-                f"Exact {phase_name} pricing found an objective improvement "
-                "but no entering unit-flow column"
-            )
-        if improvement <= tolerance:
-            improving.clear()
-        self._active_column_indices = saved_active | improving
+        tolerance = max(1e-12, float(self.config.reduced_cost_tolerance))
+        limit = max(1, int(self.config.max_columns_per_group_per_iteration))
+        evaluated = 0
+        negative = 0
+        entering: list[tuple[float, str, PlacementColumn]] = []
+        minimum_reduced_cost = math.inf
+        minimum_by_group: dict[str, float] = {}
+
+        for group in self.groups:
+            group_candidates: list[tuple[float, str, PlacementColumn]] = []
+            group_minimum = math.inf
+            for candidate in self._iter_feasible_unit_flow_columns(group):
+                key = self._column_identity(candidate)
+                if key in self._column_keys:
+                    continue
+                evaluated += 1
+                reduced_cost = self._column_reduced_cost(
+                    model,
+                    constraints,
+                    candidate,
+                    objective_mode,
+                )
+                group_minimum = min(group_minimum, reduced_cost)
+                minimum_reduced_cost = min(minimum_reduced_cost, reduced_cost)
+                if reduced_cost < -tolerance:
+                    negative += 1
+                    tie_key = f"{candidate.area_no}|{candidate.bay_no}|{candidate.row_allocation}"
+                    group_candidates.append((reduced_cost, tie_key, candidate))
+            if math.isfinite(group_minimum):
+                minimum_by_group[group.group_id] = group_minimum
+            group_candidates.sort(key=lambda item: (item[0], item[1]))
+            entering.extend(group_candidates[:limit])
+
+        entering.sort(key=lambda item: (item[0], item[1]))
+        for _reduced_cost, _tie_key, candidate in entering:
+            self._append_generated_column(candidate)
         return {
-            "new_columns": len(improving),
-            "pricing_mode": "exact_auxiliary_unit_flow_lp",
+            "new_columns": len(entering),
+            "pricing_mode": "exact_group_reduced_cost_enumeration",
             "exact_pricing": True,
-            "inactive_columns_scanned": len(self._columns) - len(saved_active),
-            "active_column_count": len(self._active_column_indices),
-            "pricing_oracle_objective": oracle_objective,
-            "pricing_objective_improvement": max(0.0, improvement),
+            "pricing_candidates_evaluated": evaluated,
+            "negative_reduced_cost_candidates": negative,
+            "generated_column_count": len(self._columns),
+            "minimum_reduced_cost": (
+                minimum_reduced_cost if math.isfinite(minimum_reduced_cost) else None
+            ),
+            "minimum_reduced_cost_by_group": {
+                key: value for key, value in sorted(minimum_by_group.items())
+            },
+            "phase": phase_name,
         }
 
     def _solve_lexicographic_integer_master(
@@ -1214,7 +1207,6 @@ class ColumnGenerationPlanner:
                 name=f"col_{idx}",
             )
             for idx, col in enumerate(self._columns)
-            if idx in self._active_column_indices
         }
         unplaced = {
             group.group_id: model.addVar(
@@ -1291,7 +1283,7 @@ class ColumnGenerationPlanner:
             group_cover[group.group_id] = model.addCons(expr + unplaced[group.group_id] == group.demand, name=f"cover_{group.group_id}")
 
         bay_capacity_limit = {}
-        for bay_key in sorted(set(bay_capacity_cols) | set(import_by_bay)):
+        for bay_key in sorted(self._master_bay_capacity_keys):
             items = bay_capacity_cols.get(bay_key, [])
             bay_capacity_limit[bay_key] = model.addCons(
                 quicksum(col.quantity * columns[idx] for idx, col in items)
@@ -1300,7 +1292,7 @@ class ColumnGenerationPlanner:
                 name=f"bay_cap_{bay_key}",
             )
         bay_size_limit = {}
-        for key in sorted(set(bay_size_capacity_cols) | set(import_by_bay_size)):
+        for key in sorted(self._master_bay_size_keys):
             items = bay_size_capacity_cols.get(key, [])
             bay_key, size = key
             bay_size_limit[key] = model.addCons(
@@ -1310,7 +1302,8 @@ class ColumnGenerationPlanner:
                 name=f"bay_size_{bay_key}_{size}",
             )
         row_capacity_limit = {}
-        for key, items in row_capacity_cols.items():
+        for key in sorted(self._master_row_capacity_keys):
+            items = row_capacity_cols.get(key, [])
             bay_key, row_no = key
             cap = int(self.bays[bay_key].row_physical_capacity.get(row_no, self.bays[bay_key].physical_capacity))
             row_capacity_limit[key] = model.addCons(
@@ -1318,7 +1311,8 @@ class ColumnGenerationPlanner:
                 name=f"row_cap_{bay_key}_{row_no}",
             )
         row_size_limit = {}
-        for key, items in row_size_capacity_cols.items():
+        for key in sorted(self._master_row_size_keys):
+            items = row_size_capacity_cols.get(key, [])
             bay_key, row_no, size = key
             cap = int(self.bays[bay_key].row_cap_by_size.get(size, {}).get(row_no, self.bays[bay_key].cap_by_size.get(size, 0)))
             row_size_limit[key] = model.addCons(
@@ -1330,9 +1324,10 @@ class ColumnGenerationPlanner:
         bay_stack_total_limit = {}
         bay_stack_vars = {}
         stack_vtype = "C" if relax else "I"
-        for key, items in sorted(bay_port_size_cols.items()):
+        for key in sorted(self._master_stack_keys):
+            items = bay_port_size_cols.get(key, [])
             bay_key, port, size = key
-            sample_group = self.groups_by_id.get(items[0][1].group_id) if items else None
+            sample_group = self.groups_by_id.get(self._master_stack_sample_group.get(key, ""))
             if sample_group is None:
                 continue
             stack_count = self._stack_count_for_group(bay_key, size, sample_group)
@@ -1377,12 +1372,6 @@ class ColumnGenerationPlanner:
         # are intentionally omitted so detailed declared boxes can recover from
         # stale or physically incompatible upstream allocations.
         quota_limit = {}
-        seed_unplaced_limit = None
-        if not relax and (self._master_seed_selected or self._master_seed_unplaced):
-            seed_unplaced_limit = model.addCons(
-                quicksum(unplaced.values()) <= sum(self._master_seed_unplaced.values()),
-                name="seed_unplaced_cap",
-            )
         lexicographic_unplaced_limit = None
         if fixed_unplaced_total is not None:
             lexicographic_unplaced_limit = model.addCons(
@@ -1411,10 +1400,10 @@ class ColumnGenerationPlanner:
                 group_area_cols,
                 group_row_cols,
             )
-        self._add_bay_compatibility_constraints(
+        bay_compatibility_constraints = self._add_bay_compatibility_constraints(
             quicksum, model, columns, bay_attr_choice_cols, relax=relax
         )
-        self._add_row_compatibility_constraints(
+        row_compatibility_constraints = self._add_row_compatibility_constraints(
             quicksum, model, columns, row_attr_choice_cols, relax=relax
         )
         return model, {
@@ -1433,8 +1422,9 @@ class ColumnGenerationPlanner:
             "bay_port_stack_limit": bay_port_stack_limit,
             "bay_stack_total_limit": bay_stack_total_limit,
             "quota_limit": quota_limit,
-            "seed_unplaced_limit": seed_unplaced_limit,
             "lexicographic_unplaced_limit": lexicographic_unplaced_limit,
+            **bay_compatibility_constraints,
+            **row_compatibility_constraints,
             **relaxed_objective_constraints,
         }
 
@@ -1477,18 +1467,8 @@ class ColumnGenerationPlanner:
         group_area_cols,
         group_row_cols,
     ) -> dict[str, dict]:
-        area_size_keys = {
-            key
-            for key in area_size_cols
-            if self._has_area_guidance(key[0], key[1], key[3])
-        }
-        for key, qty in self.quota_by_key.items():
-            voyage_id, flow, _area_no, big_size = key
-            if qty > 0 and self.voyage_flow_size_demand[(voyage_id, flow, big_size)] > 0:
-                area_size_keys.add(key)
-
         area_guidance_balance = {}
-        for key in sorted(area_size_keys):
+        for key in sorted(self._master_area_guidance_keys):
             items = area_size_cols.get(key, [])
             voyage_id, flow, area_no, big_size = key
             target = self._area_size_target(voyage_id, flow, area_no, big_size)
@@ -1501,7 +1481,8 @@ class ColumnGenerationPlanner:
         area_use_by_group: defaultdict[tuple[str, ...], list] = defaultdict(list)
         row_use_by_group: defaultdict[tuple[str, ...], list] = defaultdict(list)
         column_indices_by_group: defaultdict[tuple[str, ...], set[int]] = defaultdict(set)
-        for key, indices in group_area_cols.items():
+        for key in sorted(self._master_group_area_keys):
+            indices = group_area_cols.get(key, [])
             use = model.addVar(lb=0.0, ub=1.0, obj=self._area_activation_penalty())
             group_key, _area_no = key
             demand = sum(
@@ -1515,7 +1496,8 @@ class ColumnGenerationPlanner:
             )
             area_use_by_group[group_key].append(use)
             column_indices_by_group[group_key].update(indices)
-        for key, indices in group_row_cols.items():
+        for key in sorted(self._master_group_row_keys):
+            indices = group_row_cols.get(key, [])
             use = model.addVar(lb=0.0, ub=1.0, obj=self._row_activation_penalty())
             group_key, _bay_key, _row_no = key
             demand = sum(
@@ -1528,7 +1510,8 @@ class ColumnGenerationPlanner:
             )
             row_use_by_group[group_key].append(use)
             column_indices_by_group[group_key].update(indices)
-        for group_key, indices in column_indices_by_group.items():
+        for group_key in sorted(self._master_operational_group_keys):
+            indices = column_indices_by_group.get(group_key, set())
             demand = sum(
                 group.demand
                 for group in self.groups
@@ -1568,17 +1551,7 @@ class ColumnGenerationPlanner:
         group_area_cols,
         group_row_cols,
     ) -> None:
-        area_size_keys = {
-            key
-            for key in area_size_cols
-            if self._has_area_guidance(key[0], key[1], key[3])
-        }
-        for key, qty in self.quota_by_key.items():
-            voyage_id, flow, _area_no, big_size = key
-            if qty > 0 and self.voyage_flow_size_demand[(voyage_id, flow, big_size)] > 0:
-                area_size_keys.add(key)
-
-        for key in sorted(area_size_keys):
+        for key in sorted(self._master_area_guidance_keys):
             items = area_size_cols.get(key, [])
             voyage_id, flow, area_no, big_size = key
             target = self._area_size_target(voyage_id, flow, area_no, big_size)
@@ -1590,7 +1563,8 @@ class ColumnGenerationPlanner:
         area_use_by_group: defaultdict[tuple[str, ...], list] = defaultdict(list)
         row_use_by_group: defaultdict[tuple[str, ...], list] = defaultdict(list)
         column_indices_by_group: defaultdict[tuple[str, ...], set[int]] = defaultdict(set)
-        for (group_key, area_no), indices in group_area_cols.items():
+        for group_key, area_no in sorted(self._master_group_area_keys):
+            indices = group_area_cols.get((group_key, area_no), [])
             use = model.addVar(vtype="B", obj=self._area_activation_penalty(), name=f"use_ga_{self._key_name(group_key)}_{area_no}")
             demand = sum(
                 group.demand
@@ -1603,7 +1577,8 @@ class ColumnGenerationPlanner:
             )
             area_use_by_group[group_key].append(use)
             column_indices_by_group[group_key].update(indices)
-        for (group_key, bay_key, row_no), indices in group_row_cols.items():
+        for group_key, bay_key, row_no in sorted(self._master_group_row_keys):
+            indices = group_row_cols.get((group_key, bay_key, row_no), [])
             use = model.addVar(
                 vtype="B",
                 obj=self._row_activation_penalty(),
@@ -1617,7 +1592,8 @@ class ColumnGenerationPlanner:
             model.addCons(quicksum(columns[idx] for idx in indices) <= max(1, demand) * use)
             row_use_by_group[group_key].append(use)
             column_indices_by_group[group_key].update(indices)
-        for group_key, indices in column_indices_by_group.items():
+        for group_key in sorted(self._master_operational_group_keys):
+            indices = column_indices_by_group.get(group_key, set())
             demand = sum(
                 group.demand
                 for group in self.groups
@@ -1640,18 +1616,30 @@ class ColumnGenerationPlanner:
         columns,
         bay_attr_choice_cols: dict[tuple[str, str, str, str], list[int]],
         relax: bool,
-    ) -> None:
+    ) -> dict[str, dict]:
         big_m = max(1, sum(group.demand for group in self.groups))
         vtype = "C" if relax else "B"
         use_by_bay_attr: defaultdict[tuple[str, str, str], list] = defaultdict(list)
-        for (bay_key, attr, scope, value), indices in sorted(bay_attr_choice_cols.items()):
+        link_constraints = {}
+        one_constraints = {}
+        for bay_key, attr, scope, value in sorted(self._master_bay_attr_choice_keys):
+            indices = bay_attr_choice_cols.get((bay_key, attr, scope, value), [])
             scope_name = scope or "GLOBAL"
             use = model.addVar(lb=0.0, ub=1.0, vtype=vtype, name=f"bay_use_{attr}_{scope_name}_{bay_key}_{value}")
-            model.addCons(quicksum(columns[idx] for idx in indices) <= big_m * use)
+            link_constraints[(bay_key, attr, scope, value)] = model.addCons(
+                quicksum(columns[idx] for idx in indices) <= big_m * use
+            )
             use_by_bay_attr[(bay_key, attr, scope)].append(use)
         for (bay_key, attr, scope), uses in use_by_bay_attr.items():
             scope_name = scope or "GLOBAL"
-            model.addCons(quicksum(uses) <= 1, name=f"bay_one_{attr}_{scope_name}_{bay_key}")
+            one_constraints[(bay_key, attr, scope)] = model.addCons(
+                quicksum(uses) <= 1,
+                name=f"bay_one_{attr}_{scope_name}_{bay_key}",
+            )
+        return {
+            "bay_attr_link": link_constraints,
+            "bay_attr_one": one_constraints,
+        }
 
     def _add_row_compatibility_constraints(
         self,
@@ -1660,88 +1648,263 @@ class ColumnGenerationPlanner:
         columns,
         row_attr_choice_cols: dict[tuple[str, str, str, str, str], list[int]],
         relax: bool,
-    ) -> None:
+    ) -> dict[str, dict]:
         big_m = max(1, sum(group.demand for group in self.groups))
         vtype = "C" if relax else "B"
         use_by_row_attr: defaultdict[tuple[str, str, str, str], list] = defaultdict(list)
-        for (bay_key, row_no, attr, scope, value), indices in sorted(row_attr_choice_cols.items()):
+        link_constraints = {}
+        one_constraints = {}
+        for bay_key, row_no, attr, scope, value in sorted(self._master_row_attr_choice_keys):
+            indices = row_attr_choice_cols.get((bay_key, row_no, attr, scope, value), [])
             scope_name = scope or "GLOBAL"
             use = model.addVar(lb=0.0, ub=1.0, vtype=vtype, name=f"row_use_{attr}_{scope_name}_{bay_key}_{row_no}_{value}")
-            model.addCons(quicksum(columns[idx] for idx in indices) <= big_m * use)
+            link_constraints[(bay_key, row_no, attr, scope, value)] = model.addCons(
+                quicksum(columns[idx] for idx in indices) <= big_m * use
+            )
             use_by_row_attr[(bay_key, row_no, attr, scope)].append(use)
         for (bay_key, row_no, attr, scope), uses in use_by_row_attr.items():
             scope_name = scope or "GLOBAL"
-            model.addCons(quicksum(uses) <= 1, name=f"row_one_{attr}_{scope_name}_{bay_key}_{row_no}")
+            one_constraints[(bay_key, row_no, attr, scope)] = model.addCons(
+                quicksum(uses) <= 1,
+                name=f"row_one_{attr}_{scope_name}_{bay_key}_{row_no}",
+            )
+        return {
+            "row_attr_link": link_constraints,
+            "row_attr_one": one_constraints,
+        }
 
-    def _build_unit_flow_column_universe(self) -> None:
-        """Create every feasible group/bay/row placement option as metadata.
-
-        A column carries an integer number of identical containers on one row.
-        Combining these unit-flow options represents every integer row
-        allocation, so no capped list of multi-row templates is required.
-        Only a compact seed subset is admitted to the initial master.
-        """
+    def _initialize_column_generation(self) -> None:
         self._columns.clear()
         self._column_keys.clear()
-        self._active_column_indices.clear()
-        for group in self.groups:
-            seed_bays = {
-                bay_key
-                for bay_key, _capacity, _cost in self._candidate_bays_for_group(group)[
-                    : max(1, int(self.config.initial_columns_per_group))
-                ]
+
+    def _iter_feasible_unit_flow_columns(
+        self,
+        group: ExportGroup,
+    ) -> Iterable[PlacementColumn]:
+        """Generate feasible unit-flow columns without storing a full universe."""
+        for bay_key, _max_qty, _unused_cost in self._candidate_bays_for_group(group):
+            bay = self.bays[bay_key]
+            footprint = self._placement_footprint_keys(bay_key, group.size)
+            if not footprint:
+                continue
+            per_bay = {
+                key: dict(self._row_capacity_items_for_group(key, group.size, group))
+                for key in footprint
             }
-            for bay_key, _max_qty, base_cost in self._candidate_bays_for_group(group):
-                bay = self.bays[bay_key]
-                footprint = self._placement_footprint_keys(bay_key, group.size)
-                if not footprint:
+            if any(not values for values in per_bay.values()):
+                continue
+            common_rows = sorted(
+                set.intersection(*(set(values) for values in per_bay.values())),
+                key=self._row_sort_key,
+            )
+            for row_no in common_rows:
+                if min(per_bay[key][row_no] for key in footprint) <= 0:
                     continue
-                per_bay = {
-                    key: dict(self._row_capacity_items_for_group(key, group.size, group))
-                    for key in footprint
-                }
-                if any(not values for values in per_bay.values()):
-                    continue
-                common_rows = sorted(
-                    set.intersection(*(set(values) for values in per_bay.values())),
-                    key=self._row_sort_key,
+                allocation = self._row_allocation_signature(
+                    tuple((key, row_no, 1) for key in footprint)
                 )
-                for row_no in common_rows:
-                    row_capacity = min(per_bay[key][row_no] for key in footprint)
-                    if row_capacity <= 0:
-                        continue
-                    allocation = self._row_allocation_signature(
-                        tuple((key, row_no, 1) for key in footprint)
-                    )
-                    column_id = f"C{len(self._columns) + 1:07d}"
-                    column = PlacementColumn(
-                        column_id=column_id,
-                        group_id=group.group_id,
-                        voyage_id=group.voyage_id,
-                        flow=group.status,
-                        port=group.port,
-                        size=group.size,
-                        big_plan_size=self._big_plan_size(group.size),
-                        height=group.height,
-                        attributes=dict(group.attributes or {}),
-                        area_no=bay.area_no,
-                        bay_key=bay_key,
-                        bay_no=bay.bay_no,
-                        quantity=1,
-                        stack_units=1,
-                        row_allocation=allocation,
-                        quota_key=self._quota_key(group, bay.area_no),
-                        group_key=self._operational_group_key(group),
-                        intrinsic_cost=(
-                            base_cost
-                            + self._berth_distance_cost(group.voyage_id, bay.area_no, 1)
-                        ),
-                    )
-                    idx = len(self._columns)
-                    self._columns.append(column)
-                    self._column_keys.add((group.group_id, bay_key, 1, allocation))
-                    if bay_key in seed_bays:
-                        self._active_column_indices.add(idx)
+                yield PlacementColumn(
+                    column_id="",
+                    group_id=group.group_id,
+                    voyage_id=group.voyage_id,
+                    flow=group.status,
+                    port=group.port,
+                    size=group.size,
+                    big_plan_size=self._big_plan_size(group.size),
+                    height=group.height,
+                    attributes=dict(group.attributes),
+                    area_no=bay.area_no,
+                    bay_key=bay_key,
+                    bay_no=bay.bay_no,
+                    quantity=1,
+                    stack_units=1,
+                    row_allocation=allocation,
+                    quota_key=self._quota_key(group, bay.area_no),
+                    group_key=self._operational_group_key(group),
+                    intrinsic_cost=(
+                        self._column_base_cost(group, bay_key)
+                        + self._berth_distance_cost(group.voyage_id, bay.area_no, 1)
+                    ),
+                )
+
+    @staticmethod
+    def _column_identity(
+        column: PlacementColumn,
+    ) -> tuple[str, str, int, tuple[tuple[str, str, int], ...]]:
+        return (
+            column.group_id,
+            column.bay_key,
+            int(column.quantity),
+            column.row_allocation,
+        )
+
+    def _append_generated_column(self, candidate: PlacementColumn) -> int:
+        key = self._column_identity(candidate)
+        if key in self._column_keys:
+            raise ValueError(f"duplicate generated column: {key}")
+        column = replace(candidate, column_id=f"C{len(self._columns) + 1:07d}")
+        index = len(self._columns)
+        self._columns.append(column)
+        self._column_keys.add(key)
+        return index
+
+    def _prepare_master_index_sets(self) -> None:
+        """Create the fixed row index set shared by every restricted master."""
+        self._master_bay_capacity_keys.clear()
+        self._master_bay_size_keys.clear()
+        self._master_row_capacity_keys.clear()
+        self._master_row_size_keys.clear()
+        self._master_stack_keys.clear()
+        self._master_stack_sample_group.clear()
+        self._master_area_guidance_keys.clear()
+        self._master_group_area_keys.clear()
+        self._master_group_row_keys.clear()
+        self._master_operational_group_keys.clear()
+        self._master_bay_attr_choice_keys.clear()
+        self._master_row_attr_choice_keys.clear()
+        self._potential_unit_flow_count = 0
+
+        for group in self.groups:
+            group_key = self._operational_group_key(group)
+            self._master_operational_group_keys.add(group_key)
+            for column in self._iter_feasible_unit_flow_columns(group):
+                self._potential_unit_flow_count += 1
+                footprint = self._placement_footprint_keys(column.bay_key, column.size)
+                self._master_bay_capacity_keys.update(footprint)
+                self._master_bay_size_keys.add((column.bay_key, column.size))
+                stack_value = self._row_mix_key_for_column(column)
+                for footprint_key in footprint:
+                    stack_key = (footprint_key, stack_value, column.size)
+                    self._master_stack_keys.add(stack_key)
+                    self._master_stack_sample_group.setdefault(stack_key, group.group_id)
+                    for attr in self._bay_no_mix_attrs_for_column(column):
+                        scope = self._attr_voyage_scope(attr, column.voyage_id)
+                        self._master_bay_attr_choice_keys.add(
+                            (
+                                footprint_key,
+                                attr,
+                                scope,
+                                self._column_attr_value(column, attr),
+                            )
+                        )
+                for footprint_key, row_no, _qty in column.row_allocation:
+                    self._master_row_capacity_keys.add((footprint_key, row_no))
+                    self._master_row_size_keys.add((footprint_key, row_no, column.size))
+                    for attr in self._row_no_mix_attrs_for_column(column):
+                        scope = self._attr_voyage_scope(attr, column.voyage_id)
+                        self._master_row_attr_choice_keys.add(
+                            (
+                                footprint_key,
+                                row_no,
+                                attr,
+                                scope,
+                                self._column_attr_value(column, attr),
+                            )
+                        )
+                if self._has_area_guidance(
+                    column.voyage_id,
+                    column.flow,
+                    column.big_plan_size,
+                ):
+                    self._master_area_guidance_keys.add(column.quota_key)
+                self._master_group_area_keys.add((group_key, column.area_no))
+                anchor_row = next(
+                    row_no
+                    for bay_key, row_no, _qty in column.row_allocation
+                    if bay_key == column.bay_key
+                )
+                self._master_group_row_keys.add((group_key, column.bay_key, anchor_row))
+
+        for key, qty in self.quota_by_key.items():
+            voyage_id, flow, _area_no, big_size = key
+            if qty > 0 and self.voyage_flow_size_demand[(voyage_id, flow, big_size)] > 0:
+                self._master_area_guidance_keys.add(key)
+        for (_flow, size), candidates in self.import_reservation_candidates.items():
+            for bay_key, _capacity in candidates:
+                self._master_bay_size_keys.add((bay_key, size))
+                self._master_bay_capacity_keys.update(
+                    self._placement_footprint_keys(bay_key, size)
+                )
+
+    @staticmethod
+    def _constraint_dual(model, constraints: dict, section: str, key: object) -> float:
+        constraint = constraints.get(section, {}).get(key)
+        if constraint is None:
+            return 0.0
+        return float(model.getDualsolLinear(constraint))
+
+    def _column_reduced_cost(
+        self,
+        model,
+        constraints: dict,
+        column: PlacementColumn,
+        objective_mode: str,
+    ) -> float:
+        reduced_cost = 0.0 if objective_mode == "min_unplaced" else float(column.intrinsic_cost)
+
+        def apply(section: str, key: object, coefficient: float = 1.0) -> None:
+            nonlocal reduced_cost
+            reduced_cost -= coefficient * self._constraint_dual(
+                model,
+                constraints,
+                section,
+                key,
+            )
+
+        apply("group_cover", column.group_id)
+        footprint = self._placement_footprint_keys(column.bay_key, column.size)
+        stack_value = self._row_mix_key_for_column(column)
+        for footprint_key in footprint:
+            apply("bay_capacity_limit", footprint_key)
+            apply("bay_port_stack_link", (footprint_key, stack_value, column.size))
+            for attr in self._bay_no_mix_attrs_for_column(column):
+                scope = self._attr_voyage_scope(attr, column.voyage_id)
+                apply(
+                    "bay_attr_link",
+                    (
+                        footprint_key,
+                        attr,
+                        scope,
+                        self._column_attr_value(column, attr),
+                    ),
+                )
+        apply("bay_size_limit", (column.bay_key, column.size))
+        for footprint_key, row_no, qty in column.row_allocation:
+            apply("row_capacity_limit", (footprint_key, row_no), float(qty))
+            apply(
+                "row_size_limit",
+                (footprint_key, row_no, column.size),
+                float(qty),
+            )
+            for attr in self._row_no_mix_attrs_for_column(column):
+                scope = self._attr_voyage_scope(attr, column.voyage_id)
+                apply(
+                    "row_attr_link",
+                    (
+                        footprint_key,
+                        row_no,
+                        attr,
+                        scope,
+                        self._column_attr_value(column, attr),
+                    ),
+                )
+        apply("area_guidance_balance", column.quota_key)
+        fixed = constraints.get("fixed_use_objective_limit", {})
+        fixed_dual = lambda key: (
+            float(model.getDualsolLinear(fixed[key])) if key in fixed else 0.0
+        )
+        anchor_row = next(
+            row_no
+            for bay_key, row_no, _qty in column.row_allocation
+            if bay_key == column.bay_key
+        )
+        reduced_cost -= fixed_dual(("group_area", column.group_key, column.area_no))
+        reduced_cost -= fixed_dual(
+            ("group_row", column.group_key, column.bay_key, anchor_row)
+        )
+        reduced_cost -= fixed_dual(("group_used_upper",) + column.group_key)
+        reduced_cost += fixed_dual(("group_used_lower",) + column.group_key)
+        return float(reduced_cost)
 
     def _bay_no_mix_attrs(self, voyage_id: object = None) -> tuple[str, ...]:
         attrs = (
@@ -1812,7 +1975,7 @@ class ColumnGenerationPlanner:
             return str(value)
         text = str(attr).strip()
         upper = text.upper()
-        fallback = {
+        default_value = {
             "IYC_STS_CSTATUSCD": group.status,
             "STATUS": group.status,
             "FLOW": group.status,
@@ -1828,7 +1991,7 @@ class ColumnGenerationPlanner:
             "VOYAGE_ID": group.voyage_id,
             EXPORT_VOYAGE_ROW_NO_MIX_ATTR.upper(): group.voyage_id,
         }.get(upper, "")
-        return str(fallback)
+        return str(default_value)
 
     @staticmethod
     def _column_attr_value(col: PlacementColumn, attr: str) -> str:
@@ -1840,7 +2003,7 @@ class ColumnGenerationPlanner:
             return str(value)
         text = str(attr).strip()
         upper = text.upper()
-        fallback = {
+        default_value = {
             "IYC_STS_CSTATUSCD": col.flow,
             "STATUS": col.flow,
             "FLOW": col.flow,
@@ -1856,7 +2019,7 @@ class ColumnGenerationPlanner:
             "VOYAGE_ID": col.voyage_id,
             EXPORT_VOYAGE_ROW_NO_MIX_ATTR.upper(): col.voyage_id,
         }.get(upper, "")
-        return str(fallback)
+        return str(default_value)
 
     def _row_mix_key_for_group(self, group: ExportGroup) -> str:
         return "|".join(f"{attr}={self._group_attr_value(group, attr)}" for attr in self._row_no_mix_attrs_for_group(group)) or "__all__"
@@ -1950,8 +2113,8 @@ class ColumnGenerationPlanner:
                 capacities.append((str(row_no), cap_int))
         if has_row_caps:
             return capacities
-        fallback = int(bay.cap_by_size.get(size, 0) or bay.physical_capacity)
-        return [("__bay__", fallback)] if fallback > 0 else []
+        default_capacity = int(bay.cap_by_size.get(size, 0) or bay.physical_capacity)
+        return [("__bay__", default_capacity)] if default_capacity > 0 else []
 
     def _row_capacity_items_for_group(
         self,
@@ -2054,69 +2217,6 @@ class ColumnGenerationPlanner:
             return 10**9
         return int(math.ceil(quantity / unit_capacity))
 
-    def _greedy_import_reservation(self, state: dict) -> Counter[tuple[str, str, str]]:
-        """Construct a feasible anonymous reserve for the non-Gurobi fallback."""
-        reserved: Counter[tuple[str, str, str]] = Counter()
-        keys = sorted(
-            self.import_total_by_flow_size,
-            key=lambda key: (
-                0 if key[1] == "40" else 1,
-                len(self.import_reservation_candidates.get(key, [])),
-                key,
-            ),
-        )
-        for flow, size in keys:
-            required = int(self.import_total_by_flow_size[(flow, size)])
-            candidates = list(self.import_reservation_candidates.get((flow, size), []))
-            by_area: defaultdict[str, list[tuple[str, int]]] = defaultdict(list)
-            for bay_key, capacity in candidates:
-                by_area[self.bays[bay_key].area_no].append((bay_key, capacity))
-            reference_by_area = Counter(
-                {
-                    area_no: int(qty)
-                    for (reference_flow, area_no, reference_size), qty in self.import_area_size_reference.items()
-                    if reference_flow == flow and reference_size == size and int(qty) > 0
-                }
-            )
-            remaining = required
-            for area_no, target in sorted(reference_by_area.items(), key=lambda item: (-item[1], item[0])):
-                area_need = min(remaining, int(target))
-                for bay_key, _capacity in by_area.get(area_no, []):
-                    available = self._remaining_import_reservation_capacity(bay_key, size, state)
-                    qty = min(area_need, available)
-                    if qty <= 0:
-                        continue
-                    reserved[(flow, size, bay_key)] += qty
-                    self._apply_import_reservation_quantity(bay_key, size, qty, state)
-                    area_need -= qty
-                    remaining -= qty
-                    if area_need <= 0:
-                        break
-            if remaining > 0:
-                for bay_key, _capacity in sorted(
-                    candidates,
-                    key=lambda item: (
-                        self.bays[item[0]].area_no in reference_by_area,
-                        self.bays[item[0]].area_no,
-                        self.bays[item[0]].bay_order,
-                    ),
-                ):
-                    available = self._remaining_import_reservation_capacity(bay_key, size, state)
-                    qty = min(remaining, available)
-                    if qty <= 0:
-                        continue
-                    reserved[(flow, size, bay_key)] += qty
-                    self._apply_import_reservation_quantity(bay_key, size, qty, state)
-                    remaining -= qty
-                    if remaining <= 0:
-                        break
-            if remaining > 0:
-                raise ValueError(
-                    "insufficient function- and size-compatible capacity for imports: "
-                    f"flow={flow}, size={size}, required={required}, reserved={required - remaining}"
-                )
-        return reserved
-
     def _remaining_import_reservation_capacity(self, bay_key: str, size: str, state: dict) -> int:
         capacity = self._import_reservation_capacity(bay_key, size)
         footprint = self._placement_footprint_keys(bay_key, size)
@@ -2182,41 +2282,6 @@ class ColumnGenerationPlanner:
             after_units = self._stack_units_for_quantity(footprint_key, group.size, group, after)
             state["bay_port_size_load"][port_key] = after
             state["bay_stack_used"][total_key] += after_units - before_units
-
-    def _greedy_fallback(self) -> tuple[Counter[int], Counter[str]]:
-        selected: Counter[int] = Counter()
-        placed: Counter[str] = Counter()
-        state = self._empty_selection_state()
-        self._final_import_reservation = self._greedy_import_reservation(state)
-        indices_by_group: defaultdict[str, list[int]] = defaultdict(list)
-        for idx, column in enumerate(self._columns):
-            indices_by_group[column.group_id].append(idx)
-        for group in self.groups:
-            ordered = sorted(
-                indices_by_group[group.group_id],
-                key=lambda idx: (
-                    self._columns[idx].intrinsic_cost,
-                    self.bays[self._columns[idx].bay_key].bay_order,
-                    self._columns[idx].row_allocation,
-                ),
-            )
-            for idx in ordered:
-                column = self._columns[idx]
-                while placed[group.group_id] < group.demand:
-                    remaining = group.demand - placed[group.group_id]
-                    if not self._column_fits_state(column, state, remaining):
-                        break
-                    self._apply_column_to_state(column, state)
-                    selected[idx] += 1
-                    placed[group.group_id] += 1
-        unplaced = Counter(
-            {
-                group.group_id: group.demand - placed[group.group_id]
-                for group in self.groups
-                if placed[group.group_id] < group.demand
-            }
-        )
-        return selected, unplaced
 
     def _selection_state(self, selected: Counter[int]) -> tuple[Counter[int], dict, Counter[str]]:
         repaired: Counter[int] = Counter()
@@ -2659,14 +2724,14 @@ class ColumnGenerationPlanner:
     def _objective_scale(self, key: str) -> float:
         if key in self._objective_scales:
             return max(1.0, float(self._objective_scales[key]))
-        fallback = {
+        default_scale = {
             "existing_group_proximity": self._anchored_group_demand(),
             "area_guidance_l1": 2
             * (self._guided_demand() + sum(self.import_total_by_flow_size.values())),
             "berth_distance": sum(group.demand for group in self.groups),
         }.get(key, 1.0)
 
-        return max(1.0, float(fallback))
+        return max(1.0, float(default_scale))
 
     def _prepare_objective_normalization(self) -> None:
         demand_by_group: Counter[tuple[str, ...]] = Counter()
@@ -2674,11 +2739,10 @@ class ColumnGenerationPlanner:
         rows_by_group: defaultdict[tuple[str, ...], set[tuple[str, str]]] = defaultdict(set)
         for group in self.groups:
             demand_by_group[self._operational_group_key(group)] += int(group.demand)
-        for col in self._columns:
-            areas_by_group[col.group_key].add(col.area_no)
-            for bay_key, row_no, qty in col.row_allocation:
-                if qty > 0 and bay_key == col.bay_key:
-                    rows_by_group[col.group_key].add((bay_key, row_no))
+        for group_key, area_no in self._master_group_area_keys:
+            areas_by_group[group_key].add(area_no)
+        for group_key, bay_key, row_no in self._master_group_row_keys:
+            rows_by_group[group_key].add((bay_key, row_no))
         area_scale = sum(
             max(0, min(int(demand), len(areas_by_group[key])) - 1)
             for key, demand in demand_by_group.items()

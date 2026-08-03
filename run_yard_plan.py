@@ -37,7 +37,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mip-time-limit", type=float, default=120.0)
     parser.add_argument("--mip-gap", type=float, default=0.01)
     parser.add_argument("--quiet", action="store_true")
-    parser.add_argument("--no-gurobi", action="store_true", help="Use the built-in fallback instead of Gurobi.")
     return parser.parse_args()
 
 
@@ -70,7 +69,6 @@ def main() -> None:
         mip_time_limit=args.mip_time_limit,
         mip_gap=args.mip_gap,
         verbose=not args.quiet,
-        use_gurobi=not args.no_gurobi,
     )
     result = ColumnGenerationPlanner(inputs.problem, config).solve()
 
