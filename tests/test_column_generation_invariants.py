@@ -7,20 +7,19 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
-from block_bay_planning.models import Bay, SmallBoxGroup
-from medium_small.column_generation_planner import ColumnGenerationConfig, ColumnGenerationPlanner
-from medium_small.output_validator import validate_output_files
+from yard_planning.models import Bay, ExportGroup
+from yard_planning.planner import ColumnGenerationConfig, ColumnGenerationPlanner
+from yard_planning.output_validator import validate_output_files
 
 
-def make_group(size: str) -> SmallBoxGroup:
-    return SmallBoxGroup(
+def make_group(size: str) -> ExportGroup:
+    return ExportGroup(
         group_id=f"g-{size}",
         voyage_id="V1",
         status="OF",
         port="P1",
         size=size,
         height="96",
-        weight_class="",
         demand=5,
     )
 
@@ -54,10 +53,6 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
                 area_no="A",
                 bay_no="01",
                 bay_key="edge",
-                block_id="",
-                block_bays=(),
-                block_bay_count=0,
-                block_boundary_adjusted=False,
                 bay_order=0,
                 cap_by_size={"20": 10, "40": 10, "45": 10},
                 physical_capacity=10,
@@ -67,10 +62,6 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
                 area_no="A",
                 bay_no="03",
                 bay_key="middle",
-                block_id="",
-                block_bays=(),
-                block_bay_count=0,
-                block_boundary_adjusted=False,
                 bay_order=1,
                 cap_by_size={"20": 10, "40": 10, "45": 10},
                 physical_capacity=10,
@@ -80,10 +71,6 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
                 area_no="A",
                 bay_no="02",
                 bay_key="partner",
-                block_id="",
-                block_bays=(),
-                block_bay_count=0,
-                block_boundary_adjusted=False,
                 bay_order=2,
                 cap_by_size={"20": 10, "40": 10, "45": 10},
                 physical_capacity=10,
@@ -104,8 +91,7 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         planner.config = ColumnGenerationConfig(initial_columns_per_group=1)
         planner.bays = {
             "A|01": Bay(
-                area_no="A", bay_no="01", bay_key="A|01", block_id="",
-                block_bays=(), block_bay_count=0, block_boundary_adjusted=False,
+                area_no="A", bay_no="01", bay_key="A|01",
                 bay_order=0, cap_by_size={"20": 9}, physical_capacity=9,
             )
         }
@@ -129,13 +115,12 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
     def test_written_output_is_validated_independently(self) -> None:
         group = make_group("20")
         bay = Bay(
-            area_no="A", bay_no="01", bay_key="A|01", block_id="",
-            block_bays=(), block_bay_count=0, block_boundary_adjusted=False,
+            area_no="A", bay_no="01", bay_key="A|01",
             bay_order=0, cap_by_size={"20": 4}, physical_capacity=4,
             row_cap_by_size={"20": {"1": 4}}, row_physical_capacity={"1": 4},
         )
         problem = SimpleNamespace(
-            small_groups=[group], bays={"A|01": bay},
+            export_groups=[group], bays={"A|01": bay},
             import_area_size_reference={}, area_functions={"A": {"OF"}},
         )
         with TemporaryDirectory() as directory:
@@ -160,8 +145,7 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
 
     def test_import_reservation_does_not_inherit_existing_size_no_mix(self) -> None:
         bay = Bay(
-            area_no="A", bay_no="01", bay_key="A|01", block_id="",
-            block_bays=(), block_bay_count=0, block_boundary_adjusted=False,
+            area_no="A", bay_no="01", bay_key="A|01",
             bay_order=0, cap_by_size={"20": 4, "40": 4}, physical_capacity=4,
             row_cap_by_size={"20": {"1": 4}}, row_physical_capacity={"1": 4},
             existing_size_modes={"40"},
@@ -170,7 +154,7 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         planner.bays = {"A|01": bay}
         self.assertEqual(4, planner._import_reservation_capacity("A|01", "20"))
         problem = SimpleNamespace(
-            small_groups=[], bays={"A|01": bay},
+            export_groups=[], bays={"A|01": bay},
             import_area_size_reference={("IF", "A", "20"): 1},
             area_functions={"A": {"IF"}},
         )
@@ -194,12 +178,11 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
 
     def test_import_reservation_requires_area_function(self) -> None:
         bay = Bay(
-            area_no="A", bay_no="01", bay_key="A|01", block_id="",
-            block_bays=(), block_bay_count=0, block_boundary_adjusted=False,
+            area_no="A", bay_no="01", bay_key="A|01",
             bay_order=0, cap_by_size={"20": 4}, physical_capacity=4,
         )
         problem = SimpleNamespace(
-            small_groups=[], bays={"A|01": bay},
+            export_groups=[], bays={"A|01": bay},
             import_area_size_reference={("IF", "B", "20"): 1},
             area_functions={"A": {"OF"}},
         )

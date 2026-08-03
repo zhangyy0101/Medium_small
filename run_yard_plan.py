@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from dataclasses import asdict
 from datetime import datetime
@@ -10,15 +9,15 @@ from pathlib import Path
 import pandas as pd
 
 from adapters.input_adapter_gd import InputAdapterGd, normalize_voyage_id
-from adapters.input_adapter_standard import DEFAULT_MISPLACED_BAY_EXCLUSION_RATIO, load_medium_small_inputs
-from medium_small.column_generation_planner import (
+from adapters.planning_input import load_planning_inputs
+from yard_planning.planner import (
     ColumnGenerationConfig,
     ColumnGenerationPlanner,
     write_columns,
     write_json,
     write_rows,
 )
-from medium_small.output_validator import validate_output_files
+from yard_planning.output_validator import validate_output_files
 
 
 ROOT = Path(__file__).resolve().parent
@@ -38,7 +37,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total-time-limit", type=float, default=240.0)
     parser.add_argument("--mip-time-limit", type=float, default=120.0)
     parser.add_argument("--mip-gap", type=float, default=0.01)
-    parser.add_argument("--misplaced-bay-exclusion-ratio", type=float, default=DEFAULT_MISPLACED_BAY_EXCLUSION_RATIO)
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--no-gurobi", action="store_true", help="Use the built-in fallback instead of Gurobi.")
     return parser.parse_args()
@@ -62,12 +60,11 @@ def main() -> None:
     print(f"voyages ({len(voyages)}): {voyages}")
     print(f"output: {output_dir}")
 
-    inputs = load_medium_small_inputs(
+    inputs = load_planning_inputs(
         adapter,
         planning_time=planning_time.to_pydatetime(),
         voyages=voyages,
         horizon_hours=args.horizon_hours,
-        misplaced_bay_exclusion_ratio=args.misplaced_bay_exclusion_ratio,
         big_plan=large_plan,
     )
     config = ColumnGenerationConfig(
@@ -79,8 +76,8 @@ def main() -> None:
     )
     result = ColumnGenerationPlanner(inputs.problem, config).solve()
 
-    write_rows(output_dir / "area_bay_summary.csv", result.area_bay_rows)
-    write_rows(output_dir / "export_row_plan.csv", result.small_rows)
+    write_rows(output_dir / "bay_summary.csv", result.bay_summary_rows)
+    write_rows(output_dir / "export_row_plan.csv", result.export_rows)
     write_rows(
         output_dir / "import_capacity_reservation.csv",
         result.import_reservation_rows,
@@ -104,8 +101,8 @@ def main() -> None:
             "large_plan": str(large_plan_path),
             "planning_time": planning_time.isoformat(),
             "voyages": voyages,
-            "area_bay_summary_row_count": len(result.area_bay_rows),
-            "export_row_plan_row_count": len(result.small_rows),
+            "bay_summary_row_count": len(result.bay_summary_rows),
+            "export_row_plan_row_count": len(result.export_rows),
             "import_capacity_reservation_row_count": len(result.import_reservation_rows),
             "unplaced_row_count": len(result.unplaced_rows),
             "unplaced_boxes": result.diagnostics.get("unplaced_boxes"),
@@ -113,7 +110,7 @@ def main() -> None:
             "master_status": result.diagnostics.get("master_status"),
         },
     )
-    print(f"area_bay_summary: {output_dir / 'area_bay_summary.csv'}")
+    print(f"bay_summary: {output_dir / 'bay_summary.csv'}")
     print(f"export_row_plan: {output_dir / 'export_row_plan.csv'}")
     print(f"unplaced_boxes: {output_dir / 'unplaced_boxes.csv'}")
     print(f"import_capacity_reservation: {output_dir / 'import_capacity_reservation.csv'}")

@@ -4,7 +4,7 @@ import csv
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from block_bay_planning.models import EXPORT_VOYAGE_ROW_NO_MIX_ATTR, ProblemData
+from .models import EXPORT_VOYAGE_ROW_NO_MIX_ATTR, ProblemData
 
 
 def _read_rows(path: str | Path) -> list[dict[str, str]]:
@@ -27,7 +27,7 @@ def validate_output_files(
     import_rows = _read_rows(import_reservation_path)
     errors: list[str] = []
 
-    demand = {group.group_id: int(group.demand) for group in problem.small_groups}
+    demand = {group.group_id: int(group.demand) for group in problem.export_groups}
     assigned: Counter[str] = Counter()
     unplaced: Counter[str] = Counter()
     bay_load: Counter[str] = Counter()

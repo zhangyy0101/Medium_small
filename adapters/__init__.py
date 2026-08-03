@@ -1,1 +1,1 @@
-"""Input adapters required by the standalone medium/small planner."""
+"""Input adapters for the yard-planning model."""

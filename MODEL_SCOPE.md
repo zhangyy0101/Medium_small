@@ -151,7 +151,7 @@ criterion.
 - reefer, dangerous, over-limit, and other special-container rules;
 - manual required/allowed/blocked area or bay overrides;
 - E-area naming rules;
-- six-bay-block objective terms;
+- fixed multi-bay planning blocks;
 - coarse/fine group-specific dispersion and balancing terms;
 - bay-count dispersion (replaced by row-count dispersion);
 - fixed maximum run length for consecutive 20 ft bays;
