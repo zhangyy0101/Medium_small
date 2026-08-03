@@ -21,6 +21,8 @@ python -X utf8 -B run_yard_plan.py --run-name example_full
 
 求解器固定使用 Gurobi；初始化、受限主问题、定价和最终整数主问题中的任何失败都会直接报错，不存在备用贪心求解路径。
 
+堆场快照预处理采用必要列的批量对象数组、单次容器索引和属性状态去重，不再按箱号或贝位反复切分完整 DataFrame。每次运行都会输出 `runtime_breakdown_seconds`，分别记录 JSON 读取、大计划读取、输入预处理、规划器初始化和优化求解耗时。
+
 主要输出：
 
 - `export_row_plan.csv`：出口资料箱排级分配结果；
@@ -29,5 +31,5 @@ python -X utf8 -B run_yard_plan.py --run-name example_full
 - `declared_export_demand.csv`：出口资料箱需求；
 - `unplaced_boxes.csv`：未分配量；
 - `generated_columns.csv`：定价过程中实际生成的排级单位流列；
-- `diagnostics.json`、`run_summary.json`：求解状态和独立一致性验证结果。
+- `diagnostics.json`、`run_summary.json`：求解状态、独立一致性验证结果，以及 JSON 读取、输入预处理、规划器初始化和优化求解的分段耗时。
 - `output_validation.json`：仅根据模型输入和写出的 CSV，重新检查箱组身份、排级足迹、箱区功能、需求、容量、全部配置化不混属性、进口预留及 45 英尺规则。

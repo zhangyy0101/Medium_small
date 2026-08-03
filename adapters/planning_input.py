@@ -25,12 +25,18 @@ def date_key(value: str) -> str:
 
 
 def normalize_code(value: Any) -> str:
-    if value is None or pd.isna(value):
+    if value is None:
         return ""
-    text = str(value).strip().upper()
+    if isinstance(value, str):
+        text = value.strip().upper()
+    else:
+        if pd.isna(value):
+            return ""
+        text = str(value).strip().upper()
     if not text or text == "NAN":
         return ""
-    if re.fullmatch(r"\d+\.0", text):
+    integer_part = text[:-2] if text.endswith(".0") else ""
+    if integer_part and integer_part.isdecimal():
         text = text[:-2]
     return text
 
@@ -548,59 +554,67 @@ def existing_operational_group_loads(
     if "IYC_INYTM" in occupied.columns:
         in_time = pd.to_datetime(occupied["IYC_INYTM"], errors="coerce")
         occupied = occupied.loc[in_time.isna() | (in_time <= pd.Timestamp(planning_time))]
-    occupied = active_yard_rows(occupied)
-    if occupied.empty:
-        return area_load, bay_load
-
-    occupied["_area"] = occupied.get("YAA_AREANO", pd.Series(index=occupied.index, dtype=object)).map(normalize_code)
-    occupied["_bay_no"] = occupied.get("YBY_BAYNO", pd.Series(index=occupied.index, dtype=object)).map(normalize_bay)
-    occupied["_bay_key"] = occupied["_area"] + "|" + occupied["_bay_no"]
-    occupied = occupied.loc[occupied["_bay_key"].isin(valid_bay_keys)].copy()
-    if occupied.empty:
-        return area_load, bay_load
-
-    occupied["_container_key"] = [container_identity(row, index) for index, row in occupied.iterrows()]
-    voyage_columns = []
-    if "IYC_EVOY_ID" in occupied.columns:
-        voyage_columns.append("IYC_EVOY_ID")
-    if "IYC_IVOY_ID" in occupied.columns:
-        voyage_columns.append("IYC_IVOY_ID")
     seen_voyage_containers: set[tuple[str, str]] = set()
     seen_anchor_containers: set[tuple[tuple[str, ...], str]] = set()
     export_voyages = classified_export_voyages(input_guandong)
-    for voyage_column in voyage_columns:
-        work = occupied.copy()
-        work["_voyage"] = work[voyage_column].map(normalize_voyage)
-        work = work.loc[work["_voyage"].isin(target_voyages)].copy()
-        if work.empty:
+    base_columns = {
+        "YAA_AREANO",
+        "YBY_BAYNO",
+        "IYC_CNTRNO",
+        "IYC_CNTRID",
+        "IYC_EVOY_ID",
+        "IYC_IVOY_ID",
+        "IYC_STS_CSTATUSCD",
+        "IYC_CSZ_CSIZECD",
+        "IYC_POT_UNLDPORT",
+        *attribute_rules.group_attributes,
+    }
+    values = {
+        column: _object_column(occupied, column)
+        for column in base_columns
+    }
+    indices = occupied.index.to_numpy(dtype=object, copy=False)
+    for position in range(len(occupied)):
+        area_no = normalize_code(values["YAA_AREANO"][position])
+        bay_no = normalize_bay(values["YBY_BAYNO"][position])
+        bay_key = f"{area_no}|{bay_no}"
+        if bay_key not in valid_bay_keys:
             continue
-        keep_mask = []
-        for voyage_id, container_key in zip(work["_voyage"], work["_container_key"]):
+        export_voyage = normalize_voyage(values["IYC_EVOY_ID"][position])
+        import_voyage = normalize_voyage(values["IYC_IVOY_ID"][position])
+        if export_voyage and import_voyage:
+            continue
+        number = normalize_code(values["IYC_CNTRNO"][position])
+        container_id = normalize_code(values["IYC_CNTRID"][position])
+        if number:
+            container_key = f"NO:{number}"
+        elif container_id and container_id not in {"-1", "0"}:
+            container_key = f"ID:{container_id}"
+        else:
+            container_key = f"ROW:{indices[position]}"
+        for voyage_id in (export_voyage, import_voyage):
+            if not voyage_id or voyage_id not in target_voyages:
+                continue
             key = (str(voyage_id), str(container_key))
-            keep = key not in seen_voyage_containers
-            keep_mask.append(keep)
-            if keep:
-                seen_voyage_containers.add(key)
-        work = work.loc[keep_mask].copy()
-        if work.empty:
-            continue
-        for row in work.to_dict("records"):
-            voyage_id = str(row.get("_voyage", ""))
-            flow = normalize_planning_flow(row.get("IYC_STS_CSTATUSCD"), default="OF")
-            size = normalize_container_size(row.get("IYC_CSZ_CSIZECD"))
-            port = normalize_text(row.get("IYC_POT_UNLDPORT"), "UNK")
-            record = normalized_doc_record(row, flow, size, port)
-            record["IYC_EVOY_ID"] = normalize_voyage(row.get("IYC_EVOY_ID"))
-            record["IYC_IVOY_ID"] = normalize_voyage(row.get("IYC_IVOY_ID"))
+            if key in seen_voyage_containers:
+                continue
+            seen_voyage_containers.add(key)
+            record = {
+                column: column_values[position]
+                for column, column_values in values.items()
+            }
+            flow = normalize_planning_flow(record.get("IYC_STS_CSTATUSCD"), default="OF")
+            size = normalize_container_size(record.get("IYC_CSZ_CSIZECD"))
+            port = normalize_text(record.get("IYC_POT_UNLDPORT"), "UNK")
+            record = normalized_doc_record(record, flow, size, port)
+            record["IYC_EVOY_ID"] = export_voyage
+            record["IYC_IVOY_ID"] = import_voyage
             group_key = configured_operational_group_key(record, voyage_id, attribute_rules, export_voyages)
-            container_key = str(row.get("_container_key", ""))
             anchor_container_key = (group_key, container_key)
             if container_key and anchor_container_key in seen_anchor_containers:
                 continue
             if container_key:
                 seen_anchor_containers.add(anchor_container_key)
-            area_no = str(row.get("_area", ""))
-            bay_key = str(row.get("_bay_key", ""))
             if not area_no or not bay_key:
                 continue
             area_load[group_key + (area_no,)] += 1
@@ -946,6 +960,17 @@ def available_empty_slots(frame: pd.DataFrame) -> pd.DataFrame:
     return frame[frame["HAS_CONTAINER"].fillna(0).astype(int).eq(0)].copy()
 
 
+def _object_column(
+    frame: pd.DataFrame,
+    column: str,
+    default: object = None,
+) -> Sequence[object]:
+    """Return one column as Python objects without row-wise DataFrame slicing."""
+    if column not in frame.columns:
+        return [default] * len(frame)
+    return frame[column].to_numpy(dtype=object, copy=False)
+
+
 def slot_identity(row: Mapping[str, Any], area_no: str | None = None, bay_no: str | None = None) -> tuple[str, str, str, str, str]:
     return (
         normalize_code(area_no if area_no is not None else row.get("YAA_AREANO")),
@@ -1032,45 +1057,72 @@ def existing_large_pair_members_by_bay(
     bay_set_by_area: defaultdict[str, set[str]] = defaultdict(set)
     if frame.empty:
         return {}
-    for row in frame[["YAA_AREANO", "YBY_BAYNO"]].drop_duplicates().to_dict("records"):
-        area_no = normalize_code(row.get("YAA_AREANO"))
-        bay_no = normalize_bay(row.get("YBY_BAYNO"))
+    unique_bays = frame[["YAA_AREANO", "YBY_BAYNO"]].drop_duplicates()
+    for raw_area, raw_bay in unique_bays.to_numpy(dtype=object, copy=False):
+        area_no = normalize_code(raw_area)
+        bay_no = normalize_bay(raw_bay)
         if area_no and bay_no:
             bay_set_by_area[area_no].add(bay_no)
     occupied = active_occupied(frame)
     out: defaultdict[tuple[str, str], set[frozenset[str]]] = defaultdict(set)
     if occupied.empty:
         return {}
-    occupied = occupied.copy()
-    occupied["_area_no"] = occupied.get("YAA_AREANO", pd.Series(index=occupied.index, dtype=object)).map(normalize_code)
-    occupied["_bay_no"] = occupied.get("YBY_BAYNO", pd.Series(index=occupied.index, dtype=object)).map(normalize_bay)
-    occupied["_size"] = occupied.get("IYC_CSZ_CSIZECD", pd.Series(index=occupied.index, dtype=object)).map(normalize_container_size)
-    occupied["_cntr_id"] = occupied.get("IYC_CNTRID", pd.Series(index=occupied.index, dtype=object)).map(normalize_code)
-    large_occupied = occupied[occupied["_size"].isin({"40", "45"})].copy()
-    resolved_indices: set[int] = set()
-    valid_container_rows = large_occupied[
-        large_occupied["_cntr_id"].notna()
-        & large_occupied["_cntr_id"].astype(str).ne("")
-        & large_occupied["_cntr_id"].astype(str).ne("-1")
+    pair_columns = [
+        column
+        for column in (
+            "YAA_AREANO",
+            "YBY_BAYNO",
+            "IYC_CSZ_CSIZECD",
+            "IYC_CNTRID",
+            "YBY_ENABLECSIZECD",
+        )
+        if column in occupied.columns
     ]
-    for (_area_no, _cntr_id), group in valid_container_rows.groupby(["_area_no", "_cntr_id"], sort=False):
-        area_no = normalize_code(_area_no)
-        bay_nos = {normalize_bay(value) for value in group["_bay_no"] if normalize_bay(value)}
+    occupied = occupied.loc[:, pair_columns].drop_duplicates()
+    large_rows: list[tuple[str, str, str, object]] = []
+    bays_by_container: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+    for raw_area, raw_bay, raw_size, raw_container_id, raw_enable_sizes in zip(
+        _object_column(occupied, "YAA_AREANO"),
+        _object_column(occupied, "YBY_BAYNO"),
+        _object_column(occupied, "IYC_CSZ_CSIZECD"),
+        _object_column(occupied, "IYC_CNTRID"),
+        _object_column(occupied, "YBY_ENABLECSIZECD"),
+    ):
+        size = normalize_container_size(raw_size)
+        if size not in {"40", "45"}:
+            continue
+        area_no = normalize_code(raw_area)
+        bay_no = normalize_bay(raw_bay)
+        container_id = normalize_code(raw_container_id)
+        large_rows.append((area_no, bay_no, container_id, raw_enable_sizes))
+        if container_id not in {"", "-1"}:
+            bays_by_container[(area_no, container_id)].add(bay_no)
+
+    resolved_containers: set[tuple[str, str]] = set()
+    for container_key, bay_nos in bays_by_container.items():
+        if len(bay_nos) < 2:
+            continue
+        area_no, _container_id = container_key
         actual_pairs = consecutive_large_pairs_from_bays(area_no, bay_nos)
         if not actual_pairs:
             continue
-        resolved_indices.update(int(idx) for idx in group.index)
+        resolved_containers.add(container_key)
         for pair in actual_pairs:
             _area_no, left, right = pair
             pair_members = frozenset((left, right))
             out[(_area_no, left)].add(pair_members)
             out[(_area_no, right)].add(pair_members)
-    unresolved_large = large_occupied.loc[[idx not in resolved_indices for idx in large_occupied.index]]
-    for row in unresolved_large.to_dict("records"):
-        size = normalize_container_size(row.get("IYC_CSZ_CSIZECD"))
-        if size not in {"40", "45"}:
+    for area_no, bay_no, container_id, raw_enable_sizes in large_rows:
+        if container_id not in {"", "-1"} and (area_no, container_id) in resolved_containers:
             continue
-        pair = infer_large_pair_for_slot(row, bay_set_by_area)
+        pair = infer_large_pair_for_slot(
+            {
+                "YAA_AREANO": area_no,
+                "YBY_BAYNO": bay_no,
+                "YBY_ENABLECSIZECD": raw_enable_sizes,
+            },
+            bay_set_by_area,
+        )
         if pair is None:
             continue
         area_no, left, right = pair
@@ -1108,22 +1160,32 @@ def active_large_container_shadow_slots(
         return set()
     existing_large_pairs_by_member = existing_large_pairs_by_member or {}
     out: set[tuple[str, str, str, str, str]] = set()
-    for row in occupied.to_dict("records"):
-        size = normalize_container_size(row.get("IYC_CSZ_CSIZECD"))
+    for raw_area, raw_bay, raw_row, raw_tier, raw_slot, raw_size in zip(
+        _object_column(occupied, "YAA_AREANO"),
+        _object_column(occupied, "YBY_BAYNO"),
+        _object_column(occupied, "YST_ROWNO"),
+        _object_column(occupied, "YST_TIERNO"),
+        _object_column(occupied, "YST_SLOTNO"),
+        _object_column(occupied, "IYC_CSZ_CSIZECD"),
+    ):
+        size = normalize_container_size(raw_size)
         if size not in {"40", "45"}:
             continue
-        area_no = normalize_code(row.get("YAA_AREANO"))
-        bay_no = normalize_bay(row.get("YBY_BAYNO"))
+        area_no = normalize_code(raw_area)
+        bay_no = normalize_bay(raw_bay)
+        row_no = normalize_row(raw_row)
+        tier_no = normalize_row(raw_tier)
+        slot_no = normalize_row(raw_slot)
         pair_sets = existing_large_pairs_by_member.get((area_no, bay_no), set())
         if pair_sets:
             for pair in pair_sets:
                 for partner_bay in pair:
                     if partner_bay != bay_no:
-                        out.add(slot_identity(row, area_no=area_no, bay_no=partner_bay))
+                        out.add((area_no, partner_bay, row_no, tier_no, slot_no))
             continue
         partner_bay = large_bay_partner_by_bay.get((area_no, bay_no))
         if partner_bay:
-            out.add(slot_identity(row, area_no=area_no, bay_no=partner_bay))
+            out.add((area_no, partner_bay, row_no, tier_no, slot_no))
     return out
 
 
@@ -1237,17 +1299,54 @@ def existing_bay_attributes(
                     dynamic_attrs.append(name)
     large_bay_partner_by_bay = large_bay_partner_by_bay or {}
     existing_large_pairs_by_member = existing_large_pairs_by_member or {}
-    for row in occupied.to_dict("records"):
-        area_no = normalize_code(row.get("YAA_AREANO"))
-        bay_no = normalize_bay(row.get("YBY_BAYNO"))
-        size = normalize_container_size(row.get("IYC_CSZ_CSIZECD"))
+    state_columns = [
+        column
+        for column in dict.fromkeys(
+            (
+                "YAA_AREANO",
+                "YBY_BAYNO",
+                "IYC_CSZ_CSIZECD",
+                "IYC_CHEIGHTCD",
+                "IYC_POT_UNLDPORT",
+                "YST_ROWNO",
+                "IYC_EVOY_ID",
+                "IYC_IVOY_ID",
+                *dynamic_attrs,
+            )
+        )
+        if column in occupied.columns
+    ]
+    occupied = occupied.loc[:, state_columns].drop_duplicates()
+    area_values = _object_column(occupied, "YAA_AREANO")
+    bay_values = _object_column(occupied, "YBY_BAYNO")
+    size_values = _object_column(occupied, "IYC_CSZ_CSIZECD")
+    height_values = _object_column(occupied, "IYC_CHEIGHTCD")
+    port_values = _object_column(occupied, "IYC_POT_UNLDPORT")
+    row_values = _object_column(occupied, "YST_ROWNO")
+    export_voyages = _object_column(occupied, "IYC_EVOY_ID")
+    import_voyages = _object_column(occupied, "IYC_IVOY_ID")
+    dynamic_values = {
+        attr: _object_column(occupied, attr)
+        for attr in dynamic_attrs
+    }
+    for position in range(len(occupied)):
+        area_no = normalize_code(area_values[position])
+        bay_no = normalize_bay(bay_values[position])
+        size = normalize_container_size(size_values[position])
         row_voyages = {
             voyage
             for voyage in (
-                normalize_voyage(row.get("IYC_EVOY_ID")),
-                normalize_voyage(row.get("IYC_IVOY_ID")),
+                normalize_voyage(export_voyages[position]),
+                normalize_voyage(import_voyages[position]),
             )
             if voyage
+        }
+        height = normalize_text(height_values[position], "UNK")
+        port = normalize_text(port_values[position])
+        row_no = normalize_row(row_values[position])
+        normalized_dynamic_values = {
+            attr: raw_attribute_text(dynamic_values[attr][position])
+            for attr in dynamic_attrs
         }
         target_keys = [(area_no, bay_no)]
         if size in {"40", "45"}:
@@ -1275,16 +1374,14 @@ def existing_bay_attributes(
                 },
             )
             attrs["sizes"].add(size)
-            attrs["heights"].add(normalize_text(row.get("IYC_CHEIGHTCD"), "UNK"))
-            port = normalize_text(row.get("IYC_POT_UNLDPORT"))
-            row_no = normalize_row(row.get("YST_ROWNO"))
+            attrs["heights"].add(height)
             if port and row_no:
                 attrs["ports_by_row"].setdefault(row_no, set()).add(port)
             row_attrs = attrs["attributes_by_row"].setdefault(row_no, {}) if row_no else {}
             if row_no and row_voyages:
                 row_attrs.setdefault(EXPORT_VOYAGE_ROW_NO_MIX_ATTR, set()).update(row_voyages)
             for attr in dynamic_attrs:
-                value = dynamic_attribute_value(row, attr)
+                value = normalized_dynamic_values[attr]
                 if value:
                     if is_size_no_mix_attribute(attr):
                         attrs["attributes"].setdefault(attr, set()).add(value)

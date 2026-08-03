@@ -5,6 +5,7 @@ import os
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
+from time import perf_counter
 
 import pandas as pd
 
@@ -42,11 +43,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+    runtime_start = perf_counter()
     args = parse_args()
     input_path = args.input.resolve()
     large_plan_path = args.large_plan.resolve()
+    stage_start = perf_counter()
     adapter = InputAdapterGd.load_from_json(str(input_path))
+    input_json_seconds = perf_counter() - stage_start
+    stage_start = perf_counter()
     large_plan = pd.read_csv(large_plan_path)
+    large_plan_csv_seconds = perf_counter() - stage_start
     voyages = resolve_voyages(large_plan, args.voyages)
     planning_time = pd.Timestamp(args.planning_time if args.planning_time else adapter.planning_time)
     if pd.isna(planning_time):
@@ -58,19 +64,35 @@ def main() -> None:
     print(f"voyages ({len(voyages)}): {voyages}")
     print(f"output: {output_dir}")
 
+    stage_start = perf_counter()
     inputs = load_planning_inputs(
         adapter,
         planning_time=planning_time.to_pydatetime(),
         voyages=voyages,
         big_plan=large_plan,
     )
+    planning_input_seconds = perf_counter() - stage_start
     config = ColumnGenerationConfig(
         total_time_limit=args.total_time_limit,
         mip_time_limit=args.mip_time_limit,
         mip_gap=args.mip_gap,
         verbose=not args.quiet,
     )
-    result = ColumnGenerationPlanner(inputs.problem, config).solve()
+    stage_start = perf_counter()
+    planner = ColumnGenerationPlanner(inputs.problem, config)
+    planner_initialization_seconds = perf_counter() - stage_start
+    stage_start = perf_counter()
+    result = planner.solve()
+    optimization_seconds = perf_counter() - stage_start
+    runtime_breakdown = {
+        "input_json": round(input_json_seconds, 3),
+        "large_plan_csv": round(large_plan_csv_seconds, 3),
+        "planning_input_preparation": round(planning_input_seconds, 3),
+        "planner_initialization": round(planner_initialization_seconds, 3),
+        "optimization": round(optimization_seconds, 3),
+        "through_optimization_total": round(perf_counter() - runtime_start, 3),
+    }
+    result.diagnostics["runtime_breakdown_seconds"] = runtime_breakdown
 
     write_rows(output_dir / "bay_summary.csv", result.bay_summary_rows)
     write_rows(output_dir / "export_row_plan.csv", result.export_rows)
@@ -104,8 +126,10 @@ def main() -> None:
             "unplaced_boxes": result.diagnostics.get("unplaced_boxes"),
             "algorithm": result.diagnostics.get("algorithm"),
             "master_status": result.diagnostics.get("master_status"),
+            "runtime_breakdown_seconds": runtime_breakdown,
         },
     )
+    print(f"runtime_seconds: {runtime_breakdown}")
     print(f"bay_summary: {output_dir / 'bay_summary.csv'}")
     print(f"export_row_plan: {output_dir / 'export_row_plan.csv'}")
     print(f"unplaced_boxes: {output_dir / 'unplaced_boxes.csv'}")
