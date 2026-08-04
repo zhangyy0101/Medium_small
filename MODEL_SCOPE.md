@@ -126,12 +126,16 @@ creates one shortage and one excess in the L1 vector. For each voyage, berth
 distance is mapped from its closest and farthest compatible areas to `[0,1]`
 and then averaged by declared quantity.
 
-The baseline empirical weights are 0.240 for area dispersion, 0.205 for row
-dispersion, 0.157 for incumbent-group proximity, 0.265 for big-plan guidance,
-and 0.133 for berth distance. They sum to one. The first three terms jointly
-receive 0.602, expressing the policy order concentration and layout continuity
-> big-plan inheritance > travel efficiency. The weights therefore express
-policy preference only, rather than compensate for incompatible raw units.
+The baseline empirical weights are 0.290 for area dispersion, 0.240 for row
+dispersion, 0.070 for incumbent-group proximity, 0.270 for big-plan guidance,
+and 0.130 for berth distance. They sum to one. The first three terms jointly
+receive 0.600, expressing the policy order concentration and layout continuity
+> big-plan inheritance > travel efficiency. The weights were calibrated using
+the realized normalized component contributions and the coverage of reachable
+incumbent anchors. In particular, proximity is not allowed to dominate the
+objective when it applies to only a small share of declared demand. They are
+not inverse-value multipliers fitted to one solution, so good performance on a
+component does not mechanically reduce its policy importance.
 
 The stage-2 integer solution is the final reported allocation. There is no
 post-solve intra-area row relayout or separate heuristic objective; row-level

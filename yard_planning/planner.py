@@ -157,12 +157,14 @@ class ColumnGenerationConfig:
     complete_integer_verification_max_columns: int = 10_000
     verbose: bool = True
     # Stage-2 policy weights. Every component is first mapped to a natural
-    # dimensionless scale, so these values express policy preference only.
-    area_dispersion_weight: float = 0.240
-    row_dispersion_weight: float = 0.205
-    existing_group_proximity_weight: float = 0.157
-    area_guidance_weight: float = 0.265
-    berth_distance_weight: float = 0.133
+    # dimensionless scale. The baseline is calibrated against realized
+    # component contributions and reachable-anchor coverage, while retaining
+    # the declared policy hierarchy.
+    area_dispersion_weight: float = 0.290
+    row_dispersion_weight: float = 0.240
+    existing_group_proximity_weight: float = 0.070
+    area_guidance_weight: float = 0.270
+    berth_distance_weight: float = 0.130
 
 
 @dataclass

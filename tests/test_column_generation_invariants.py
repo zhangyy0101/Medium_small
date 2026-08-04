@@ -151,9 +151,15 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             config.area_guidance_weight,
             config.berth_distance_weight,
         ]
+        self.assertEqual([0.290, 0.240, 0.070, 0.270, 0.130], weights)
         self.assertAlmostEqual(1.0, sum(weights))
         self.assertGreater(concentration, config.area_guidance_weight)
         self.assertGreater(config.area_guidance_weight, config.berth_distance_weight)
+        self.assertGreater(config.area_dispersion_weight, config.row_dispersion_weight)
+        self.assertGreater(
+            config.row_dispersion_weight,
+            config.existing_group_proximity_weight,
+        )
 
     def test_45ft_is_edge_only_without_excluding_other_sizes(self) -> None:
         planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
