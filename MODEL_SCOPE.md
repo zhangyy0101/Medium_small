@@ -93,13 +93,24 @@ layout while retaining the shared yard interactions in the master.
 
 The initial restricted master contains one all-unplaced artificial pattern per
 group. Early pricing rounds use stabilized duals and several deterministic
-constructive heuristics to populate the master cheaply. Subsequent pricing
-solves an exact integer pricing MIP for every group. Negative-reduced-cost patterns
-enter in an adaptive group-wise batch, and new variables are inserted into a
-persistent Gurobi master so its LP basis is retained. At configured intervals,
-all pricing MIPs are solved against the raw master duals. The sum of the
-negative group-wise minimum reduced costs corrects the restricted-master value
-into a valid lower bound for the full implicit pattern LP.
+constructive heuristics to populate the master cheaply. One pricing MIP is then
+built and retained for each group; later solves update only its objective and
+reuse the preceding incumbent as a MIP start. Non-certificate rounds apply a
+short selective solve only to groups that remain active according to cached
+negative patterns or their preceding pricing incumbent. Historical pricing
+patterns are re-evaluated under every new dual vector. Negative-reduced-cost
+patterns enter in an adaptive group-wise batch, and new variables are inserted
+into a persistent Gurobi master so its LP basis is retained.
+
+At configured certificate rounds, pricing uses the raw master duals and covers
+every group. If a group pricing MIP is optimal, its minimum reduced cost is
+known exactly. If it reaches its certificate time limit, Gurobi's valid
+objective lower bound is used instead; this may weaken but cannot invalidate
+the full-pattern LP lower bound. The sum of the negative group-wise reduced-cost
+lower bounds corrects the restricted-master value into a valid lower bound for
+the full implicit pattern LP. Incumbent reduced costs, pricing optimality, and
+time-limit counts are reported separately, so a bound certificate is never
+misreported as exact pricing.
 
 The model is solved in two lexicographic stages. Stage 1
 minimizes the number of unplaced declared containers. Stage 2 fixes that
@@ -139,11 +150,13 @@ not inverse-value multipliers fitted to one solution, so good performance on a
 component does not mechanically reduce its policy importance.
 
 After column generation, an integer pattern master supplies the first feasible
-integer allocation. A final fix-and-optimize model collects only the row
-locations encountered in generated patterns and recombines their integer
-quantities under the same constraints and objective. It may improve the
-integer incumbent but introduces neither a different business objective nor a
-free post-solve relayout.
+integer allocation. A final fix-and-optimize model enriches its row-location
+pool with locations from all generated master patterns, cached pricing
+patterns, and feasible group-area neighborhoods supported by the final
+fractional pattern solution, the integer incumbent, or the latest raw-dual
+negative-reduced-cost patterns. It recombines integer quantities under the same
+constraints and objective. It may improve the integer incumbent but introduces
+neither a different business objective nor a free post-solve relayout.
 
 The stage-1 optimum for total unplaced demand is imposed as an equality in
 every stage-2 restricted master. Consequently, stage-2 unplaced variables have
@@ -157,14 +170,14 @@ capacity.
 
 Stage 1 stops immediately at zero unplaced boxes because its nonnegative
 objective then proves optimality. In stage 2, the default stopping condition is
-a certified full-pattern LP gap of at most `0.5%`; setting
-`pattern_lp_gap_tolerance` to zero requires no negative-reduced-cost pattern.
-The code reports the restricted-master value, corrected full-pattern LP lower
-bound, certified LP gap, integer-master MIP gap, and the valid gap between the
-final integer incumbent and that LP lower bound separately. Exact group pricing
-is mandatory for every certificate; a pricing time limit cannot silently be
-treated as proof. The method is column generation plus integer recovery, not
-branch-and-price, so it makes no full integer-optimality claim.
+a certified full-pattern relative LP gap of at most `0.5%`, calculated as the
+restricted-master upper bound minus the corrected lower bound, divided by the
+absolute restricted-master upper bound. Setting `pattern_lp_gap_tolerance` to
+zero requires a lower-bound certificate with no negative reduced cost. The code
+reports the absolute and relative pattern-LP gaps, integer-master MIP gap, and
+the valid absolute and relative gaps between the final integer incumbent and
+that LP lower bound separately. The method is column generation plus integer
+recovery, not branch-and-price, so it makes no full integer-optimality claim.
 
 The import variables are anonymous capacity reservations indexed only by flow,
 size, and bay. Their totals equal the corresponding import `new_qty`. Their

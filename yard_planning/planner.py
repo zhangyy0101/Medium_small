@@ -153,6 +153,22 @@ class PackingPattern:
 
 
 @dataclass
+class PricingMipState:
+    """Persistent exact-pricing model and its reusable incumbent."""
+
+    group: ExportGroup
+    model: object
+    candidates: tuple[PlacementColumn, ...]
+    x: dict[int, object]
+    unplaced: object
+    placed: object
+    area_use: dict[str, object]
+    row_use: dict[int, object]
+    last_x: dict[int, int] = field(default_factory=dict)
+    last_unplaced: int | None = None
+
+
+@dataclass
 class ColumnGenerationConfig:
     max_iterations: int = 60
     min_columns_per_group_per_iteration: int = 1
@@ -160,6 +176,7 @@ class ColumnGenerationConfig:
     adaptive_pricing_fraction: float = 0.75
     heuristic_pricing_variants: int = 12
     dual_stabilization_alpha: float = 0.65
+    selective_pricing_time_limit: float = 2.0
     exact_pricing_time_limit: float = 60.0
     pattern_lp_gap_tolerance: float = 0.005
     raw_dual_check_interval: int = 5
@@ -258,6 +275,25 @@ class ColumnGenerationPlanner:
         self._pattern_keys: set[tuple] = set()
         self._artificial_pattern_by_group: dict[str, int] = {}
         self._pricing_calls_by_phase: Counter[str] = Counter()
+        self._base_placements_by_group: dict[
+            str, tuple[PlacementColumn, ...]
+        ] = {}
+        self._pricing_mip_states: dict[str, PricingMipState] = {}
+        self._pricing_pattern_cache: defaultdict[
+            str, dict[tuple, PackingPattern]
+        ] = defaultdict(dict)
+        self._pricing_last_minimum: dict[tuple[str, str], float] = {}
+        self._last_raw_negative_patterns: defaultdict[
+            str, dict[tuple, PackingPattern]
+        ] = defaultdict(dict)
+        self._final_stage2_pattern_values: dict[int, float] = {}
+        self._pricing_model_build_seconds = 0.0
+        self._pricing_mip_solve_count = 0
+        self._pricing_mip_warm_start_count = 0
+        self._selective_pricing_mip_solve_count = 0
+        self._raw_pricing_mip_solve_count = 0
+        self._pricing_mip_optimal_count = 0
+        self._pricing_mip_time_limit_count = 0
         self._columns: list[PlacementColumn] = []
         self._column_keys: set[tuple[str, str, int, tuple[tuple[str, str, int], ...]]] = set()
         self._candidate_cache: dict[str, list[tuple[str, int, float]]] = {}
@@ -322,6 +358,8 @@ class ColumnGenerationPlanner:
             )
         if float(self.config.exact_pricing_time_limit) <= 0.0:
             raise ValueError("exact_pricing_time_limit must be positive")
+        if float(self.config.selective_pricing_time_limit) <= 0.0:
+            raise ValueError("selective_pricing_time_limit must be positive")
         lp_gap = float(self.config.pattern_lp_gap_tolerance)
         if not math.isfinite(lp_gap) or lp_gap < 0.0:
             raise ValueError("pattern_lp_gap_tolerance must be finite and nonnegative")
@@ -411,7 +449,9 @@ class ColumnGenerationPlanner:
             "initial_pattern_count": len(self._patterns),
             "base_feasible_placement_count": self._base_feasible_placement_count,
             "pattern_universe": "implicit_exponential",
-            "exact_pattern_pricing": True,
+            "raw_pricing_certificate": (
+                "all_groups_with_optimal_or_valid_gurobi_lower_bound"
+            ),
             "pricing_configuration": {
                 "persistent_restricted_master": True,
                 "lp_method": int(self.config.lp_method),
@@ -427,7 +467,10 @@ class ColumnGenerationPlanner:
                 "exact_pricing_time_limit": float(
                     self.config.exact_pricing_time_limit
                 ),
-                "pattern_lp_gap_tolerance": float(
+                "selective_pricing_time_limit": float(
+                    self.config.selective_pricing_time_limit
+                ),
+                "pattern_lp_relative_gap_tolerance": float(
                     self.config.pattern_lp_gap_tolerance
                 ),
                 "raw_dual_check_interval": int(
@@ -480,7 +523,10 @@ class ColumnGenerationPlanner:
             "big_m_tightening": self._big_m_diagnostics(),
         }
 
-        selected, unplaced, master_stats = self._solve_by_column_generation()
+        try:
+            selected, unplaced, master_stats = self._solve_by_column_generation()
+        finally:
+            self._dispose_pricing_models()
         diagnostics.update(master_stats)
 
         import_reservation_rows = self._make_import_reservation_rows()
@@ -1592,10 +1638,22 @@ class ColumnGenerationPlanner:
 
     def _initialize_pattern_generation(self) -> None:
         """Seed the master with one all-unplaced pattern for every group."""
+        self._dispose_pricing_models()
         self._patterns.clear()
         self._pattern_keys.clear()
         self._artificial_pattern_by_group.clear()
         self._pricing_calls_by_phase.clear()
+        self._pricing_pattern_cache.clear()
+        self._pricing_last_minimum.clear()
+        self._last_raw_negative_patterns.clear()
+        self._final_stage2_pattern_values.clear()
+        self._pricing_model_build_seconds = 0.0
+        self._pricing_mip_solve_count = 0
+        self._pricing_mip_warm_start_count = 0
+        self._selective_pricing_mip_solve_count = 0
+        self._raw_pricing_mip_solve_count = 0
+        self._pricing_mip_optimal_count = 0
+        self._pricing_mip_time_limit_count = 0
         self._columns.clear()
         self._column_keys.clear()
         for group in self.groups:
@@ -1603,6 +1661,14 @@ class ColumnGenerationPlanner:
                 self._make_pattern(group, (), int(group.demand))
             )
             self._artificial_pattern_by_group[group.group_id] = idx
+
+    def _dispose_pricing_models(self) -> None:
+        for state in self._pricing_mip_states.values():
+            try:
+                state.model.dispose()
+            except Exception:
+                pass
+        self._pricing_mip_states.clear()
 
     def _make_pattern(
         self,
@@ -1740,6 +1806,15 @@ class ColumnGenerationPlanner:
         )
 
     @staticmethod
+    def _optimality_gaps(
+        upper_bound: float,
+        lower_bound: float,
+    ) -> tuple[float, float]:
+        absolute = max(0.0, float(upper_bound) - float(lower_bound))
+        relative = absolute / max(abs(float(upper_bound)), 1e-12)
+        return absolute, relative
+
+    @staticmethod
     def _dual_value(
         duals: dict[tuple[str, object], float],
         section: str,
@@ -1825,102 +1900,155 @@ class ColumnGenerationPlanner:
         phase_name: str,
         objective_mode: str,
     ) -> tuple[dict, list[int]]:
-        """Use cheap stabilized pricing first and exact MIP pricing for proof."""
+        """Combine cached, selective stabilized, and full raw-dual pricing."""
         tolerance = max(1e-12, float(self.config.reduced_cost_tolerance))
         call_number = int(self._pricing_calls_by_phase[phase_name])
         self._pricing_calls_by_phase[phase_name] += 1
-        use_heuristic = call_number < 3
-        heuristic_by_group: dict[str, list[tuple[float, PackingPattern]]] = {
+        use_constructive = call_number < 3
+        candidate_by_group: dict[str, list[tuple[float, PackingPattern]]] = {
             group.group_id: [] for group in self.groups
         }
-        for group in self.groups if use_heuristic else ():
-            candidates: list[tuple[float, PackingPattern]] = []
+        candidate_identities: defaultdict[str, set[tuple]] = defaultdict(set)
+
+        def consider(pattern: PackingPattern) -> None:
+            identity = self._pattern_identity(pattern)
+            if (
+                identity in self._pattern_keys
+                or identity in candidate_identities[pattern.group_id]
+            ):
+                return
+            reduced = self._pattern_reduced_cost(
+                pattern, raw_duals, objective_mode
+            )
+            if reduced < -tolerance:
+                candidate_by_group[pattern.group_id].append(
+                    (reduced, pattern)
+                )
+                candidate_identities[pattern.group_id].add(identity)
+
+        for group in self.groups:
+            for pattern in self._pricing_pattern_cache[group.group_id].values():
+                consider(pattern)
+
+        for group in self.groups if use_constructive else ():
             for pattern in self._heuristic_group_patterns(
                 group, stabilized_duals, objective_mode
             ):
-                if self._pattern_identity(pattern) in self._pattern_keys:
-                    continue
-                reduced = self._pattern_reduced_cost(
-                    pattern, raw_duals, objective_mode
-                )
-                if reduced < -tolerance:
-                    candidates.append((reduced, pattern))
-            candidates.sort(
-                key=lambda item: (item[0], self._pattern_identity(item[1]))
-            )
-            heuristic_by_group[group.group_id] = candidates
+                consider(pattern)
 
-        heuristic_negative_total = sum(
-            len(values) for values in heuristic_by_group.values()
+        cached_negative_total = sum(
+            len(values) for values in candidate_by_group.values()
         )
-        # Heuristic pricing is used only to populate the first RMPs cheaply.
-        # Later iterations solve the exact pricing MIPs with stabilized duals;
-        # raw duals are used once more whenever no entering pattern is found,
-        # which is the only test accepted as the LP optimality certificate.
         run_exact_search = (
-            not use_heuristic
-            or heuristic_negative_total <= 2 * len(self.groups)
+            not use_constructive
+            or cached_negative_total <= 2 * len(self.groups)
         )
         force_raw_check = (
-            not use_heuristic
+            not use_constructive
             and (call_number - 3) % int(self.config.raw_dual_check_interval)
             == int(self.config.raw_dual_check_interval) - 1
         )
-        candidate_by_group = heuristic_by_group
         minimum_by_group: dict[str, float] = {}
-        exact_seconds = 0.0
-        exact_performed = False
+        pricing_mip_seconds = 0.0
+        raw_certificate_performed = False
+        selective_group_ids: list[str] = []
+        raw_group_ids: list[str] = []
+        pricing_optimal_by_group: dict[str, bool] = {}
+        pricing_incumbent_reduced_cost_by_group: dict[str, float] = {}
 
         def merge_exact_pool(
             pricing_duals: dict[tuple[str, object], float],
+            groups: Iterable[ExportGroup],
+            raw_certificate: bool,
         ) -> dict[str, float]:
-            nonlocal exact_seconds
+            nonlocal pricing_mip_seconds
             minima: dict[str, float] = {}
-            for group in self.groups:
+            if raw_certificate:
+                self._last_raw_negative_patterns.clear()
+            for group in groups:
                 started = perf_counter()
-                patterns, minimum = self._solve_exact_group_pricing(
-                    group, pricing_duals, objective_mode
+                (
+                    patterns,
+                    lower_bound,
+                    incumbent_reduced_cost,
+                    pricing_optimal,
+                ) = self._solve_group_pricing_mip(
+                    group,
+                    pricing_duals,
+                    objective_mode,
+                    raw_certificate,
                 )
-                exact_seconds += perf_counter() - started
-                minima[group.group_id] = minimum
-                candidates = list(candidate_by_group.get(group.group_id, []))
-                seen_identities = {
-                    self._pattern_identity(pattern)
-                    for _reduced, pattern in candidates
-                }
+                pricing_mip_seconds += perf_counter() - started
+                minima[group.group_id] = lower_bound
+                pricing_optimal_by_group[group.group_id] = pricing_optimal
+                pricing_incumbent_reduced_cost_by_group[
+                    group.group_id
+                ] = incumbent_reduced_cost
+                self._pricing_last_minimum[
+                    (phase_name, group.group_id)
+                ] = incumbent_reduced_cost
                 for pattern in patterns:
                     identity = self._pattern_identity(pattern)
-                    if identity in self._pattern_keys or identity in seen_identities:
-                        continue
                     reduced = self._pattern_reduced_cost(
                         pattern, raw_duals, objective_mode
                     )
-                    if reduced < -tolerance:
-                        candidates.append((reduced, pattern))
-                        seen_identities.add(identity)
-                candidate_by_group[group.group_id] = sorted(
-                    candidates,
-                    key=lambda item: (item[0], self._pattern_identity(item[1])),
-                )
+                    if raw_certificate and reduced < -tolerance:
+                        self._last_raw_negative_patterns[
+                            group.group_id
+                        ][identity] = pattern
+                    consider(pattern)
             return minima
 
         if run_exact_search:
-            candidate_by_group = {
-                group_id: list(values)
-                for group_id, values in heuristic_by_group.items()
-            }
-            stabilized_minima = merge_exact_pool(stabilized_duals)
-            if force_raw_check or not any(candidate_by_group.values()):
-                minimum_by_group = merge_exact_pool(raw_duals)
-                exact_performed = True
-            elif stabilized_duals == raw_duals:
-                minimum_by_group = stabilized_minima
+            if force_raw_check:
+                raw_group_ids = [group.group_id for group in self.groups]
+                minimum_by_group = merge_exact_pool(
+                    raw_duals, self.groups, True
+                )
+                raw_certificate_performed = True
+            else:
+                if call_number == 3 or use_constructive:
+                    selective_groups = list(self.groups)
+                else:
+                    selective_groups = [
+                        group
+                        for group in self.groups
+                        if candidate_by_group[group.group_id]
+                        or self._pricing_last_minimum.get(
+                            (phase_name, group.group_id), 0.0
+                        )
+                        < -tolerance
+                    ]
+                selective_group_ids = [
+                    group.group_id for group in selective_groups
+                ]
+                stabilized_minima = merge_exact_pool(
+                    stabilized_duals, selective_groups, False
+                )
+                if (
+                    len(selective_groups) == len(self.groups)
+                    and stabilized_duals == raw_duals
+                ):
+                    minimum_by_group = stabilized_minima
+                    raw_certificate_performed = True
+                    raw_group_ids = list(selective_group_ids)
+                elif not any(candidate_by_group.values()):
+                    raw_group_ids = [group.group_id for group in self.groups]
+                    minimum_by_group = merge_exact_pool(
+                        raw_duals, self.groups, True
+                    )
+                    raw_certificate_performed = True
 
         entering: list[tuple[float, PackingPattern]] = []
         negative_counts: dict[str, int] = {}
         selected_batch: dict[str, int] = {}
         for group in self.groups:
-            candidates = candidate_by_group.get(group.group_id, [])
+            candidates = sorted(
+                candidate_by_group.get(group.group_id, []),
+                key=lambda item: (
+                    item[0], self._pattern_identity(item[1])
+                ),
+            )
             batch = self._adaptive_pricing_batch_size(len(candidates))
             negative_counts[group.group_id] = len(candidates)
             selected_batch[group.group_id] = batch
@@ -1935,15 +2063,52 @@ class ColumnGenerationPlanner:
             "new_patterns": len(new_indices),
             "pricing_mode": (
                 "raw_dual_exact_group_pattern_mip"
-                if exact_performed
-                else "stabilized_exact_group_pattern_mip"
-                if run_exact_search
+                if raw_certificate_performed
+                and all(
+                    pricing_optimal_by_group.get(group_id, False)
+                    for group_id in raw_group_ids
+                )
+                else "raw_dual_bounded_group_pattern_mip"
+                if raw_certificate_performed
+                else "selective_stabilized_group_pattern_mip"
+                if selective_group_ids
                 else "stabilized_constructive_pattern_pool"
             ),
-            "exact_pricing_performed": exact_performed,
-            "exact_pricing": exact_performed,
+            "exact_pricing_performed": (
+                bool(raw_group_ids)
+                and all(
+                    pricing_optimal_by_group.get(group_id, False)
+                    for group_id in raw_group_ids
+                )
+            ),
+            "raw_pricing_certificate_available": raw_certificate_performed,
+            "selective_pricing_group_ids": selective_group_ids,
+            "raw_pricing_group_ids": raw_group_ids,
+            "selective_pricing_group_count": len(selective_group_ids),
+            "raw_pricing_group_count": len(raw_group_ids),
+            "pricing_optimal_by_group": {
+                key: value
+                for key, value in sorted(pricing_optimal_by_group.items())
+            },
+            "pricing_incumbent_reduced_cost_by_group": {
+                key: value
+                for key, value in sorted(
+                    pricing_incumbent_reduced_cost_by_group.items()
+                )
+            },
+            "raw_pricing_all_optimal": (
+                bool(raw_group_ids)
+                and all(
+                    pricing_optimal_by_group.get(group_id, False)
+                    for group_id in raw_group_ids
+                )
+            ),
             "dual_stabilization": True,
             "adaptive_batch": True,
+            "persistent_pricing_models": True,
+            "cached_pricing_pattern_count": sum(
+                len(values) for values in self._pricing_pattern_cache.values()
+            ),
             "negative_candidates_by_group": negative_counts,
             "selected_batch_by_group": selected_batch,
             "generated_pattern_count": len(self._patterns),
@@ -1955,10 +2120,10 @@ class ColumnGenerationPlanner:
             },
             "valid_lower_bound_correction": (
                 sum(min(0.0, value) for value in minimum_by_group.values())
-                if exact_performed
+                if raw_certificate_performed
                 else None
             ),
-            "exact_pricing_elapsed_seconds": round(exact_seconds, 3),
+            "pricing_mip_elapsed_seconds": round(pricing_mip_seconds, 3),
             "phase": phase_name,
         }, new_indices
 
@@ -1968,7 +2133,7 @@ class ColumnGenerationPlanner:
         duals: dict[tuple[str, object], float],
         objective_mode: str,
     ) -> list[PackingPattern]:
-        candidates = list(self._iter_feasible_base_placements(group))
+        candidates = list(self._base_placements_for_group(group))
         if not candidates:
             return []
         score_by_identity = {
@@ -2056,6 +2221,7 @@ class ColumnGenerationPlanner:
             if identity not in seen:
                 seen.add(identity)
                 patterns.append(pattern)
+                self._pricing_pattern_cache[group.group_id][identity] = pattern
         return patterns
 
     def _specific_row_remaining_capacity(
@@ -2093,23 +2259,29 @@ class ColumnGenerationPlanner:
             )
         return max(0, int(capacity))
 
-    def _solve_exact_group_pricing(
+    def _solve_group_pricing_mip(
         self,
         group: ExportGroup,
         duals: dict[tuple[str, object], float],
         objective_mode: str,
-    ) -> tuple[list[PackingPattern], float]:
+        raw_certificate: bool,
+    ) -> tuple[list[PackingPattern], float, float, bool]:
+        state = self._pricing_mip_states.get(group.group_id)
+        if state is not None:
+            return self._optimize_group_pricing_state(
+                state, duals, objective_mode, raw_certificate
+            )
+
         import gurobipy as gp
 
-        candidates = list(self._iter_feasible_base_placements(group))
+        build_started = perf_counter()
+        candidates = list(self._base_placements_for_group(group))
         model = gp.Model(f"price_{self._key_name((group.group_id,))}")
         model.Params.OutputFlag = 1 if self.config.verbose else 0
         model.Params.Seed = int(self.config.solver_seed)
         if int(self.config.solver_threads) > 0:
             model.Params.Threads = int(self.config.solver_threads)
-        model.Params.TimeLimit = float(self.config.exact_pricing_time_limit)
         model.Params.MIPGap = 0.0
-        model.Params.PoolSearchMode = 1
         model.Params.PoolSolutions = int(
             self.config.max_columns_per_group_per_iteration
         )
@@ -2216,38 +2388,105 @@ class ColumnGenerationPlanner:
             ub = max(1, int(round(x[idx].UB)))
             model.addConstr(x[idx] <= ub * use)
             model.addConstr(use <= x[idx])
+        model.update()
+        state = PricingMipState(
+            group=group,
+            model=model,
+            candidates=tuple(candidates),
+            x=x,
+            unplaced=unplaced,
+            placed=placed,
+            area_use=area_use,
+            row_use=row_use,
+        )
+        self._pricing_mip_states[group.group_id] = state
+        self._pricing_model_build_seconds += perf_counter() - build_started
+        return self._optimize_group_pricing_state(
+            state, duals, objective_mode, raw_certificate
+        )
 
+    def _optimize_group_pricing_state(
+        self,
+        state: PricingMipState,
+        duals: dict[tuple[str, object], float],
+        objective_mode: str,
+        raw_certificate: bool,
+    ) -> tuple[list[PackingPattern], float, float, bool]:
+        """Update and reoptimize one persistent exact-pricing MIP."""
+        import gurobipy as gp
+
+        group = state.group
+        model = state.model
         objective = gp.LinExpr()
         unplaced_cost = 1.0 if objective_mode == "min_unplaced" else 0.0
         unplaced_cost -= self._dual_value(
             duals, "fixed_unplaced_total", "total"
         )
-        objective += unplaced_cost * unplaced
-        for idx, candidate in enumerate(candidates):
+        objective += unplaced_cost * state.unplaced
+        for idx, candidate in enumerate(state.candidates):
             objective += self._placement_reduced_unit_cost(
                 candidate, duals, objective_mode
-            ) * x[idx]
+            ) * state.x[idx]
         if objective_mode != "min_unplaced":
             objective += self._area_activation_penalty() * gp.quicksum(
-                area_use.values()
+                state.area_use.values()
             )
             objective += self._row_activation_penalty() * gp.quicksum(
-                row_use.values()
+                state.row_use.values()
             )
             objective -= (
                 self._area_activation_penalty()
                 + self._row_activation_penalty()
-            ) * placed
+            ) * state.placed
         model.setObjective(objective, gp.GRB.MINIMIZE)
+        model.Params.TimeLimit = float(
+            self.config.exact_pricing_time_limit
+            if raw_certificate
+            else self.config.selective_pricing_time_limit
+        )
+        model.Params.PoolSearchMode = 1 if raw_certificate else 0
+
+        if state.last_unplaced is not None:
+            positive_areas: set[str] = set()
+            for idx, var in state.x.items():
+                value = int(state.last_x.get(idx, 0))
+                var.Start = float(value)
+                state.row_use[idx].Start = float(value > 0)
+                if value > 0:
+                    positive_areas.add(state.candidates[idx].area_no)
+            state.unplaced.Start = float(state.last_unplaced)
+            state.placed.Start = float(sum(state.last_x.values()) > 0)
+            for area_no, var in state.area_use.items():
+                var.Start = float(area_no in positive_areas)
+            self._pricing_mip_warm_start_count += 1
+
         model.optimize()
-        if model.Status != gp.GRB.OPTIMAL:
-            status = int(model.Status)
-            model.dispose()
+        self._pricing_mip_solve_count += 1
+        if raw_certificate:
+            self._raw_pricing_mip_solve_count += 1
+        else:
+            self._selective_pricing_mip_solve_count += 1
+        pricing_optimal = model.Status == gp.GRB.OPTIMAL
+        if pricing_optimal:
+            self._pricing_mip_optimal_count += 1
+        elif model.Status == gp.GRB.TIME_LIMIT:
+            self._pricing_mip_time_limit_count += 1
+        if int(model.SolCount) <= 0:
             raise RuntimeError(
-                "exact packing-pattern pricing must be proven optimal: "
-                f"group={group.group_id}, status={status}"
+                "packing-pattern pricing produced no incumbent: "
+                f"group={group.group_id}, status={int(model.Status)}"
             )
-        minimum_reduced_cost = float(model.ObjVal) - self._dual_value(
+
+        state.last_x = {
+            idx: int(round(var.X))
+            for idx, var in state.x.items()
+            if int(round(var.X)) > 0
+        }
+        state.last_unplaced = int(round(state.unplaced.X))
+        incumbent_reduced_cost = float(model.ObjVal) - self._dual_value(
+            duals, "group_convexity", group.group_id
+        )
+        reduced_cost_lower_bound = float(model.ObjBound) - self._dual_value(
             duals, "group_convexity", group.group_id
         )
         patterns: list[PackingPattern] = []
@@ -2255,8 +2494,8 @@ class ColumnGenerationPlanner:
         for solution_number in range(int(model.SolCount)):
             model.Params.SolutionNumber = solution_number
             placements: list[PlacementColumn] = []
-            for idx, candidate in enumerate(candidates):
-                quantity = int(round(x[idx].Xn))
+            for idx, candidate in enumerate(state.candidates):
+                quantity = int(round(state.x[idx].Xn))
                 if quantity <= 0:
                     continue
                 placements.append(
@@ -2276,14 +2515,19 @@ class ColumnGenerationPlanner:
                     )
                 )
             pattern = self._make_pattern(
-                group, placements, int(round(unplaced.Xn))
+                group, placements, int(round(state.unplaced.Xn))
             )
             identity = self._pattern_identity(pattern)
             if identity not in seen:
                 seen.add(identity)
                 patterns.append(pattern)
-        model.dispose()
-        return patterns, minimum_reduced_cost
+                self._pricing_pattern_cache[group.group_id][identity] = pattern
+        return (
+            patterns,
+            reduced_cost_lower_bound,
+            incumbent_reduced_cost,
+            pricing_optimal,
+        )
 
     def _solve_by_column_generation(self) -> tuple[Counter[int], Counter[str], dict]:
         """Solve the two lexicographic pattern masters to a certified LP gap."""
@@ -2292,7 +2536,10 @@ class ColumnGenerationPlanner:
         pricing_start = perf_counter()
         stats: dict = {
             "gurobi_available": True,
-            "pricing_method": "stabilized_heuristic_then_exact_group_pattern_pricing",
+            "pricing_method": (
+                "cached_selective_stabilized_then_raw_certified_"
+                "group_pattern_pricing"
+            ),
             "pricing_iterations": [],
             "pricing_stop_reason": "",
             "base_feasible_placement_count": self._base_feasible_placement_count,
@@ -2302,7 +2549,7 @@ class ColumnGenerationPlanner:
             phase_name: str,
             objective_mode: str,
             fixed_unplaced_total: float | None = None,
-        ) -> tuple[float, float, float, float, str]:
+        ) -> tuple[float, float, float, float, float, str]:
             model, variables, constraints = self._build_restricted_master(
                 _GurobiModelAdapter,
                 quicksum,
@@ -2328,6 +2575,12 @@ class ColumnGenerationPlanner:
                         * self._gurobi_value(model, var)
                         for idx, var in variables["pattern"].items()
                     )
+                    if objective_mode == "full":
+                        self._final_stage2_pattern_values = {
+                            idx: self._gurobi_value(model, var)
+                            for idx, var in variables["pattern"].items()
+                            if self._gurobi_value(model, var) > 1e-8
+                        }
                     if (
                         objective_mode == "min_unplaced"
                         and last_objective <= 1e-9
@@ -2342,12 +2595,14 @@ class ColumnGenerationPlanner:
                                 "pricing_mode": "nonnegative_stage1_objective_bound",
                                 "exact_pricing_performed": False,
                                 "valid_lp_lower_bound": 0.0,
-                                "certified_lp_gap": 0.0,
+                                "certified_lp_absolute_gap": 0.0,
+                                "certified_lp_relative_gap": 0.0,
                             }
                         )
                         return (
                             last_objective,
                             last_unplaced,
+                            0.0,
                             0.0,
                             0.0,
                             "nonnegative_stage1_objective_bound",
@@ -2364,17 +2619,16 @@ class ColumnGenerationPlanner:
                     )
                     correction = pricing.get("valid_lower_bound_correction")
                     valid_lower_bound = None
-                    certified_lp_gap = None
+                    absolute_lp_gap = None
+                    relative_lp_gap = None
                     if correction is not None:
                         valid_lower_bound = float(last_objective) + float(
                             correction
                         )
                         if objective_mode == "min_unplaced":
                             valid_lower_bound = max(0.0, valid_lower_bound)
-                        certified_lp_gap = max(
-                            0.0,
-                            (float(last_objective) - valid_lower_bound)
-                            / max(abs(float(last_objective)), 1.0),
+                        absolute_lp_gap, relative_lp_gap = self._optimality_gaps(
+                            last_objective, valid_lower_bound
                         )
                     stats["pricing_iterations"].append(
                         {
@@ -2383,31 +2637,42 @@ class ColumnGenerationPlanner:
                             "lp_objective": last_objective,
                             "lp_unplaced_boxes": float(last_unplaced),
                             "valid_lp_lower_bound": valid_lower_bound,
-                            "certified_lp_gap": certified_lp_gap,
+                            "certified_lp_absolute_gap": absolute_lp_gap,
+                            "certified_lp_relative_gap": relative_lp_gap,
                             **pricing,
                         }
                     )
                     if (
-                        certified_lp_gap is not None
-                        and certified_lp_gap
+                        relative_lp_gap is not None
+                        and relative_lp_gap
                         <= float(self.config.pattern_lp_gap_tolerance)
                     ):
                         return (
                             last_objective,
                             last_unplaced,
                             float(valid_lower_bound),
-                            float(certified_lp_gap),
-                            "certified_pattern_lp_gap",
+                            float(absolute_lp_gap),
+                            float(relative_lp_gap),
+                            "certified_pattern_relative_lp_gap",
                         )
                     if not new_indices:
-                        if not pricing["exact_pricing_performed"]:
+                        if not pricing["raw_pricing_certificate_available"]:
                             raise RuntimeError(
-                                "pattern pricing stopped without an exact certificate"
+                                "pattern pricing stopped without a raw-dual certificate"
+                            )
+                        if float(correction or 0.0) < -max(
+                            1e-12, float(self.config.reduced_cost_tolerance)
+                        ):
+                            raise RuntimeError(
+                                "raw-dual pricing has a negative lower bound but "
+                                "produced no entering pattern; increase the exact "
+                                "pricing time limit"
                             )
                         return (
                             last_objective,
                             last_unplaced,
                             float(last_objective),
+                            0.0,
                             0.0,
                             "no_negative_reduced_cost_pattern",
                         )
@@ -2430,7 +2695,8 @@ class ColumnGenerationPlanner:
             _phase1_objective,
             phase1_unplaced,
             _phase1_lower_bound,
-            _phase1_gap,
+            _phase1_absolute_gap,
+            _phase1_relative_gap,
             phase1_stop_reason,
         ) = run_phase(
             "minimum_unplaced", "min_unplaced"
@@ -2445,7 +2711,8 @@ class ColumnGenerationPlanner:
             phase2_rmp_objective,
             phase2_unplaced,
             phase2_lower_bound,
-            phase2_lp_gap,
+            phase2_absolute_lp_gap,
+            phase2_relative_lp_gap,
             phase2_stop_reason,
         ) = run_phase(
             "secondary_objective",
@@ -2463,7 +2730,28 @@ class ColumnGenerationPlanner:
                 "pricing_phase1_lp_unplaced_boxes": phase1_unplaced,
                 "pricing_phase2_rmp_objective": phase2_rmp_objective,
                 "pricing_phase2_lp_lower_bound": phase2_lower_bound,
-                "pricing_phase2_certified_gap": phase2_lp_gap,
+                "pricing_phase2_absolute_gap": phase2_absolute_lp_gap,
+                "pricing_phase2_relative_gap": phase2_relative_lp_gap,
+                "pricing_model_build_seconds": round(
+                    self._pricing_model_build_seconds, 3
+                ),
+                "persistent_pricing_model_count": len(
+                    self._pricing_mip_states
+                ),
+                "pricing_mip_solve_count": self._pricing_mip_solve_count,
+                "pricing_mip_warm_start_count": (
+                    self._pricing_mip_warm_start_count
+                ),
+                "selective_pricing_mip_solve_count": (
+                    self._selective_pricing_mip_solve_count
+                ),
+                "raw_pricing_mip_solve_count": (
+                    self._raw_pricing_mip_solve_count
+                ),
+                "pricing_mip_optimal_count": self._pricing_mip_optimal_count,
+                "pricing_mip_time_limit_count": (
+                    self._pricing_mip_time_limit_count
+                ),
                 "pattern_generation_pricing_elapsed_seconds": round(
                     perf_counter() - pricing_start, 3
                 ),
@@ -2516,13 +2804,12 @@ class ColumnGenerationPlanner:
                 f"before={pattern_integer_objective}, after={final_objective}"
             )
         final_unplaced = int(sum(unplaced.values()))
-        lp_gap: float | None = None
+        lp_absolute_gap: float | None = None
+        lp_relative_gap: float | None = None
         gap_reason = "available"
         if abs(phase1_unplaced - final_unplaced) <= 1e-7:
-            denominator = max(abs(final_objective), 1e-12)
-            lp_gap = max(
-                0.0,
-                (final_objective - phase2_lower_bound) / denominator,
+            lp_absolute_gap, lp_relative_gap = self._optimality_gaps(
+                final_objective, phase2_lower_bound
             )
         else:
             gap_reason = (
@@ -2565,11 +2852,11 @@ class ColumnGenerationPlanner:
                     ),
                 },
                 "complete_pattern_lp_lower_bound": phase2_lower_bound,
-                "complete_model_lp_bound_gap": lp_gap,
-                "complete_model_lp_bound_gap_reason": gap_reason,
-                "complete_model_certified_gap": lp_gap,
-                "complete_model_certified_gap_source": (
-                    "exact_group_pattern_pricing_lp_lower_bound"
+                "complete_model_absolute_gap": lp_absolute_gap,
+                "complete_model_relative_gap": lp_relative_gap,
+                "complete_model_gap_reason": gap_reason,
+                "complete_model_gap_source": (
+                    "raw_dual_group_pricing_lp_lower_bound"
                 ),
                 "restricted_master_lp_unplaced_boxes": float(
                     phase2_unplaced
@@ -2653,7 +2940,8 @@ class ColumnGenerationPlanner:
             tuple[str, str, int, tuple[tuple[str, str, int], ...]],
             PlacementColumn,
         ] = {}
-        for pattern in self._patterns:
+
+        def add_pattern_locations(pattern: PackingPattern) -> None:
             for placement in pattern.placements:
                 unit = replace(
                     placement,
@@ -2667,6 +2955,47 @@ class ColumnGenerationPlanner:
                     ),
                 )
                 pool_candidates.setdefault(self._column_identity(unit), unit)
+
+        for pattern in self._patterns:
+            add_pattern_locations(pattern)
+        master_pattern_location_count = len(pool_candidates)
+
+        for cached in self._pricing_pattern_cache.values():
+            for pattern in cached.values():
+                add_pattern_locations(pattern)
+        pricing_cache_added_locations = (
+            len(pool_candidates) - master_pattern_location_count
+        )
+
+        focus_areas: defaultdict[str, set[str]] = defaultdict(set)
+        for pattern_idx, value in self._final_stage2_pattern_values.items():
+            if value <= 1e-8:
+                continue
+            for placement in self._patterns[pattern_idx].placements:
+                focus_areas[placement.group_id].add(placement.area_no)
+        for idx, chosen in incumbent_selected.items():
+            if chosen <= 0:
+                continue
+            placement = incumbent_columns[idx]
+            focus_areas[placement.group_id].add(placement.area_no)
+        for group_id, patterns in self._last_raw_negative_patterns.items():
+            for pattern in patterns.values():
+                for placement in pattern.placements:
+                    focus_areas[group_id].add(placement.area_no)
+
+        before_neighborhood = len(pool_candidates)
+        for group in self.groups:
+            areas = focus_areas.get(group.group_id, set())
+            if not areas:
+                continue
+            for unit in self._base_placements_for_group(group):
+                if unit.area_no in areas:
+                    pool_candidates.setdefault(
+                        self._column_identity(unit), unit
+                    )
+        neighborhood_added_locations = (
+            len(pool_candidates) - before_neighborhood
+        )
 
         self._columns.clear()
         self._column_keys.clear()
@@ -2716,7 +3045,21 @@ class ColumnGenerationPlanner:
         )
         solve_stats["location_pool_size"] = len(self._columns)
         solve_stats["source_pattern_count"] = len(self._patterns)
-        solve_stats["method"] = "pattern_location_pool_fix_and_optimize"
+        solve_stats["master_pattern_location_count"] = (
+            master_pattern_location_count
+        )
+        solve_stats["pricing_cache_added_location_count"] = (
+            pricing_cache_added_locations
+        )
+        solve_stats["focused_area_neighborhood_added_location_count"] = (
+            neighborhood_added_locations
+        )
+        solve_stats["focused_group_area_count"] = sum(
+            len(areas) for areas in focus_areas.values()
+        )
+        solve_stats["method"] = (
+            "fractional_and_negative_pattern_location_pool_fix_and_optimize"
+        )
         return selected, unplaced, solve_stats
 
     def _build_restricted_master(
@@ -3232,6 +3575,16 @@ class ColumnGenerationPlanner:
                     ),
                 )
 
+    def _base_placements_for_group(
+        self,
+        group: ExportGroup,
+    ) -> tuple[PlacementColumn, ...]:
+        cached = self._base_placements_by_group.get(group.group_id)
+        if cached is None:
+            cached = tuple(self._iter_feasible_base_placements(group))
+            self._base_placements_by_group[group.group_id] = cached
+        return cached
+
     def _feasible_bay_capacity_without_demand(self, group: ExportGroup, bay_key: str) -> int:
         footprint = self._placement_footprint_keys(bay_key, group.size)
         if not footprint:
@@ -3314,6 +3667,7 @@ class ColumnGenerationPlanner:
         self._master_row_attr_big_m.clear()
         self._master_group_area_big_m.clear()
         self._master_group_row_big_m.clear()
+        self._base_placements_by_group.clear()
         self._base_feasible_placement_count = 0
         bay_attr_groups: defaultdict[tuple[str, str, str, str], set[str]] = defaultdict(set)
         row_attr_groups: defaultdict[tuple[str, str, str, str, str], set[str]] = defaultdict(set)
@@ -3330,7 +3684,9 @@ class ColumnGenerationPlanner:
         for group in self.groups:
             group_key = self._operational_group_key(group)
             self._master_operational_group_keys.add(group_key)
-            for column in self._iter_feasible_base_placements(group):
+            placements = tuple(self._iter_feasible_base_placements(group))
+            self._base_placements_by_group[group.group_id] = placements
+            for column in placements:
                 self._base_feasible_placement_count += 1
                 footprint = self._placement_footprint_keys(column.bay_key, column.size)
                 self._master_bay_capacity_keys.update(footprint)

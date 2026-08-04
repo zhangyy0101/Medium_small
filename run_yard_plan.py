@@ -43,8 +43,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pricing-fraction", type=float, default=0.75)
     parser.add_argument("--heuristic-pricing-variants", type=int, default=12)
     parser.add_argument("--dual-stabilization-alpha", type=float, default=0.65)
+    parser.add_argument("--selective-pricing-time-limit", type=float, default=2.0)
     parser.add_argument("--exact-pricing-time-limit", type=float, default=60.0)
-    parser.add_argument("--pattern-lp-gap", type=float, default=0.005)
+    parser.add_argument(
+        "--pattern-lp-gap",
+        type=float,
+        default=0.005,
+        help="Relative full-pattern LP gap tolerance; 0 requires no negative reduced cost.",
+    )
     parser.add_argument("--raw-dual-check-interval", type=int, default=5)
     parser.add_argument(
         "--solver-threads",
@@ -97,6 +103,7 @@ def main() -> None:
         adaptive_pricing_fraction=args.pricing_fraction,
         heuristic_pricing_variants=args.heuristic_pricing_variants,
         dual_stabilization_alpha=args.dual_stabilization_alpha,
+        selective_pricing_time_limit=args.selective_pricing_time_limit,
         exact_pricing_time_limit=args.exact_pricing_time_limit,
         pattern_lp_gap_tolerance=args.pattern_lp_gap,
         raw_dual_check_interval=args.raw_dual_check_interval,
@@ -155,17 +162,23 @@ def main() -> None:
             "algorithm": result.diagnostics.get("algorithm"),
             "master_status": result.diagnostics.get("master_status"),
             "master_bound_scope": result.diagnostics.get("master_bound_scope"),
-            "pattern_lp_certified_gap": result.diagnostics.get(
-                "pricing_phase2_certified_gap"
+            "pattern_lp_absolute_gap": result.diagnostics.get(
+                "pricing_phase2_absolute_gap"
+            ),
+            "pattern_lp_relative_gap": result.diagnostics.get(
+                "pricing_phase2_relative_gap"
             ),
             "integer_master_mip_gap": result.diagnostics.get(
                 "master_mip_gap"
             ),
-            "complete_model_certified_gap": result.diagnostics.get(
-                "complete_model_certified_gap"
+            "complete_model_absolute_gap": result.diagnostics.get(
+                "complete_model_absolute_gap"
             ),
-            "complete_model_certified_gap_source": result.diagnostics.get(
-                "complete_model_certified_gap_source"
+            "complete_model_relative_gap": result.diagnostics.get(
+                "complete_model_relative_gap"
+            ),
+            "complete_model_gap_source": result.diagnostics.get(
+                "complete_model_gap_source"
             ),
             "runtime_breakdown_seconds": runtime_breakdown,
         },

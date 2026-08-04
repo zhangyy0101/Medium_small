@@ -312,6 +312,14 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             planner._pattern_reduced_cost(pattern, duals, "full"),
         )
 
+    def test_optimality_gap_reports_absolute_and_relative_values(self) -> None:
+        absolute, relative = ColumnGenerationPlanner._optimality_gaps(
+            0.1922437294523396,
+            0.18918124516010498,
+        )
+        self.assertAlmostEqual(0.0030624842922346296, absolute)
+        self.assertAlmostEqual(absolute / 0.1922437294523396, relative)
+
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
     def test_pattern_generation_reports_a_certified_small_case_lp_bound(self) -> None:
         config = ColumnGenerationConfig(
@@ -332,7 +340,10 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             diagnostics["pricing_phase2_lp_lower_bound"],
             places=8,
         )
-        self.assertEqual(0.0, diagnostics["pricing_phase2_certified_gap"])
+        self.assertEqual(0.0, diagnostics["pricing_phase2_absolute_gap"])
+        self.assertEqual(0.0, diagnostics["pricing_phase2_relative_gap"])
+        self.assertGreater(diagnostics["pricing_mip_solve_count"], 0)
+        self.assertGreater(diagnostics["pricing_mip_warm_start_count"], 0)
         self.assertEqual(
             "two_phase_certified_pattern_pricing",
             diagnostics["pricing_stop_reason"],
@@ -349,7 +360,10 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         )
         diagnostics = planner.solve().diagnostics
         polishing = diagnostics["pattern_pool_integer_polishing"]
-        self.assertEqual("pattern_location_pool_fix_and_optimize", polishing["method"])
+        self.assertEqual(
+            "fractional_and_negative_pattern_location_pool_fix_and_optimize",
+            polishing["method"],
+        )
         self.assertGreater(polishing["location_pool_size"], 0)
         self.assertLessEqual(
             polishing["objective_after_polishing"],
@@ -360,8 +374,8 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             diagnostics["master_bound_scope"],
         )
         self.assertEqual(
-            "exact_group_pattern_pricing_lp_lower_bound",
-            diagnostics["complete_model_certified_gap_source"],
+            "raw_dual_group_pricing_lp_lower_bound",
+            diagnostics["complete_model_gap_source"],
         )
 
     def test_written_output_is_validated_independently(self) -> None:
