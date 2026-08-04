@@ -14,7 +14,7 @@ from adapters.planning_input import load_planning_inputs
 from yard_planning.planner import (
     ColumnGenerationConfig,
     ColumnGenerationPlanner,
-    write_columns,
+    write_selected_locations,
     write_json,
     write_rows,
 )
@@ -34,23 +34,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--voyages", nargs="+", default=None, help="Optional voyage subset; default is every voyage in the large plan.")
     parser.add_argument("--planning-time", default=None, help="Optional override; default is the JSON planning_time.")
-    parser.add_argument("--total-time-limit", type=float, default=240.0)
-    parser.add_argument("--mip-time-limit", type=float, default=120.0)
+    parser.add_argument("--total-time-limit", type=float, default=60.0)
+    parser.add_argument("--mip-time-limit", type=float, default=30.0)
     parser.add_argument("--mip-gap", type=float, default=0.01)
-    parser.add_argument("--pricing-min-batch", type=int, default=32)
-    parser.add_argument("--pricing-max-batch", type=int, default=128)
-    parser.add_argument("--pricing-fraction", type=float, default=0.25)
+    parser.add_argument("--max-pricing-iterations", type=int, default=60)
+    parser.add_argument("--pricing-min-batch", type=int, default=1)
+    parser.add_argument("--pricing-max-batch", type=int, default=12)
+    parser.add_argument("--pricing-fraction", type=float, default=0.75)
+    parser.add_argument("--heuristic-pricing-variants", type=int, default=12)
+    parser.add_argument("--dual-stabilization-alpha", type=float, default=0.65)
+    parser.add_argument("--exact-pricing-time-limit", type=float, default=60.0)
+    parser.add_argument("--pattern-lp-gap", type=float, default=0.005)
+    parser.add_argument("--raw-dual-check-interval", type=int, default=5)
     parser.add_argument(
         "--solver-threads",
         type=int,
         default=0,
         help="0 lets Gurobi choose; use a fixed positive value for experiments.",
-    )
-    parser.add_argument(
-        "--complete-integer-verification-max-columns",
-        type=int,
-        default=10_000,
-        help="Complete the unit-flow universe and verify the integer master when its size is at most this value; 0 disables it.",
     )
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
@@ -88,16 +88,19 @@ def main() -> None:
     )
     planning_input_seconds = perf_counter() - stage_start
     config = ColumnGenerationConfig(
+        max_iterations=args.max_pricing_iterations,
         total_time_limit=args.total_time_limit,
         mip_time_limit=args.mip_time_limit,
         mip_gap=args.mip_gap,
         min_columns_per_group_per_iteration=args.pricing_min_batch,
         max_columns_per_group_per_iteration=args.pricing_max_batch,
         adaptive_pricing_fraction=args.pricing_fraction,
+        heuristic_pricing_variants=args.heuristic_pricing_variants,
+        dual_stabilization_alpha=args.dual_stabilization_alpha,
+        exact_pricing_time_limit=args.exact_pricing_time_limit,
+        pattern_lp_gap_tolerance=args.pattern_lp_gap,
+        raw_dual_check_interval=args.raw_dual_check_interval,
         solver_threads=args.solver_threads,
-        complete_integer_verification_max_columns=(
-            args.complete_integer_verification_max_columns
-        ),
         verbose=not args.quiet,
     )
     stage_start = perf_counter()
@@ -123,7 +126,10 @@ def main() -> None:
         result.import_reservation_rows,
     )
     write_rows(output_dir / "unplaced_boxes.csv", result.unplaced_rows)
-    write_columns(output_dir / "generated_columns.csv", result.columns)
+    write_selected_locations(
+        output_dir / "selected_row_locations.csv",
+        result.columns,
+    )
     write_rows(output_dir / "declared_export_demand.csv", [asdict(row) for row in inputs.demand_rows])
     large_plan.to_csv(output_dir / "large_plan_used.csv", index=False, encoding="utf-8-sig")
     write_json(output_dir / "diagnostics.json", result.diagnostics)
@@ -149,8 +155,11 @@ def main() -> None:
             "algorithm": result.diagnostics.get("algorithm"),
             "master_status": result.diagnostics.get("master_status"),
             "master_bound_scope": result.diagnostics.get("master_bound_scope"),
-            "restricted_master_mip_gap": result.diagnostics.get(
-                "restricted_master_mip_gap"
+            "pattern_lp_certified_gap": result.diagnostics.get(
+                "pricing_phase2_certified_gap"
+            ),
+            "integer_master_mip_gap": result.diagnostics.get(
+                "master_mip_gap"
             ),
             "complete_model_certified_gap": result.diagnostics.get(
                 "complete_model_certified_gap"

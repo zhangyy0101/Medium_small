@@ -79,28 +79,29 @@ big plan is not exempt from its flow-function requirement; an incompatible
 upstream allocation contributes a soft guidance deviation but never creates a
 detailed-placement candidate.
 
-## Retained objectives
+## Pattern decomposition and retained objectives
 
-Each column is a feasible operational-group/bay/row unit flow. Its master
-variable is an integer container quantity, so arbitrary feasible integer row
-allocations are represented by combining unit-flow columns; there is no capped
-list of multi-row packing templates. The initial restricted master contains no
-export placement column. In every lexicographic phase, the restricted-master
-LP is solved first and its row duals define an independent finite pricing
-problem for each export group. Feasible group/bay/row unit flows are generated
-transiently; only flows with reduced cost below the numerical tolerance enter
-the master. Each phase keeps one persistent Gurobi master and inserts priced
-variables with their master-row coefficients, preserving the simplex basis.
-Dual-simplex pricing is deterministic for a fixed solver configuration. The
-number of entering columns is adaptive by group: it is a bounded fraction of
-the currently negative candidates rather than a fixed batch. The complete
-compatible column universe is neither stored nor solved as one auxiliary model
-during pricing. Pricing stops only when every group pricing problem has no
-negative-reduced-cost flow. A time limit cannot silently terminate this
-certificate phase.
+A column is a complete integer row-layout pattern for one export operational
+group. It specifies all placements of that group across areas, bays, and rows,
+together with any unplaced quantity. Pattern construction enforces the group's
+size footprint, 45-ft edge rule, residual bay and row capacities, stack
+capacity, incumbent compatibility, and its own area/row dispersion. The master
+selects exactly one pattern per group and coordinates shared bay/row capacity,
+cross-group no-mix attributes, anonymous import reservation, and big-plan
+deviation. Thus the decomposition internalizes each group's combinatorial
+layout while retaining the shared yard interactions in the master.
 
-The final integer restricted master over the generated columns is solved
-in two lexicographic stages. Stage 1
+The initial restricted master contains one all-unplaced artificial pattern per
+group. Early pricing rounds use stabilized duals and several deterministic
+constructive heuristics to populate the master cheaply. Subsequent pricing
+solves an exact integer pricing MIP for every group. Negative-reduced-cost patterns
+enter in an adaptive group-wise batch, and new variables are inserted into a
+persistent Gurobi master so its LP basis is retained. At configured intervals,
+all pricing MIPs are solved against the raw master duals. The sum of the
+negative group-wise minimum reduced costs corrects the restricted-master value
+into a valid lower bound for the full implicit pattern LP.
+
+The model is solved in two lexicographic stages. Stage 1
 minimizes the number of unplaced declared containers. Stage 2 fixes that
 minimum exactly and minimizes the following operational criteria:
 
@@ -137,10 +138,12 @@ objective when it applies to only a small share of declared demand. They are
 not inverse-value multipliers fitted to one solution, so good performance on a
 component does not mechanically reduce its policy importance.
 
-The stage-2 integer solution is the final reported allocation. There is no
-post-solve intra-area row relayout or separate heuristic objective; row-level
-row assignments must be combinations of the declared unit flows and are
-selected by the same final master.
+After column generation, an integer pattern master supplies the first feasible
+integer allocation. A final fix-and-optimize model collects only the row
+locations encountered in generated patterns and recombines their integer
+quantities under the same constraints and objective. It may improve the
+integer incumbent but introduces neither a different business objective nor a
+free post-solve relayout.
 
 The stage-1 optimum for total unplaced demand is imposed as an equality in
 every stage-2 restricted master. Consequently, stage-2 unplaced variables have
@@ -152,15 +155,16 @@ feasible bay-row capacity in that area, with each bay additionally capped by
 its size, footprint, and stack capacity. It does not use unrelated total area
 capacity.
 
-The no-negative-reduced-cost certificate applies to the LP relaxation over the
-complete compatible unit-flow universe. The code separately reports the
-restricted-master MIP gap and the valid gap between the integer incumbent and
-the complete column-generation LP lower bound. For small cases below a
-configured potential-column threshold, a verification layer appends every
-missing column, warm-starts a complete two-stage integer master, and reports
-its complete-universe MIP bound and gap. Larger cases retain standard column
-generation followed by integer recovery. This is not branch-and-price;
-without complete-column verification, no full integer optimality claim is made.
+Stage 1 stops immediately at zero unplaced boxes because its nonnegative
+objective then proves optimality. In stage 2, the default stopping condition is
+a certified full-pattern LP gap of at most `0.5%`; setting
+`pattern_lp_gap_tolerance` to zero requires no negative-reduced-cost pattern.
+The code reports the restricted-master value, corrected full-pattern LP lower
+bound, certified LP gap, integer-master MIP gap, and the valid gap between the
+final integer incumbent and that LP lower bound separately. Exact group pricing
+is mandatory for every certificate; a pricing time limit cannot silently be
+treated as proof. The method is column generation plus integer recovery, not
+branch-and-price, so it makes no full integer-optimality claim.
 
 The import variables are anonymous capacity reservations indexed only by flow,
 size, and bay. Their totals equal the corresponding import `new_qty`. Their

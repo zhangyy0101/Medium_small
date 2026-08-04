@@ -141,20 +141,35 @@ class PlacementColumn:
     intrinsic_cost: float
 
 
+@dataclass(frozen=True)
+class PackingPattern:
+    """One complete yard-allocation decision for one export group."""
+
+    pattern_id: str
+    group_id: str
+    placements: tuple[PlacementColumn, ...]
+    unplaced: int
+    phase2_cost: float
+
+
 @dataclass
 class ColumnGenerationConfig:
-    max_iterations: int = 30
-    min_columns_per_group_per_iteration: int = 32
-    max_columns_per_group_per_iteration: int = 128
-    adaptive_pricing_fraction: float = 0.25
+    max_iterations: int = 60
+    min_columns_per_group_per_iteration: int = 1
+    max_columns_per_group_per_iteration: int = 12
+    adaptive_pricing_fraction: float = 0.75
+    heuristic_pricing_variants: int = 12
+    dual_stabilization_alpha: float = 0.65
+    exact_pricing_time_limit: float = 60.0
+    pattern_lp_gap_tolerance: float = 0.005
+    raw_dual_check_interval: int = 5
     reduced_cost_tolerance: float = 1e-7
-    total_time_limit: float = 240.0
-    mip_time_limit: float = 120.0
+    total_time_limit: float = 60.0
+    mip_time_limit: float = 30.0
     mip_gap: float = 0.01
     lp_method: int = 1
     solver_seed: int = 0
     solver_threads: int = 0
-    complete_integer_verification_max_columns: int = 10_000
     verbose: bool = True
     # Stage-2 policy weights. Every component is first mapped to a natural
     # dimensionless scale. The baseline is calibrated against realized
@@ -178,10 +193,11 @@ class ColumnGenerationResult:
 
 
 class ColumnGenerationPlanner:
-    """Declared-export row assignment with exact unit-flow pricing.
+    """Declared-export row assignment with stabilized packing-pattern pricing.
 
-    A column is one feasible group/bay/row unit flow.  Its integer master
-    variable gives the number of identical containers assigned there.  The master uses
+    A column is a complete feasible row-level allocation pattern for one
+    export group, possibly retaining some of that group's demand as unplaced.
+    The master uses
     only declared, not-yet-gated-in export containers. Incoming imports are
     represented by anonymous size-compatible bay-capacity reservations: their
     flow/size totals are fixed, while their area distribution may deviate from
@@ -238,13 +254,17 @@ class ColumnGenerationPlanner:
                 self.existing_group_area_bays[group_tuple + (str(area_no),)].add(str(bay_key))
         self.group_demand = {group.group_id: int(group.demand) for group in self.groups}
         self.voyage_flow_size_demand: Counter[tuple[str, str, str]] = Counter()
+        self._patterns: list[PackingPattern] = []
+        self._pattern_keys: set[tuple] = set()
+        self._artificial_pattern_by_group: dict[str, int] = {}
+        self._pricing_calls_by_phase: Counter[str] = Counter()
         self._columns: list[PlacementColumn] = []
         self._column_keys: set[tuple[str, str, int, tuple[tuple[str, str, int], ...]]] = set()
         self._candidate_cache: dict[str, list[tuple[str, int, float]]] = {}
         self._objective_scales: dict[str, float] = {}
         self._berth_distance_bounds: dict[str, tuple[float, float]] = {}
         self._initial_unplaced_start: Counter[str] = Counter()
-        self._potential_unit_flow_count = 0
+        self._base_feasible_placement_count = 0
         self._master_bay_capacity_keys: set[str] = set()
         self._master_bay_size_keys: set[tuple[str, str]] = set()
         self._master_row_capacity_keys: set[tuple[str, str]] = set()
@@ -291,8 +311,22 @@ class ColumnGenerationPlanner:
             )
         if int(self.config.max_iterations) <= 0:
             raise ValueError("max_iterations must be positive")
-        if int(self.config.complete_integer_verification_max_columns) < 0:
-            raise ValueError("complete_integer_verification_max_columns cannot be negative")
+        variants = int(self.config.heuristic_pricing_variants)
+        if variants <= 0:
+            raise ValueError("heuristic_pricing_variants must be positive")
+        alpha = float(self.config.dual_stabilization_alpha)
+        if not math.isfinite(alpha) or not 0.0 < alpha <= 1.0:
+            raise ValueError(
+                "dual_stabilization_alpha must be in (0, 1], "
+                f"got {alpha}"
+            )
+        if float(self.config.exact_pricing_time_limit) <= 0.0:
+            raise ValueError("exact_pricing_time_limit must be positive")
+        lp_gap = float(self.config.pattern_lp_gap_tolerance)
+        if not math.isfinite(lp_gap) or lp_gap < 0.0:
+            raise ValueError("pattern_lp_gap_tolerance must be finite and nonnegative")
+        if int(self.config.raw_dual_check_interval) <= 0:
+            raise ValueError("raw_dual_check_interval must be positive")
 
     def _build_planning_groups(self) -> list[ExportGroup]:
         """Return declared, not-yet-arrived export groups only."""
@@ -311,19 +345,19 @@ class ColumnGenerationPlanner:
         }
         return groups
     def solve(self) -> ColumnGenerationResult:
-        self._initialize_column_generation()
         self._prepare_master_index_sets()
         self._prepare_objective_normalization()
+        self._initialize_pattern_generation()
         self._initial_unplaced_start = Counter(
             {group.group_id: int(group.demand) for group in self.groups}
         )
         seed_stats = {
-            "initialization": "artificial_unplaced_variables_only",
-            "initial_generated_columns": 0,
+            "initialization": "one_all-unplaced_artificial_pattern_per_group",
+            "initial_generated_patterns": len(self._patterns),
             "initial_unplaced_boxes": int(sum(self._initial_unplaced_start.values())),
         }
         diagnostics: dict = {
-            "algorithm": "dual_priced_restricted_master_column_generation",
+            "algorithm": "stabilized_export_group_packing_pattern_column_generation",
             "model_scope": "export_declared_containers_row_allocation",
             "detailed_allocation_direction": "export_only",
             "target_voyages": self.problem.target_voyages,
@@ -374,14 +408,31 @@ class ColumnGenerationPlanner:
                     for (flow, size), candidates in sorted(self.import_reservation_candidates.items())
                 },
             },
-            "initial_column_count": 0,
-            "potential_unit_flow_count": self._potential_unit_flow_count,
-            "exact_unit_flow_pricing": True,
+            "initial_pattern_count": len(self._patterns),
+            "base_feasible_placement_count": self._base_feasible_placement_count,
+            "pattern_universe": "implicit_exponential",
+            "exact_pattern_pricing": True,
             "pricing_configuration": {
                 "persistent_restricted_master": True,
                 "lp_method": int(self.config.lp_method),
                 "solver_seed": int(self.config.solver_seed),
                 "solver_threads": int(self.config.solver_threads),
+                "decomposition": "one_complete_row_layout_pattern_per_export_group",
+                "heuristic_pricing_variants": int(
+                    self.config.heuristic_pricing_variants
+                ),
+                "dual_stabilization_alpha": float(
+                    self.config.dual_stabilization_alpha
+                ),
+                "exact_pricing_time_limit": float(
+                    self.config.exact_pricing_time_limit
+                ),
+                "pattern_lp_gap_tolerance": float(
+                    self.config.pattern_lp_gap_tolerance
+                ),
+                "raw_dual_check_interval": int(
+                    self.config.raw_dual_check_interval
+                ),
                 "adaptive_batch": {
                     "minimum_per_group": int(
                         self.config.min_columns_per_group_per_iteration
@@ -394,8 +445,8 @@ class ColumnGenerationPlanner:
                     ),
                 },
             },
-            "restricted_master_contains_generated_columns_only": True,
-            "complete_unit_flow_universe_materialized": False,
+            "restricted_master_contains_generated_patterns_only": True,
+            "branch_and_price": False,
             **seed_stats,
             "pricing_iterations": [],
             "gurobi_available": True,
@@ -453,8 +504,8 @@ class ColumnGenerationPlanner:
         operational_group_dispersion = self._operational_group_dispersion_stats(export_rows)
         diagnostics.update(
             {
-                "final_column_count": len(self._columns),
-                "selected_column_count": sum(1 for qty in selected.values() if qty > 0),
+                "integer_location_pool_size": len(self._columns),
+                "selected_location_count": sum(1 for qty in selected.values() if qty > 0),
                 "summary_granularity": "bay",
                 "export_row_count": len(export_rows),
                 "bay_summary_row_count": len(bay_summary_rows),
@@ -496,7 +547,7 @@ class ColumnGenerationPlanner:
             repaired, placed = Counter(), Counter()
             errors.append(str(exc))
         if repaired != normalized:
-            errors.append("selected columns violate a physical or no-mix rule")
+            errors.append("selected row locations violate a physical or no-mix rule")
         for group in self.groups:
             assigned = int(placed.get(group.group_id, 0))
             missing = int(unplaced.get(group.group_id, 0))
@@ -508,12 +559,14 @@ class ColumnGenerationPlanner:
         for idx in normalized:
             col = self._columns[idx]
             if col.size == "45" and col.bay_key not in self.area_edge_bays.get(col.area_no, set()):
-                errors.append(f"45-ft column {col.column_id} is not on an edge large bay")
+                errors.append(
+                    f"45-ft row location {col.column_id} is not on an edge large bay"
+                )
         if errors:
             raise RuntimeError("Independent solution validation failed: " + "; ".join(errors[:10]))
         return {
             "passed": True,
-            "selected_columns_checked": len(normalized),
+            "selected_locations_checked": len(normalized),
             "groups_checked": len(self.groups),
             "assigned_boxes_checked": int(sum(placed.values())),
             "unplaced_boxes_checked": int(sum(unplaced.values())),
@@ -851,403 +904,7 @@ class ColumnGenerationPlanner:
             "row_bay_summary_consistency_shortage_boxes": shortage,
         }
 
-    def _solve_by_column_generation(self) -> tuple[Counter[int], Counter[str], dict]:
-        """Solve two restricted-master LP phases with exact dual pricing."""
-        from gurobipy import quicksum
-
-        Model = _GurobiModelAdapter
-        pricing_start = perf_counter()
-        stats: dict = {
-            "gurobi_available": True,
-            "pricing_method": "independent_group_unit_flow_reduced_cost_pricing",
-            "pricing_iterations": [],
-            "pricing_stop_reason": "",
-            "potential_unit_flow_count": self._potential_unit_flow_count,
-        }
-
-        def run_phase(
-            phase_name: str,
-            objective_mode: str,
-            fixed_unplaced_total: float | None = None,
-        ) -> tuple[float, Counter[str]]:
-            last_objective = 0.0
-            last_unplaced: Counter[str] = Counter()
-            model, variables, constraints = self._build_restricted_master(
-                Model,
-                quicksum,
-                relax=True,
-                objective_mode=objective_mode,
-                fixed_unplaced_total=fixed_unplaced_total,
-            )
-            self._set_gurobi_param(model, "TimeLimit", float(self.config.mip_time_limit))
-            try:
-                for iteration in range(int(self.config.max_iterations)):
-                    model.optimize()
-                    status = self._gurobi_status_name(model)
-                    if status != "optimal":
-                        raise RuntimeError(
-                            f"Strict {phase_name} pricing LP is not optimal: {status}"
-                        )
-                    last_objective = self._gurobi_objective_value(model)
-                    last_unplaced = Counter(
-                        {
-                            group_id: self._gurobi_value(model, var)
-                            for group_id, var in variables["unplaced"].items()
-                            if self._gurobi_value(model, var) > 1e-8
-                        }
-                    )
-                    pricing, new_indices = self._price_unit_flow_columns(
-                        model,
-                        constraints,
-                        phase_name,
-                        objective_mode,
-                    )
-                    stats["pricing_iterations"].append(
-                        {
-                            "phase": phase_name,
-                            "iteration": iteration,
-                            "lp_objective": last_objective,
-                            "lp_unplaced_boxes": float(
-                                sum(
-                                    self._gurobi_value(model, var)
-                                    for var in variables["unplaced"].values()
-                                )
-                            ),
-                            **pricing,
-                        }
-                    )
-                    if not new_indices:
-                        return last_objective, last_unplaced
-                    self._add_columns_to_restricted_master(
-                        model,
-                        variables,
-                        constraints,
-                        new_indices,
-                        objective_mode,
-                    )
-            finally:
-                self._free_gurobi_model(model)
-            raise RuntimeError(
-                f"Strict {phase_name} pricing exceeded max_iterations="
-                f"{self.config.max_iterations}"
-            )
-
-        _phase1_objective, phase1_unplaced = run_phase(
-            "minimum_unplaced",
-            "min_unplaced",
-        )
-        phase1_unplaced_total = float(sum(phase1_unplaced.values()))
-        phase2_objective, phase2_unplaced = run_phase(
-            "secondary_objective",
-            "full",
-            fixed_unplaced_total=phase1_unplaced_total,
-        )
-        stats.update(
-            {
-                "pricing_stop_reason": "two_phase_reduced_cost_convergence",
-                "pricing_iterations_run": len(stats["pricing_iterations"]),
-                "pricing_phase1_lp_unplaced_boxes": phase1_unplaced_total,
-                "pricing_phase2_lp_objective": phase2_objective,
-                "column_generation_pricing_elapsed_seconds": round(
-                    perf_counter() - pricing_start, 3
-                ),
-            }
-        )
-
-        integer_start = perf_counter()
-        pricing_generated_column_count = len(self._columns)
-        selected, unplaced, restricted_integer_stats = self._solve_lexicographic_integer_master(
-            Counter(),
-            Counter(self._initial_unplaced_start),
-            float(self.config.total_time_limit) if self.config.total_time_limit > 0 else None,
-        )
-        if not restricted_integer_stats.get("lexicographic_integer_master_used"):
-            raise RuntimeError(
-                "The final two-stage integer master did not produce a stage-2 solution"
-            )
-
-        restricted_integer_summary = {
-            "column_count": pricing_generated_column_count,
-            "objective": restricted_integer_stats.get("lexicographic_stage2_objective"),
-            "bound": restricted_integer_stats.get("lexicographic_stage2_bound"),
-            "mip_gap": restricted_integer_stats.get("lexicographic_stage2_gap"),
-            "stage1_unplaced_boxes": restricted_integer_stats.get(
-                "lexicographic_stage1_unplaced_boxes"
-            ),
-        }
-        verification_limit = int(self.config.complete_integer_verification_max_columns)
-        verification_enabled = (
-            verification_limit > 0
-            and self._potential_unit_flow_count <= verification_limit
-        )
-        verification_stats: dict[str, object] = {
-            "enabled": verification_enabled,
-            "threshold": verification_limit,
-            "potential_column_count": self._potential_unit_flow_count,
-            "pricing_generated_column_count": pricing_generated_column_count,
-            "performed": False,
-        }
-        integer_stats = restricted_integer_stats
-        master_bound_scope = "generated_columns_at_lp_reduced_cost_convergence"
-        if verification_enabled:
-            verification_start = perf_counter()
-            added = self._materialize_complete_unit_flow_universe()
-            if added > 0:
-                selected, unplaced, integer_stats = self._solve_lexicographic_integer_master(
-                    selected,
-                    unplaced,
-                    float(self.config.total_time_limit)
-                    if self.config.total_time_limit > 0
-                    else None,
-                )
-                if not integer_stats.get("lexicographic_integer_master_used"):
-                    raise RuntimeError(
-                        "Complete-column integer verification did not produce a stage-2 solution"
-                    )
-            master_bound_scope = "complete_unit_flow_universe"
-            verification_stats.update(
-                {
-                    "performed": True,
-                    "added_columns": added,
-                    "complete_column_count": len(self._columns),
-                    "objective": integer_stats.get("lexicographic_stage2_objective"),
-                    "bound": integer_stats.get("lexicographic_stage2_bound"),
-                    "mip_gap": integer_stats.get("lexicographic_stage2_gap"),
-                    "elapsed_seconds": round(perf_counter() - verification_start, 3),
-                }
-            )
-
-        stats.update(integer_stats)
-        final_objective = self._selected_solution_energy(selected, unplaced)
-        final_integer_unplaced = int(sum(unplaced.values()))
-        lp_bound_gap: float | None = None
-        lp_bound_gap_reason = "available"
-        if abs(float(phase1_unplaced_total) - final_integer_unplaced) <= 1e-7:
-            denominator = max(abs(float(final_objective)), 1e-12)
-            lp_bound_gap = max(
-                0.0,
-                (float(final_objective) - float(phase2_objective)) / denominator,
-            )
-        else:
-            lp_bound_gap_reason = (
-                "phase2 LP and final integer master fix different unplaced totals"
-            )
-        if verification_stats["performed"]:
-            certified_gap = integer_stats.get("lexicographic_stage2_gap")
-            certified_gap_source = "complete_integer_master"
-        else:
-            certified_gap = lp_bound_gap
-            certified_gap_source = "complete_column_generation_lp_lower_bound"
-        stats.update(
-            {
-                "master_algorithm": (
-                    "two_phase_dual_priced_column_generation_then_complete_integer_verification"
-                    if verification_stats["performed"]
-                    else "two_phase_dual_priced_column_generation_then_integer_rmp"
-                ),
-                "master_bound_scope": master_bound_scope,
-                "master_status": (
-                    "lexicographic_integer_master"
-                    if integer_stats.get("lexicographic_integer_master_used")
-                    else "integer_master_incomplete"
-                ),
-                "master_solve_seconds": round(perf_counter() - integer_start, 3),
-                "master_objective": final_objective,
-                "master_mip_gap": integer_stats.get("lexicographic_stage2_gap"),
-                "restricted_master_mip_gap": restricted_integer_stats.get(
-                    "lexicographic_stage2_gap"
-                ),
-                "restricted_integer_master": restricted_integer_summary,
-                "complete_integer_verification": verification_stats,
-                "complete_lp_lower_bound": phase2_objective,
-                "complete_model_lp_bound_gap": lp_bound_gap,
-                "complete_model_lp_bound_gap_reason": lp_bound_gap_reason,
-                "complete_model_certified_gap": certified_gap,
-                "complete_model_certified_gap_source": certified_gap_source,
-                "restricted_master_lp_unplaced_boxes": float(sum(phase2_unplaced.values())),
-            }
-        )
-        return selected, unplaced, stats
-
-    def _price_unit_flow_columns(
-        self,
-        model,
-        constraints: dict,
-        phase_name: str,
-        objective_mode: str,
-    ) -> tuple[dict, list[int]]:
-        """Solve every group pricing problem from restricted-master duals.
-
-        A feasible column is a single group/bay/row unit flow, so each pricing
-        subproblem is an exact finite minimum-reduced-cost search. Candidate
-        placements are generated transiently and are stored only when their
-        reduced cost is negative.
-        """
-        tolerance = max(1e-12, float(self.config.reduced_cost_tolerance))
-        evaluated = 0
-        negative = 0
-        entering: list[tuple[float, str, PlacementColumn]] = []
-        minimum_reduced_cost = math.inf
-        minimum_by_group: dict[str, float] = {}
-        adaptive_batch_by_group: dict[str, int] = {}
-        negative_by_group: dict[str, int] = {}
-
-        for group in self.groups:
-            group_candidates: list[tuple[float, str, PlacementColumn]] = []
-            group_minimum = math.inf
-            for candidate in self._iter_feasible_unit_flow_columns(group):
-                key = self._column_identity(candidate)
-                if key in self._column_keys:
-                    continue
-                evaluated += 1
-                reduced_cost = self._column_reduced_cost(
-                    model,
-                    constraints,
-                    candidate,
-                    objective_mode,
-                )
-                group_minimum = min(group_minimum, reduced_cost)
-                minimum_reduced_cost = min(minimum_reduced_cost, reduced_cost)
-                if reduced_cost < -tolerance:
-                    negative += 1
-                    tie_key = f"{candidate.area_no}|{candidate.bay_no}|{candidate.row_allocation}"
-                    group_candidates.append((reduced_cost, tie_key, candidate))
-            if math.isfinite(group_minimum):
-                minimum_by_group[group.group_id] = group_minimum
-            group_candidates.sort(key=lambda item: (item[0], item[1]))
-            batch_size = self._adaptive_pricing_batch_size(len(group_candidates))
-            negative_by_group[group.group_id] = len(group_candidates)
-            adaptive_batch_by_group[group.group_id] = batch_size
-            entering.extend(group_candidates[:batch_size])
-
-        entering.sort(key=lambda item: (item[0], item[1]))
-        new_indices: list[int] = []
-        for _reduced_cost, _tie_key, candidate in entering:
-            new_indices.append(self._append_generated_column(candidate))
-        return {
-            "new_columns": len(entering),
-            "pricing_mode": "exact_group_reduced_cost_enumeration",
-            "exact_pricing": True,
-            "adaptive_batch": True,
-            "negative_candidates_by_group": negative_by_group,
-            "selected_batch_by_group": adaptive_batch_by_group,
-            "pricing_candidates_evaluated": evaluated,
-            "negative_reduced_cost_candidates": negative,
-            "generated_column_count": len(self._columns),
-            "minimum_reduced_cost": (
-                minimum_reduced_cost if math.isfinite(minimum_reduced_cost) else None
-            ),
-            "minimum_reduced_cost_by_group": {
-                key: value for key, value in sorted(minimum_by_group.items())
-            },
-            "phase": phase_name,
-        }, new_indices
-
-    def _adaptive_pricing_batch_size(self, negative_count: int) -> int:
-        count = max(0, int(negative_count))
-        if count == 0:
-            return 0
-        proportional = int(math.ceil(count * float(self.config.adaptive_pricing_fraction)))
-        target = max(int(self.config.min_columns_per_group_per_iteration), proportional)
-        return min(count, int(self.config.max_columns_per_group_per_iteration), target)
-
-    def _add_columns_to_restricted_master(
-        self,
-        model,
-        variables: dict,
-        constraints: dict,
-        column_indices: Iterable[int],
-        objective_mode: str,
-    ) -> None:
-        """Insert priced variables into a persistent LP master and keep its basis."""
-
-        def term(terms: list[tuple[float, object]], section: str, key: object, value: float) -> None:
-            constraint = constraints.get(section, {}).get(key)
-            if constraint is not None and abs(float(value)) > 0.0:
-                terms.append((float(value), constraint))
-
-        fixed = constraints.get("fixed_use_objective_limit", {})
-        for idx in column_indices:
-            col = self._columns[int(idx)]
-            quantity = float(col.quantity)
-            terms: list[tuple[float, object]] = []
-            term(terms, "group_cover", col.group_id, quantity)
-            footprint = self._placement_footprint_keys(col.bay_key, col.size)
-            stack_value = self._row_mix_key_for_column(col)
-            for footprint_key in footprint:
-                term(terms, "bay_capacity_limit", footprint_key, quantity)
-                term(
-                    terms,
-                    "bay_port_stack_link",
-                    (footprint_key, stack_value, col.size),
-                    quantity,
-                )
-                for attr in self._bay_no_mix_attrs_for_column(col):
-                    scope = self._attr_voyage_scope(attr, col.voyage_id)
-                    term(
-                        terms,
-                        "bay_attr_link",
-                        (
-                            footprint_key,
-                            attr,
-                            scope,
-                            self._column_attr_value(col, attr),
-                        ),
-                        1.0,
-                    )
-            term(terms, "bay_size_limit", (col.bay_key, col.size), quantity)
-            for footprint_key, row_no, row_quantity in col.row_allocation:
-                term(
-                    terms,
-                    "row_capacity_limit",
-                    (footprint_key, row_no),
-                    float(row_quantity),
-                )
-                term(
-                    terms,
-                    "row_size_limit",
-                    (footprint_key, row_no, col.size),
-                    float(row_quantity),
-                )
-                for attr in self._row_no_mix_attrs_for_column(col):
-                    scope = self._attr_voyage_scope(attr, col.voyage_id)
-                    term(
-                        terms,
-                        "row_attr_link",
-                        (
-                            footprint_key,
-                            row_no,
-                            attr,
-                            scope,
-                            self._column_attr_value(col, attr),
-                        ),
-                        1.0,
-                    )
-            term(terms, "area_guidance_balance", col.quota_key, quantity)
-            anchor_row = next(
-                row_no
-                for bay_key, row_no, _qty in col.row_allocation
-                if bay_key == col.bay_key
-            )
-            for key, coefficient in (
-                (("group_area", col.group_key, col.area_no), quantity),
-                (("group_row", col.group_key, col.bay_key, anchor_row), 1.0),
-                (("group_used_upper",) + col.group_key, 1.0),
-                (("group_used_lower",) + col.group_key, -1.0),
-            ):
-                constraint = fixed.get(key)
-                if constraint is not None:
-                    terms.append((coefficient, constraint))
-            variables["column"][idx] = model.addPricedVar(
-                terms,
-                lb=0.0,
-                ub=float(self.group_demand[col.group_id]),
-                vtype="C",
-                obj=0.0 if objective_mode == "min_unplaced" else col.intrinsic_cost,
-                name=f"col_{idx}",
-            )
-
-    def _solve_lexicographic_integer_master(
+    def _solve_location_pool_integer_master(
         self,
         start_selected: Counter[int],
         start_unplaced: Counter[str],
@@ -1277,7 +934,7 @@ class ColumnGenerationPlanner:
             for group_id, var in vars_by_kind["unplaced"].items():
                 var.Start = float(max(0, int(unplaced.get(group_id, 0))))
 
-        stage1, stage1_vars, _ = self._build_restricted_master(
+        stage1, stage1_vars, _ = self._build_location_pool_integer_master(
             Model,
             quicksum,
             relax=False,
@@ -1312,7 +969,7 @@ class ColumnGenerationPlanner:
         stats["lexicographic_stage1_bound"] = self._gurobi_dual_bound(stage1)
         self._free_gurobi_model(stage1)
 
-        stage2, stage2_vars, _ = self._build_restricted_master(
+        stage2, stage2_vars, _ = self._build_location_pool_integer_master(
             Model,
             quicksum,
             relax=False,
@@ -1454,7 +1111,7 @@ class ColumnGenerationPlanner:
             except Exception:
                 continue
 
-    def _build_restricted_master(
+    def _build_location_pool_integer_master(
         self,
         Model,
         quicksum,
@@ -1675,10 +1332,10 @@ class ColumnGenerationPlanner:
                 group_area_cols,
                 group_row_cols,
             )
-        bay_compatibility_constraints = self._add_bay_compatibility_constraints(
+        bay_compatibility_constraints = self._add_location_pool_bay_compatibility_constraints(
             quicksum, model, columns, bay_attr_choice_cols, relax=relax
         )
-        row_compatibility_constraints = self._add_row_compatibility_constraints(
+        row_compatibility_constraints = self._add_location_pool_row_compatibility_constraints(
             quicksum, model, columns, row_attr_choice_cols, relax=relax
         )
         return model, {
@@ -1867,7 +1524,7 @@ class ColumnGenerationPlanner:
             model.addCons(baseline <= assigned)
             model.addCons(baseline <= quicksum(area_use_by_group[group_key]))
             model.addCons(baseline <= quicksum(row_use_by_group[group_key]))
-    def _add_bay_compatibility_constraints(
+    def _add_location_pool_bay_compatibility_constraints(
         self,
         quicksum,
         model,
@@ -1900,7 +1557,7 @@ class ColumnGenerationPlanner:
             "bay_attr_one": one_constraints,
         }
 
-    def _add_row_compatibility_constraints(
+    def _add_location_pool_row_compatibility_constraints(
         self,
         quicksum,
         model,
@@ -1933,15 +1590,1603 @@ class ColumnGenerationPlanner:
             "row_attr_one": one_constraints,
         }
 
-    def _initialize_column_generation(self) -> None:
+    def _initialize_pattern_generation(self) -> None:
+        """Seed the master with one all-unplaced pattern for every group."""
+        self._patterns.clear()
+        self._pattern_keys.clear()
+        self._artificial_pattern_by_group.clear()
+        self._pricing_calls_by_phase.clear()
         self._columns.clear()
         self._column_keys.clear()
+        for group in self.groups:
+            idx = self._append_pattern(
+                self._make_pattern(group, (), int(group.demand))
+            )
+            self._artificial_pattern_by_group[group.group_id] = idx
 
-    def _iter_feasible_unit_flow_columns(
+    def _make_pattern(
+        self,
+        group: ExportGroup,
+        placements: Iterable[PlacementColumn],
+        unplaced: int,
+    ) -> PackingPattern:
+        ordered = tuple(
+            sorted(
+                (col for col in placements if int(col.quantity) > 0),
+                key=lambda col: (
+                    col.area_no,
+                    self.bays[col.bay_key].bay_order,
+                    col.row_allocation,
+                ),
+            )
+        )
+        placed = sum(int(col.quantity) for col in ordered)
+        if placed + int(unplaced) != int(group.demand):
+            raise ValueError(
+                "packing pattern must partition one group demand exactly: "
+                f"group={group.group_id}, placed={placed}, unplaced={unplaced}, "
+                f"demand={group.demand}"
+            )
+        used_areas = {col.area_no for col in ordered}
+        used_rows = {
+            (col.bay_key, row_no)
+            for col in ordered
+            for bay_key, row_no, qty in col.row_allocation
+            if int(qty) > 0 and bay_key == col.bay_key
+        }
+        phase2_cost = sum(
+            float(col.intrinsic_cost) * int(col.quantity) for col in ordered
+        )
+        if ordered:
+            phase2_cost += self._area_activation_penalty() * max(
+                0, len(used_areas) - 1
+            )
+            phase2_cost += self._row_activation_penalty() * max(
+                0, len(used_rows) - 1
+            )
+        return PackingPattern(
+            pattern_id="",
+            group_id=group.group_id,
+            placements=ordered,
+            unplaced=int(unplaced),
+            phase2_cost=float(phase2_cost),
+        )
+
+    @staticmethod
+    def _pattern_identity(pattern: PackingPattern) -> tuple:
+        return (
+            pattern.group_id,
+            int(pattern.unplaced),
+            tuple(
+                (col.bay_key, int(col.quantity), col.row_allocation)
+                for col in pattern.placements
+            ),
+        )
+
+    def _append_pattern(self, candidate: PackingPattern) -> int:
+        key = self._pattern_identity(candidate)
+        if key in self._pattern_keys:
+            raise ValueError(f"duplicate packing pattern: {key}")
+        pattern = replace(
+            candidate,
+            pattern_id=f"P{len(self._patterns) + 1:07d}",
+        )
+        idx = len(self._patterns)
+        self._patterns.append(pattern)
+        self._pattern_keys.add(key)
+        return idx
+
+    def _placement_master_coefficients(
+        self,
+        col: PlacementColumn,
+    ) -> dict[str, Counter[object]]:
+        out: dict[str, Counter[object]] = defaultdict(Counter)
+        quantity = int(col.quantity)
+        footprint = self._placement_footprint_keys(col.bay_key, col.size)
+        stack_value = self._row_mix_key_for_column(col)
+        for footprint_key in footprint:
+            out["bay_capacity_limit"][footprint_key] += quantity
+            out["bay_port_stack_link"][(footprint_key, stack_value, col.size)] += quantity
+            for attr in self._bay_no_mix_attrs_for_column(col):
+                scope = self._attr_voyage_scope(attr, col.voyage_id)
+                out["bay_attr_link"][(
+                    footprint_key,
+                    attr,
+                    scope,
+                    self._column_attr_value(col, attr),
+                )] += quantity
+        out["bay_size_limit"][(col.bay_key, col.size)] += quantity
+        for footprint_key, row_no, qty in col.row_allocation:
+            out["row_capacity_limit"][(footprint_key, row_no)] += int(qty)
+            out["row_size_limit"][(footprint_key, row_no, col.size)] += int(qty)
+            for attr in self._row_no_mix_attrs_for_column(col):
+                scope = self._attr_voyage_scope(attr, col.voyage_id)
+                out["row_attr_link"][(
+                    footprint_key,
+                    row_no,
+                    attr,
+                    scope,
+                    self._column_attr_value(col, attr),
+                )] += int(qty)
+        out["area_guidance_balance"][col.quota_key] += quantity
+        return out
+
+    def _pattern_master_coefficients(
+        self,
+        pattern: PackingPattern,
+    ) -> dict[str, Counter[object]]:
+        out: dict[str, Counter[object]] = defaultdict(Counter)
+        out["group_convexity"][pattern.group_id] = 1
+        out["fixed_unplaced_total"]["total"] = int(pattern.unplaced)
+        for col in pattern.placements:
+            for section, values in self._placement_master_coefficients(col).items():
+                out[section].update(values)
+        return out
+
+    def _adaptive_pricing_batch_size(self, negative_count: int) -> int:
+        count = max(0, int(negative_count))
+        if count == 0:
+            return 0
+        proportional = int(
+            math.ceil(count * float(self.config.adaptive_pricing_fraction))
+        )
+        target = max(
+            int(self.config.min_columns_per_group_per_iteration), proportional
+        )
+        return min(
+            count,
+            int(self.config.max_columns_per_group_per_iteration),
+            target,
+        )
+
+    @staticmethod
+    def _dual_value(
+        duals: dict[tuple[str, object], float],
+        section: str,
+        key: object,
+    ) -> float:
+        return float(duals.get((section, key), 0.0))
+
+    def _master_dual_snapshot(
+        self,
+        model,
+        constraints: dict,
+    ) -> dict[tuple[str, object], float]:
+        duals: dict[tuple[str, object], float] = {}
+        for section, rows in constraints.items():
+            if not isinstance(rows, dict):
+                continue
+            for key, row in rows.items():
+                if row is not None:
+                    duals[(section, key)] = float(model.getDualsolLinear(row))
+        return duals
+
+    def _stabilized_duals(
+        self,
+        raw: dict[tuple[str, object], float],
+        center: dict[tuple[str, object], float] | None,
+    ) -> dict[tuple[str, object], float]:
+        if center is None:
+            return dict(raw)
+        alpha = float(self.config.dual_stabilization_alpha)
+        keys = set(raw) | set(center)
+        return {
+            key: alpha * float(raw.get(key, 0.0))
+            + (1.0 - alpha) * float(center.get(key, 0.0))
+            for key in keys
+        }
+
+    def _pattern_reduced_cost(
+        self,
+        pattern: PackingPattern,
+        duals: dict[tuple[str, object], float],
+        objective_mode: str,
+    ) -> float:
+        reduced = (
+            float(pattern.unplaced)
+            if objective_mode == "min_unplaced"
+            else float(pattern.phase2_cost)
+        )
+        for section, values in self._pattern_master_coefficients(pattern).items():
+            for key, coefficient in values.items():
+                reduced -= float(coefficient) * self._dual_value(
+                    duals, section, key
+                )
+        return float(reduced)
+
+    def _placement_reduced_unit_cost(
+        self,
+        col: PlacementColumn,
+        duals: dict[tuple[str, object], float],
+        objective_mode: str,
+    ) -> float:
+        reduced = (
+            0.0 if objective_mode == "min_unplaced" else float(col.intrinsic_cost)
+        )
+        unit = replace(
+            col,
+            quantity=1,
+            row_allocation=tuple(
+                (bay_key, row_no, 1)
+                for bay_key, row_no, _qty in col.row_allocation
+            ),
+        )
+        for section, values in self._placement_master_coefficients(unit).items():
+            for key, coefficient in values.items():
+                reduced -= float(coefficient) * self._dual_value(
+                    duals, section, key
+                )
+        return float(reduced)
+
+    def _price_packing_patterns(
+        self,
+        raw_duals: dict[tuple[str, object], float],
+        stabilized_duals: dict[tuple[str, object], float],
+        phase_name: str,
+        objective_mode: str,
+    ) -> tuple[dict, list[int]]:
+        """Use cheap stabilized pricing first and exact MIP pricing for proof."""
+        tolerance = max(1e-12, float(self.config.reduced_cost_tolerance))
+        call_number = int(self._pricing_calls_by_phase[phase_name])
+        self._pricing_calls_by_phase[phase_name] += 1
+        use_heuristic = call_number < 3
+        heuristic_by_group: dict[str, list[tuple[float, PackingPattern]]] = {
+            group.group_id: [] for group in self.groups
+        }
+        for group in self.groups if use_heuristic else ():
+            candidates: list[tuple[float, PackingPattern]] = []
+            for pattern in self._heuristic_group_patterns(
+                group, stabilized_duals, objective_mode
+            ):
+                if self._pattern_identity(pattern) in self._pattern_keys:
+                    continue
+                reduced = self._pattern_reduced_cost(
+                    pattern, raw_duals, objective_mode
+                )
+                if reduced < -tolerance:
+                    candidates.append((reduced, pattern))
+            candidates.sort(
+                key=lambda item: (item[0], self._pattern_identity(item[1]))
+            )
+            heuristic_by_group[group.group_id] = candidates
+
+        heuristic_negative_total = sum(
+            len(values) for values in heuristic_by_group.values()
+        )
+        # Heuristic pricing is used only to populate the first RMPs cheaply.
+        # Later iterations solve the exact pricing MIPs with stabilized duals;
+        # raw duals are used once more whenever no entering pattern is found,
+        # which is the only test accepted as the LP optimality certificate.
+        run_exact_search = (
+            not use_heuristic
+            or heuristic_negative_total <= 2 * len(self.groups)
+        )
+        force_raw_check = (
+            not use_heuristic
+            and (call_number - 3) % int(self.config.raw_dual_check_interval)
+            == int(self.config.raw_dual_check_interval) - 1
+        )
+        candidate_by_group = heuristic_by_group
+        minimum_by_group: dict[str, float] = {}
+        exact_seconds = 0.0
+        exact_performed = False
+
+        def merge_exact_pool(
+            pricing_duals: dict[tuple[str, object], float],
+        ) -> dict[str, float]:
+            nonlocal exact_seconds
+            minima: dict[str, float] = {}
+            for group in self.groups:
+                started = perf_counter()
+                patterns, minimum = self._solve_exact_group_pricing(
+                    group, pricing_duals, objective_mode
+                )
+                exact_seconds += perf_counter() - started
+                minima[group.group_id] = minimum
+                candidates = list(candidate_by_group.get(group.group_id, []))
+                seen_identities = {
+                    self._pattern_identity(pattern)
+                    for _reduced, pattern in candidates
+                }
+                for pattern in patterns:
+                    identity = self._pattern_identity(pattern)
+                    if identity in self._pattern_keys or identity in seen_identities:
+                        continue
+                    reduced = self._pattern_reduced_cost(
+                        pattern, raw_duals, objective_mode
+                    )
+                    if reduced < -tolerance:
+                        candidates.append((reduced, pattern))
+                        seen_identities.add(identity)
+                candidate_by_group[group.group_id] = sorted(
+                    candidates,
+                    key=lambda item: (item[0], self._pattern_identity(item[1])),
+                )
+            return minima
+
+        if run_exact_search:
+            candidate_by_group = {
+                group_id: list(values)
+                for group_id, values in heuristic_by_group.items()
+            }
+            stabilized_minima = merge_exact_pool(stabilized_duals)
+            if force_raw_check or not any(candidate_by_group.values()):
+                minimum_by_group = merge_exact_pool(raw_duals)
+                exact_performed = True
+            elif stabilized_duals == raw_duals:
+                minimum_by_group = stabilized_minima
+
+        entering: list[tuple[float, PackingPattern]] = []
+        negative_counts: dict[str, int] = {}
+        selected_batch: dict[str, int] = {}
+        for group in self.groups:
+            candidates = candidate_by_group.get(group.group_id, [])
+            batch = self._adaptive_pricing_batch_size(len(candidates))
+            negative_counts[group.group_id] = len(candidates)
+            selected_batch[group.group_id] = batch
+            entering.extend(candidates[:batch])
+        entering.sort(
+            key=lambda item: (item[0], self._pattern_identity(item[1]))
+        )
+        new_indices = [
+            self._append_pattern(pattern) for _reduced, pattern in entering
+        ]
+        return {
+            "new_patterns": len(new_indices),
+            "pricing_mode": (
+                "raw_dual_exact_group_pattern_mip"
+                if exact_performed
+                else "stabilized_exact_group_pattern_mip"
+                if run_exact_search
+                else "stabilized_constructive_pattern_pool"
+            ),
+            "exact_pricing_performed": exact_performed,
+            "exact_pricing": exact_performed,
+            "dual_stabilization": True,
+            "adaptive_batch": True,
+            "negative_candidates_by_group": negative_counts,
+            "selected_batch_by_group": selected_batch,
+            "generated_pattern_count": len(self._patterns),
+            "minimum_reduced_cost": min(
+                minimum_by_group.values(), default=None
+            ),
+            "minimum_reduced_cost_by_group": {
+                key: value for key, value in sorted(minimum_by_group.items())
+            },
+            "valid_lower_bound_correction": (
+                sum(min(0.0, value) for value in minimum_by_group.values())
+                if exact_performed
+                else None
+            ),
+            "exact_pricing_elapsed_seconds": round(exact_seconds, 3),
+            "phase": phase_name,
+        }, new_indices
+
+    def _heuristic_group_patterns(
+        self,
+        group: ExportGroup,
+        duals: dict[tuple[str, object], float],
+        objective_mode: str,
+    ) -> list[PackingPattern]:
+        candidates = list(self._iter_feasible_base_placements(group))
+        if not candidates:
+            return []
+        score_by_identity = {
+            id(col): self._placement_reduced_unit_cost(
+                col, duals, objective_mode
+            )
+            for col in candidates
+        }
+        scored = sorted(
+            candidates,
+            key=lambda col: (
+                score_by_identity[id(col)],
+                col.area_no,
+                self.bays[col.bay_key].bay_order,
+                col.row_allocation,
+            ),
+        )
+        seeds: list[PlacementColumn] = []
+        seen_areas: set[str] = set()
+        for col in scored:
+            if not seeds or col.area_no not in seen_areas:
+                seeds.append(col)
+                seen_areas.add(col.area_no)
+            if len(seeds) >= int(self.config.heuristic_pricing_variants):
+                break
+        for col in scored:
+            if len(seeds) >= int(self.config.heuristic_pricing_variants):
+                break
+            if col not in seeds:
+                seeds.append(col)
+
+        patterns: list[PackingPattern] = []
+        seen: set[tuple] = set()
+        for seed in seeds:
+            order = sorted(
+                scored,
+                key=lambda col: (
+                    score_by_identity[id(col)]
+                    + (
+                        0.0
+                        if col.area_no == seed.area_no
+                        else self._area_activation_penalty()
+                    )
+                    + (
+                        0.0
+                        if col.bay_key == seed.bay_key
+                        else self._row_activation_penalty()
+                    ),
+                    0 if col is seed else 1,
+                    col.area_no,
+                    self.bays[col.bay_key].bay_order,
+                    col.row_allocation,
+                ),
+            )
+            order = [seed] + [col for col in order if col is not seed]
+            state = self._empty_selection_state()
+            placements: list[PlacementColumn] = []
+            remaining = int(group.demand)
+            for unit in order:
+                if remaining <= 0:
+                    break
+                capacity = self._specific_row_remaining_capacity(
+                    group, unit, state, remaining
+                )
+                if capacity <= 0:
+                    continue
+                placement = replace(
+                    unit,
+                    quantity=capacity,
+                    stack_units=self._stack_units_for_quantity(
+                        unit.bay_key, unit.size, group, capacity
+                    ),
+                    row_allocation=tuple(
+                        (bay_key, row_no, capacity)
+                        for bay_key, row_no, _qty in unit.row_allocation
+                    ),
+                )
+                if not self._column_fits_state(placement, state, remaining):
+                    continue
+                self._apply_column_to_state(placement, state)
+                placements.append(placement)
+                remaining -= capacity
+            pattern = self._make_pattern(group, placements, remaining)
+            identity = self._pattern_identity(pattern)
+            if identity not in seen:
+                seen.add(identity)
+                patterns.append(pattern)
+        return patterns
+
+    def _specific_row_remaining_capacity(
+        self,
+        group: ExportGroup,
+        unit: PlacementColumn,
+        state: dict,
+        remaining: int,
+    ) -> int:
+        capacity = self._remaining_capacity_for_group_bay(
+            group,
+            unit.bay_key,
+            state,
+            remaining,
+            enforce_quota=False,
+        )
+        for footprint_key, row_no, _qty in unit.row_allocation:
+            bay = self.bays[footprint_key]
+            capacity = min(
+                capacity,
+                int(
+                    bay.row_physical_capacity.get(
+                        row_no, bay.physical_capacity
+                    )
+                )
+                - int(state["row_load"][(footprint_key, row_no)]),
+                int(
+                    bay.row_cap_by_size.get(unit.size, {}).get(
+                        row_no, bay.cap_by_size.get(unit.size, 0)
+                    )
+                )
+                - int(
+                    state["row_size_load"][(footprint_key, row_no, unit.size)]
+                ),
+            )
+        return max(0, int(capacity))
+
+    def _solve_exact_group_pricing(
+        self,
+        group: ExportGroup,
+        duals: dict[tuple[str, object], float],
+        objective_mode: str,
+    ) -> tuple[list[PackingPattern], float]:
+        import gurobipy as gp
+
+        candidates = list(self._iter_feasible_base_placements(group))
+        model = gp.Model(f"price_{self._key_name((group.group_id,))}")
+        model.Params.OutputFlag = 1 if self.config.verbose else 0
+        model.Params.Seed = int(self.config.solver_seed)
+        if int(self.config.solver_threads) > 0:
+            model.Params.Threads = int(self.config.solver_threads)
+        model.Params.TimeLimit = float(self.config.exact_pricing_time_limit)
+        model.Params.MIPGap = 0.0
+        model.Params.PoolSearchMode = 1
+        model.Params.PoolSolutions = int(
+            self.config.max_columns_per_group_per_iteration
+        )
+
+        x = {
+            idx: model.addVar(
+                lb=0.0,
+                ub=float(
+                    min(
+                        int(group.demand),
+                        self._base_location_capacity(group, candidate),
+                    )
+                ),
+                vtype=gp.GRB.INTEGER,
+                name=f"x_{idx}",
+            )
+            for idx, candidate in enumerate(candidates)
+        }
+        unplaced = model.addVar(
+            lb=0.0,
+            ub=float(group.demand),
+            vtype=gp.GRB.INTEGER,
+            name="unplaced",
+        )
+        model.addConstr(
+            gp.quicksum(x.values()) + unplaced == int(group.demand)
+        )
+
+        by_bay: defaultdict[str, list] = defaultdict(list)
+        by_bay_size: defaultdict[tuple[str, str], list] = defaultdict(list)
+        by_row: defaultdict[tuple[str, str], list] = defaultdict(list)
+        by_row_size: defaultdict[tuple[str, str, str], list] = defaultdict(list)
+        by_stack: defaultdict[tuple[str, str], list] = defaultdict(list)
+        by_area: defaultdict[str, list] = defaultdict(list)
+        for idx, candidate in enumerate(candidates):
+            by_area[candidate.area_no].append(x[idx])
+            for footprint_key in self._placement_footprint_keys(
+                candidate.bay_key, candidate.size
+            ):
+                by_bay[footprint_key].append(x[idx])
+                by_stack[(footprint_key, candidate.size)].append(x[idx])
+            by_bay_size[(candidate.bay_key, candidate.size)].append(x[idx])
+            for footprint_key, row_no, _qty in candidate.row_allocation:
+                by_row[(footprint_key, row_no)].append(x[idx])
+                by_row_size[(footprint_key, row_no, candidate.size)].append(
+                    x[idx]
+                )
+        for bay_key, variables in by_bay.items():
+            model.addConstr(
+                gp.quicksum(variables)
+                <= int(self.bays[bay_key].physical_capacity)
+            )
+        for (bay_key, size), variables in by_bay_size.items():
+            model.addConstr(
+                gp.quicksum(variables)
+                <= int(self.bays[bay_key].cap_by_size.get(size, 0))
+            )
+        for (bay_key, row_no), variables in by_row.items():
+            bay = self.bays[bay_key]
+            model.addConstr(
+                gp.quicksum(variables)
+                <= int(
+                    bay.row_physical_capacity.get(row_no, bay.physical_capacity)
+                )
+            )
+        for (bay_key, row_no, size), variables in by_row_size.items():
+            bay = self.bays[bay_key]
+            model.addConstr(
+                gp.quicksum(variables)
+                <= int(
+                    bay.row_cap_by_size.get(size, {}).get(
+                        row_no, bay.cap_by_size.get(size, 0)
+                    )
+                )
+            )
+        for (bay_key, size), variables in by_stack.items():
+            stack_count = self._stack_count_for_group(bay_key, size, group)
+            unit_capacity = self._stack_unit_capacity_for_group(
+                bay_key, size, group
+            )
+            model.addConstr(
+                gp.quicksum(variables)
+                <= int(stack_count * unit_capacity)
+            )
+
+        placed = model.addVar(vtype=gp.GRB.BINARY, name="placed")
+        total_placed = gp.quicksum(x.values())
+        model.addConstr(total_placed <= int(group.demand) * placed)
+        model.addConstr(placed <= total_placed)
+        area_use = {}
+        for area_no, variables in by_area.items():
+            use = model.addVar(
+                vtype=gp.GRB.BINARY, name=f"use_area_{area_no}"
+            )
+            area_use[area_no] = use
+            load = gp.quicksum(variables)
+            model.addConstr(load <= int(group.demand) * use)
+            model.addConstr(use <= load)
+        row_use = {}
+        model.update()
+        for idx in x:
+            use = model.addVar(vtype=gp.GRB.BINARY, name=f"use_row_{idx}")
+            row_use[idx] = use
+            ub = max(1, int(round(x[idx].UB)))
+            model.addConstr(x[idx] <= ub * use)
+            model.addConstr(use <= x[idx])
+
+        objective = gp.LinExpr()
+        unplaced_cost = 1.0 if objective_mode == "min_unplaced" else 0.0
+        unplaced_cost -= self._dual_value(
+            duals, "fixed_unplaced_total", "total"
+        )
+        objective += unplaced_cost * unplaced
+        for idx, candidate in enumerate(candidates):
+            objective += self._placement_reduced_unit_cost(
+                candidate, duals, objective_mode
+            ) * x[idx]
+        if objective_mode != "min_unplaced":
+            objective += self._area_activation_penalty() * gp.quicksum(
+                area_use.values()
+            )
+            objective += self._row_activation_penalty() * gp.quicksum(
+                row_use.values()
+            )
+            objective -= (
+                self._area_activation_penalty()
+                + self._row_activation_penalty()
+            ) * placed
+        model.setObjective(objective, gp.GRB.MINIMIZE)
+        model.optimize()
+        if model.Status != gp.GRB.OPTIMAL:
+            status = int(model.Status)
+            model.dispose()
+            raise RuntimeError(
+                "exact packing-pattern pricing must be proven optimal: "
+                f"group={group.group_id}, status={status}"
+            )
+        minimum_reduced_cost = float(model.ObjVal) - self._dual_value(
+            duals, "group_convexity", group.group_id
+        )
+        patterns: list[PackingPattern] = []
+        seen: set[tuple] = set()
+        for solution_number in range(int(model.SolCount)):
+            model.Params.SolutionNumber = solution_number
+            placements: list[PlacementColumn] = []
+            for idx, candidate in enumerate(candidates):
+                quantity = int(round(x[idx].Xn))
+                if quantity <= 0:
+                    continue
+                placements.append(
+                    replace(
+                        candidate,
+                        quantity=quantity,
+                        stack_units=self._stack_units_for_quantity(
+                            candidate.bay_key,
+                            candidate.size,
+                            group,
+                            quantity,
+                        ),
+                        row_allocation=tuple(
+                            (bay_key, row_no, quantity)
+                            for bay_key, row_no, _qty in candidate.row_allocation
+                        ),
+                    )
+                )
+            pattern = self._make_pattern(
+                group, placements, int(round(unplaced.Xn))
+            )
+            identity = self._pattern_identity(pattern)
+            if identity not in seen:
+                seen.add(identity)
+                patterns.append(pattern)
+        model.dispose()
+        return patterns, minimum_reduced_cost
+
+    def _solve_by_column_generation(self) -> tuple[Counter[int], Counter[str], dict]:
+        """Solve the two lexicographic pattern masters to a certified LP gap."""
+        from gurobipy import quicksum
+
+        pricing_start = perf_counter()
+        stats: dict = {
+            "gurobi_available": True,
+            "pricing_method": "stabilized_heuristic_then_exact_group_pattern_pricing",
+            "pricing_iterations": [],
+            "pricing_stop_reason": "",
+            "base_feasible_placement_count": self._base_feasible_placement_count,
+        }
+
+        def run_phase(
+            phase_name: str,
+            objective_mode: str,
+            fixed_unplaced_total: float | None = None,
+        ) -> tuple[float, float, float, float, str]:
+            model, variables, constraints = self._build_restricted_master(
+                _GurobiModelAdapter,
+                quicksum,
+                relax=True,
+                objective_mode=objective_mode,
+                fixed_unplaced_total=fixed_unplaced_total,
+            )
+            dual_center: dict[tuple[str, object], float] | None = None
+            last_objective = 0.0
+            last_unplaced = 0.0
+            try:
+                for iteration in range(int(self.config.max_iterations)):
+                    model.optimize()
+                    status = self._gurobi_status_name(model)
+                    if status != "optimal":
+                        raise RuntimeError(
+                            f"Strict {phase_name} pattern-master LP is not optimal: "
+                            f"{status}"
+                        )
+                    last_objective = self._gurobi_objective_value(model)
+                    last_unplaced = sum(
+                        self._patterns[idx].unplaced
+                        * self._gurobi_value(model, var)
+                        for idx, var in variables["pattern"].items()
+                    )
+                    if (
+                        objective_mode == "min_unplaced"
+                        and last_objective <= 1e-9
+                    ):
+                        stats["pricing_iterations"].append(
+                            {
+                                "phase": phase_name,
+                                "iteration": iteration,
+                                "lp_objective": last_objective,
+                                "lp_unplaced_boxes": float(last_unplaced),
+                                "new_patterns": 0,
+                                "pricing_mode": "nonnegative_stage1_objective_bound",
+                                "exact_pricing_performed": False,
+                                "valid_lp_lower_bound": 0.0,
+                                "certified_lp_gap": 0.0,
+                            }
+                        )
+                        return (
+                            last_objective,
+                            last_unplaced,
+                            0.0,
+                            0.0,
+                            "nonnegative_stage1_objective_bound",
+                        )
+                    raw_duals = self._master_dual_snapshot(model, constraints)
+                    stabilized = self._stabilized_duals(
+                        raw_duals, dual_center
+                    )
+                    pricing, new_indices = self._price_packing_patterns(
+                        raw_duals,
+                        stabilized,
+                        phase_name,
+                        objective_mode,
+                    )
+                    correction = pricing.get("valid_lower_bound_correction")
+                    valid_lower_bound = None
+                    certified_lp_gap = None
+                    if correction is not None:
+                        valid_lower_bound = float(last_objective) + float(
+                            correction
+                        )
+                        if objective_mode == "min_unplaced":
+                            valid_lower_bound = max(0.0, valid_lower_bound)
+                        certified_lp_gap = max(
+                            0.0,
+                            (float(last_objective) - valid_lower_bound)
+                            / max(abs(float(last_objective)), 1.0),
+                        )
+                    stats["pricing_iterations"].append(
+                        {
+                            "phase": phase_name,
+                            "iteration": iteration,
+                            "lp_objective": last_objective,
+                            "lp_unplaced_boxes": float(last_unplaced),
+                            "valid_lp_lower_bound": valid_lower_bound,
+                            "certified_lp_gap": certified_lp_gap,
+                            **pricing,
+                        }
+                    )
+                    if (
+                        certified_lp_gap is not None
+                        and certified_lp_gap
+                        <= float(self.config.pattern_lp_gap_tolerance)
+                    ):
+                        return (
+                            last_objective,
+                            last_unplaced,
+                            float(valid_lower_bound),
+                            float(certified_lp_gap),
+                            "certified_pattern_lp_gap",
+                        )
+                    if not new_indices:
+                        if not pricing["exact_pricing_performed"]:
+                            raise RuntimeError(
+                                "pattern pricing stopped without an exact certificate"
+                            )
+                        return (
+                            last_objective,
+                            last_unplaced,
+                            float(last_objective),
+                            0.0,
+                            "no_negative_reduced_cost_pattern",
+                        )
+                    self._add_patterns_to_restricted_master(
+                        model,
+                        variables,
+                        constraints,
+                        new_indices,
+                        objective_mode,
+                    )
+                    dual_center = stabilized
+            finally:
+                self._free_gurobi_model(model)
+            raise RuntimeError(
+                f"Strict {phase_name} pattern pricing exceeded max_iterations="
+                f"{self.config.max_iterations}"
+            )
+
+        (
+            _phase1_objective,
+            phase1_unplaced,
+            _phase1_lower_bound,
+            _phase1_gap,
+            phase1_stop_reason,
+        ) = run_phase(
+            "minimum_unplaced", "min_unplaced"
+        )
+        if abs(phase1_unplaced - round(phase1_unplaced)) > 1e-7:
+            raise RuntimeError(
+                "stage-1 pattern LP has a fractional unplaced optimum; "
+                "cannot define the integer lexicographic boundary"
+            )
+        phase1_unplaced = float(round(phase1_unplaced))
+        (
+            phase2_rmp_objective,
+            phase2_unplaced,
+            phase2_lower_bound,
+            phase2_lp_gap,
+            phase2_stop_reason,
+        ) = run_phase(
+            "secondary_objective",
+            "full",
+            fixed_unplaced_total=phase1_unplaced,
+        )
+        stats.update(
+            {
+                "pricing_stop_reason": "two_phase_certified_pattern_pricing",
+                "pricing_phase_stop_reasons": {
+                    "minimum_unplaced": phase1_stop_reason,
+                    "secondary_objective": phase2_stop_reason,
+                },
+                "pricing_iterations_run": len(stats["pricing_iterations"]),
+                "pricing_phase1_lp_unplaced_boxes": phase1_unplaced,
+                "pricing_phase2_rmp_objective": phase2_rmp_objective,
+                "pricing_phase2_lp_lower_bound": phase2_lower_bound,
+                "pricing_phase2_certified_gap": phase2_lp_gap,
+                "pattern_generation_pricing_elapsed_seconds": round(
+                    perf_counter() - pricing_start, 3
+                ),
+            }
+        )
+
+        integer_start = perf_counter()
+        artificial_start = Counter(
+            {idx: 1 for idx in self._artificial_pattern_by_group.values()}
+        )
+        selected_patterns, unplaced, integer_stats = (
+            self._solve_lexicographic_integer_master(
+                artificial_start,
+                float(self.config.total_time_limit)
+                if self.config.total_time_limit > 0
+                else None,
+            )
+        )
+        if not integer_stats.get("lexicographic_integer_master_used"):
+            raise RuntimeError(
+                "The final two-stage integer pattern master produced no stage-2 solution"
+            )
+        pattern_count = len(self._patterns)
+        selected, expanded_unplaced = self._expand_pattern_selection(
+            selected_patterns
+        )
+        if expanded_unplaced != unplaced:
+            raise RuntimeError(
+                "packing-pattern expansion changed unplaced quantities"
+            )
+        final_objective = self._selected_solution_energy(selected, unplaced)
+        model_objective = float(
+            integer_stats.get("lexicographic_stage2_objective", final_objective)
+        )
+        if abs(model_objective - final_objective) > 1e-6:
+            raise RuntimeError(
+                "integer pattern objective differs from reconstructed row plan: "
+                f"master={model_objective}, reconstructed={final_objective}"
+            )
+        pattern_integer_objective = final_objective
+        selected, unplaced, polishing_stats = (
+            self._polish_with_pattern_location_pool(selected, unplaced)
+        )
+        if not polishing_stats.get("lexicographic_integer_master_used"):
+            raise RuntimeError("pattern-location polishing produced no stage-2 solution")
+        final_objective = self._selected_solution_energy(selected, unplaced)
+        if final_objective > pattern_integer_objective + 1e-7:
+            raise RuntimeError(
+                "pattern-location polishing worsened the incumbent objective: "
+                f"before={pattern_integer_objective}, after={final_objective}"
+            )
+        final_unplaced = int(sum(unplaced.values()))
+        lp_gap: float | None = None
+        gap_reason = "available"
+        if abs(phase1_unplaced - final_unplaced) <= 1e-7:
+            denominator = max(abs(final_objective), 1e-12)
+            lp_gap = max(
+                0.0,
+                (final_objective - phase2_lower_bound) / denominator,
+            )
+        else:
+            gap_reason = (
+                "phase2 LP and integer pattern master fix different unplaced totals"
+            )
+        stats.update(polishing_stats)
+        stats.update(
+            {
+                "master_algorithm": (
+                    "stabilized_pattern_column_generation_then_"
+                    "pattern_pool_fix_and_optimize"
+                ),
+                "master_bound_scope": "complete_group_pattern_lp_relaxation",
+                "master_status": "lexicographic_pattern_pool_integer_polishing",
+                "master_solve_seconds": round(
+                    perf_counter() - integer_start, 3
+                ),
+                "master_objective": final_objective,
+                "master_mip_gap": polishing_stats.get(
+                    "lexicographic_stage2_gap"
+                ),
+                "restricted_integer_master": {
+                    "pattern_count": pattern_count,
+                    "selected_pattern_count": int(sum(selected_patterns.values())),
+                    "objective": integer_stats.get(
+                        "lexicographic_stage2_objective"
+                    ),
+                    "bound": integer_stats.get("lexicographic_stage2_bound"),
+                    "mip_gap": integer_stats.get("lexicographic_stage2_gap"),
+                    "stage1_unplaced_boxes": integer_stats.get(
+                        "lexicographic_stage1_unplaced_boxes"
+                    ),
+                },
+                "pattern_pool_integer_polishing": {
+                    **polishing_stats,
+                    "objective_before_polishing": pattern_integer_objective,
+                    "objective_after_polishing": final_objective,
+                    "improvement": max(
+                        0.0, pattern_integer_objective - final_objective
+                    ),
+                },
+                "complete_pattern_lp_lower_bound": phase2_lower_bound,
+                "complete_model_lp_bound_gap": lp_gap,
+                "complete_model_lp_bound_gap_reason": gap_reason,
+                "complete_model_certified_gap": lp_gap,
+                "complete_model_certified_gap_source": (
+                    "exact_group_pattern_pricing_lp_lower_bound"
+                ),
+                "restricted_master_lp_unplaced_boxes": float(
+                    phase2_unplaced
+                ),
+                "generated_pattern_count": pattern_count,
+                "selected_pattern_count": int(sum(selected_patterns.values())),
+            }
+        )
+        return selected, unplaced, stats
+
+    def _add_patterns_to_restricted_master(
+        self,
+        model,
+        variables: dict,
+        constraints: dict,
+        pattern_indices: Iterable[int],
+        objective_mode: str,
+    ) -> None:
+        """Insert new pattern variables while preserving the RMP basis."""
+        for idx in pattern_indices:
+            pattern = self._patterns[int(idx)]
+            terms: list[tuple[float, object]] = []
+            for section, values in self._pattern_master_coefficients(
+                pattern
+            ).items():
+                rows = constraints.get(section, {})
+                for key, coefficient in values.items():
+                    row = rows.get(key)
+                    if row is not None and coefficient:
+                        terms.append((float(coefficient), row))
+            variables["pattern"][idx] = model.addPricedVar(
+                terms,
+                lb=0.0,
+                ub=1.0,
+                vtype="C",
+                obj=(
+                    float(pattern.unplaced)
+                    if objective_mode == "min_unplaced"
+                    else float(pattern.phase2_cost)
+                ),
+                name=f"pattern_{idx}",
+            )
+
+    def _expand_pattern_selection(
+        self,
+        selected_patterns: Counter[int],
+    ) -> tuple[Counter[int], Counter[str]]:
+        """Convert selected patterns into the existing row-output structure."""
+        self._columns.clear()
+        self._column_keys.clear()
+        selected: Counter[int] = Counter()
+        unplaced: Counter[str] = Counter()
+        for pattern_idx, chosen in sorted(selected_patterns.items()):
+            if chosen <= 0:
+                continue
+            pattern = self._patterns[pattern_idx]
+            if int(chosen) != 1:
+                raise RuntimeError(
+                    "group convexity permits exactly one selected pattern per group"
+                )
+            if pattern.unplaced > 0:
+                unplaced[pattern.group_id] += int(pattern.unplaced)
+            for placement in pattern.placements:
+                idx = self._append_generated_column(placement)
+                selected[idx] = 1
+        return selected, unplaced
+
+    def _polish_with_pattern_location_pool(
+        self,
+        incumbent_selected: Counter[int],
+        incumbent_unplaced: Counter[str],
+    ) -> tuple[Counter[int], Counter[str], dict]:
+        """Recombine all row locations discovered inside generated patterns.
+
+        This is a compact fix-and-optimize neighborhood, not branch-and-price:
+        pattern pricing remains finished, while the integer polishing model may
+        exchange individual row allocations among the generated group patterns.
+        """
+        incumbent_columns = list(self._columns)
+        pool_candidates: dict[
+            tuple[str, str, int, tuple[tuple[str, str, int], ...]],
+            PlacementColumn,
+        ] = {}
+        for pattern in self._patterns:
+            for placement in pattern.placements:
+                unit = replace(
+                    placement,
+                    column_id="",
+                    quantity=1,
+                    stack_units=1,
+                    row_allocation=tuple(
+                        (bay_key, row_no, 1)
+                        for bay_key, row_no, qty in placement.row_allocation
+                        if int(qty) > 0
+                    ),
+                )
+                pool_candidates.setdefault(self._column_identity(unit), unit)
+
+        self._columns.clear()
+        self._column_keys.clear()
+        pool_index: dict[
+            tuple[str, str, int, tuple[tuple[str, str, int], ...]], int
+        ] = {}
+        for key, unit in sorted(
+            pool_candidates.items(),
+            key=lambda item: (
+                item[1].group_id,
+                item[1].area_no,
+                self.bays[item[1].bay_key].bay_order,
+                item[1].row_allocation,
+            ),
+        ):
+            pool_index[key] = self._append_generated_column(unit)
+
+        start_selected: Counter[int] = Counter()
+        for idx, chosen in incumbent_selected.items():
+            if chosen <= 0:
+                continue
+            placement = incumbent_columns[idx]
+            unit = replace(
+                placement,
+                column_id="",
+                quantity=1,
+                stack_units=1,
+                row_allocation=tuple(
+                    (bay_key, row_no, 1)
+                    for bay_key, row_no, qty in placement.row_allocation
+                    if int(qty) > 0
+                ),
+            )
+            pool_idx = pool_index.get(self._column_identity(unit))
+            if pool_idx is None:
+                raise RuntimeError("incumbent row location is absent from pattern pool")
+            start_selected[pool_idx] += int(placement.quantity) * int(chosen)
+
+        selected, unplaced, solve_stats = (
+            self._solve_location_pool_integer_master(
+                start_selected,
+                Counter(incumbent_unplaced),
+                float(self.config.total_time_limit)
+                if self.config.total_time_limit > 0
+                else None,
+            )
+        )
+        solve_stats["location_pool_size"] = len(self._columns)
+        solve_stats["source_pattern_count"] = len(self._patterns)
+        solve_stats["method"] = "pattern_location_pool_fix_and_optimize"
+        return selected, unplaced, solve_stats
+
+    def _build_restricted_master(
+        self,
+        Model,
+        quicksum,
+        relax: bool,
+        objective_mode: str = "full",
+        fixed_unplaced_total: float | None = None,
+    ):
+        model = Model("yard_export_group_pattern_master_gurobi")
+        self._configure_gurobi_output(model)
+        self._set_gurobi_param(model, "Seed", int(self.config.solver_seed))
+        if int(self.config.solver_threads) > 0:
+            self._set_gurobi_param(
+                model, "Threads", int(self.config.solver_threads)
+            )
+        if relax:
+            self._set_gurobi_param(model, "Method", int(self.config.lp_method))
+        model.setMinimize()
+        pattern_vtype = "C" if relax else "B"
+        patterns = {
+            idx: model.addVar(
+                lb=0.0,
+                ub=1.0,
+                vtype=pattern_vtype,
+                obj=(
+                    float(pattern.unplaced)
+                    if objective_mode == "min_unplaced"
+                    else float(pattern.phase2_cost)
+                ),
+                name=f"pattern_{idx}",
+            )
+            for idx, pattern in enumerate(self._patterns)
+        }
+        import_reserve = {
+            (flow, size, bay_key): model.addVar(
+                lb=0.0,
+                ub=float(capacity),
+                vtype="C" if relax else "I",
+                obj=0.0,
+                name=(
+                    f"import_reserve_{flow}_{size}_"
+                    f"{self._key_name((bay_key,))}"
+                ),
+            )
+            for (flow, size), candidates in sorted(
+                self.import_reservation_candidates.items()
+            )
+            for bay_key, capacity in candidates
+        }
+
+        coefficient_rows: defaultdict[
+            str, defaultdict[object, list[tuple[int, float]]]
+        ] = defaultdict(lambda: defaultdict(list))
+        for idx, pattern in enumerate(self._patterns):
+            for section, values in self._pattern_master_coefficients(
+                pattern
+            ).items():
+                for key, coefficient in values.items():
+                    if coefficient:
+                        coefficient_rows[section][key].append(
+                            (idx, float(coefficient))
+                        )
+
+        import_by_bay: defaultdict[str, list] = defaultdict(list)
+        import_by_bay_size: defaultdict[tuple[str, str], list] = defaultdict(list)
+        import_by_flow_size: defaultdict[tuple[str, str], list] = defaultdict(list)
+        import_by_flow_area_size: defaultdict[tuple[str, str, str], list] = (
+            defaultdict(list)
+        )
+        for (flow, size, bay_key), var in import_reserve.items():
+            area_no = self.bays[bay_key].area_no
+            for footprint_key in self._placement_footprint_keys(bay_key, size):
+                import_by_bay[footprint_key].append(var)
+            import_by_bay_size[(bay_key, size)].append(var)
+            import_by_flow_size[(flow, size)].append(var)
+            import_by_flow_area_size[(flow, area_no, size)].append(var)
+
+        group_convexity = {}
+        for group in self.groups:
+            items = coefficient_rows["group_convexity"].get(
+                group.group_id, []
+            )
+            group_convexity[group.group_id] = model.addCons(
+                quicksum(coefficient * patterns[idx] for idx, coefficient in items)
+                == 1.0,
+                name=f"choose_pattern_{group.group_id}",
+            )
+
+        bay_capacity_limit = {}
+        for bay_key in sorted(self._master_bay_capacity_keys):
+            items = coefficient_rows["bay_capacity_limit"].get(bay_key, [])
+            bay_capacity_limit[bay_key] = model.addCons(
+                quicksum(coefficient * patterns[idx] for idx, coefficient in items)
+                + quicksum(import_by_bay.get(bay_key, []))
+                <= int(self.bays[bay_key].physical_capacity),
+                name=f"bay_cap_{self._key_name((bay_key,))}",
+            )
+        bay_size_limit = {}
+        for key in sorted(self._master_bay_size_keys):
+            bay_key, size = key
+            items = coefficient_rows["bay_size_limit"].get(key, [])
+            bay_size_limit[key] = model.addCons(
+                quicksum(coefficient * patterns[idx] for idx, coefficient in items)
+                + quicksum(import_by_bay_size.get(key, []))
+                <= int(self.bays[bay_key].cap_by_size.get(size, 0)),
+                name=f"bay_size_{self._key_name((bay_key, size))}",
+            )
+        row_capacity_limit = {}
+        for key in sorted(self._master_row_capacity_keys):
+            bay_key, row_no = key
+            bay = self.bays[bay_key]
+            items = coefficient_rows["row_capacity_limit"].get(key, [])
+            row_capacity_limit[key] = model.addCons(
+                quicksum(coefficient * patterns[idx] for idx, coefficient in items)
+                <= int(
+                    bay.row_physical_capacity.get(row_no, bay.physical_capacity)
+                ),
+                name=f"row_cap_{self._key_name((bay_key, row_no))}",
+            )
+        row_size_limit = {}
+        for key in sorted(self._master_row_size_keys):
+            bay_key, row_no, size = key
+            bay = self.bays[bay_key]
+            items = coefficient_rows["row_size_limit"].get(key, [])
+            row_size_limit[key] = model.addCons(
+                quicksum(coefficient * patterns[idx] for idx, coefficient in items)
+                <= int(
+                    bay.row_cap_by_size.get(size, {}).get(
+                        row_no, bay.cap_by_size.get(size, 0)
+                    )
+                ),
+                name=f"row_size_{self._key_name((bay_key, row_no, size))}",
+            )
+
+        bay_port_stack_link = {}
+        bay_stack_total_limit = {}
+        stack_vars_by_bay_size: defaultdict[tuple[str, str], list] = defaultdict(list)
+        for key in sorted(self._master_stack_keys):
+            bay_key, port, size = key
+            sample_group = self.groups_by_id.get(
+                self._master_stack_sample_group.get(key, "")
+            )
+            if sample_group is None:
+                continue
+            stack_count = self._stack_count_for_group(
+                bay_key, size, sample_group
+            )
+            unit_capacity = self._stack_unit_capacity_for_group(
+                bay_key, size, sample_group
+            )
+            if stack_count <= 0 or unit_capacity <= 0:
+                continue
+            stack_var = model.addVar(
+                lb=0.0,
+                ub=stack_count,
+                vtype="C" if relax else "I",
+                name=f"stack_{self._key_name(key)}",
+            )
+            items = coefficient_rows["bay_port_stack_link"].get(key, [])
+            bay_port_stack_link[key] = model.addCons(
+                quicksum(coefficient * patterns[idx] for idx, coefficient in items)
+                <= unit_capacity * stack_var,
+                name=f"stack_load_{self._key_name(key)}",
+            )
+            stack_vars_by_bay_size[(bay_key, size)].append(stack_var)
+        for key, stack_vars in stack_vars_by_bay_size.items():
+            stack_count = self._stack_count_for_bay_size(*key)
+            bay_stack_total_limit[key] = model.addCons(
+                quicksum(stack_vars) <= stack_count,
+                name=f"stack_total_{self._key_name(key)}",
+            )
+
+        import_total_balance = {}
+        for key, required in sorted(self.import_total_by_flow_size.items()):
+            candidates = import_by_flow_size.get(key, [])
+            if not candidates:
+                raise ValueError(
+                    "import capacity reservation has no compatible bay: "
+                    f"flow={key[0]}, size={key[1]}, required={required}"
+                )
+            import_total_balance[key] = model.addCons(
+                quicksum(candidates) == int(required),
+                name=f"import_total_{self._key_name(key)}",
+            )
+        import_reference_balance = self._add_import_reference_deviation(
+            quicksum,
+            model,
+            import_by_flow_area_size,
+            objective_mode=objective_mode,
+        )
+
+        fixed_unplaced = {}
+        if fixed_unplaced_total is not None:
+            items = coefficient_rows["fixed_unplaced_total"].get("total", [])
+            fixed_unplaced["total"] = model.addCons(
+                quicksum(coefficient * patterns[idx] for idx, coefficient in items)
+                == float(fixed_unplaced_total),
+                name="fixed_total_unplaced",
+            )
+        area_guidance_balance = self._add_pattern_area_guidance_objective(
+            quicksum,
+            model,
+            patterns,
+            coefficient_rows["area_guidance_balance"],
+            objective_mode,
+        )
+        bay_compatibility = self._add_pattern_bay_compatibility_constraints(
+            quicksum,
+            model,
+            patterns,
+            coefficient_rows["bay_attr_link"],
+            relax,
+        )
+        row_compatibility = self._add_pattern_row_compatibility_constraints(
+            quicksum,
+            model,
+            patterns,
+            coefficient_rows["row_attr_link"],
+            relax,
+        )
+        return model, {
+            "pattern": patterns,
+            "import_reserve": import_reserve,
+        }, {
+            "group_convexity": group_convexity,
+            "bay_capacity_limit": bay_capacity_limit,
+            "bay_size_limit": bay_size_limit,
+            "row_capacity_limit": row_capacity_limit,
+            "row_size_limit": row_size_limit,
+            "bay_port_stack_link": bay_port_stack_link,
+            "bay_stack_total_limit": bay_stack_total_limit,
+            "import_total_balance": import_total_balance,
+            "import_reference_balance": import_reference_balance,
+            "fixed_unplaced_total": fixed_unplaced,
+            "area_guidance_balance": area_guidance_balance,
+            **bay_compatibility,
+            **row_compatibility,
+        }
+
+    def _add_pattern_area_guidance_objective(
+        self,
+        quicksum,
+        model,
+        patterns,
+        items_by_key,
+        objective_mode: str,
+    ) -> dict[tuple[str, str, str, str], object]:
+        if objective_mode == "min_unplaced":
+            return {}
+        balance = {}
+        for key in sorted(self._master_area_guidance_keys):
+            voyage_id, flow, area_no, big_size = key
+            target = self._area_size_target(
+                voyage_id, flow, area_no, big_size
+            )
+            pos = model.addVar(
+                lb=0.0,
+                obj=self._area_guidance_penalty(),
+                name=f"guide_pos_{self._key_name(key)}",
+            )
+            neg = model.addVar(
+                lb=0.0,
+                obj=self._area_guidance_penalty(),
+                name=f"guide_neg_{self._key_name(key)}",
+            )
+            items = items_by_key.get(key, [])
+            actual = quicksum(
+                coefficient * patterns[idx] for idx, coefficient in items
+            )
+            balance[key] = model.addCons(
+                actual - target == pos - neg,
+                name=f"guide_balance_{self._key_name(key)}",
+            )
+        return balance
+
+    def _add_pattern_bay_compatibility_constraints(
+        self,
+        quicksum,
+        model,
+        patterns,
+        items_by_key,
+        relax: bool,
+    ) -> dict[str, dict]:
+        uses_by_scope: defaultdict[tuple[str, str, str], list] = defaultdict(list)
+        links = {}
+        choices = {}
+        for key in sorted(self._master_bay_attr_choice_keys):
+            bay_key, attr, scope, value = key
+            use = model.addVar(
+                lb=0.0,
+                ub=1.0,
+                vtype="C" if relax else "B",
+                name=f"bay_use_{self._key_name(key)}",
+            )
+            items = items_by_key.get(key, [])
+            links[key] = model.addCons(
+                quicksum(
+                    coefficient * patterns[idx] for idx, coefficient in items
+                )
+                <= self._master_bay_attr_big_m[key] * use,
+                name=f"bay_attr_link_{self._key_name(key)}",
+            )
+            uses_by_scope[(bay_key, attr, scope)].append(use)
+        for key, uses in uses_by_scope.items():
+            choices[key] = model.addCons(
+                quicksum(uses) <= 1,
+                name=f"bay_attr_one_{self._key_name(key)}",
+            )
+        return {"bay_attr_link": links, "bay_attr_one": choices}
+
+    def _add_pattern_row_compatibility_constraints(
+        self,
+        quicksum,
+        model,
+        patterns,
+        items_by_key,
+        relax: bool,
+    ) -> dict[str, dict]:
+        uses_by_scope: defaultdict[tuple[str, str, str, str], list] = (
+            defaultdict(list)
+        )
+        links = {}
+        choices = {}
+        for key in sorted(self._master_row_attr_choice_keys):
+            bay_key, row_no, attr, scope, value = key
+            use = model.addVar(
+                lb=0.0,
+                ub=1.0,
+                vtype="C" if relax else "B",
+                name=f"row_use_{self._key_name(key)}",
+            )
+            items = items_by_key.get(key, [])
+            links[key] = model.addCons(
+                quicksum(
+                    coefficient * patterns[idx] for idx, coefficient in items
+                )
+                <= self._master_row_attr_big_m[key] * use,
+                name=f"row_attr_link_{self._key_name(key)}",
+            )
+            uses_by_scope[(bay_key, row_no, attr, scope)].append(use)
+        for key, uses in uses_by_scope.items():
+            choices[key] = model.addCons(
+                quicksum(uses) <= 1,
+                name=f"row_attr_one_{self._key_name(key)}",
+            )
+        return {"row_attr_link": links, "row_attr_one": choices}
+
+    def _solve_lexicographic_integer_master(
+        self,
+        start_selected: Counter[int],
+        remaining_seconds: float | None,
+    ) -> tuple[Counter[int], Counter[str], dict]:
+        """Choose one generated packing pattern per group in two stages."""
+        from gurobipy import quicksum
+
+        stats = {
+            "lexicographic_integer_master_used": False,
+            "lexicographic_stage1_status": "not_run",
+            "lexicographic_stage2_status": "not_run",
+            "lexicographic_stage1_optimal": False,
+            "lexicographic_stage2_optimal": False,
+        }
+        available = float(self.config.mip_time_limit) * 2.0
+        if remaining_seconds is not None:
+            available = max(0.0, min(available, float(remaining_seconds)))
+        if available < 2.0:
+            stats["lexicographic_skip_reason"] = "insufficient_time"
+            return Counter(start_selected), Counter(self._initial_unplaced_start), stats
+
+        def apply_start(variables: dict, selected: Counter[int]) -> None:
+            for idx, var in variables["pattern"].items():
+                var.Start = float(1 if selected.get(idx, 0) > 0 else 0)
+
+        stage1, vars1, _constraints1 = self._build_restricted_master(
+            _GurobiModelAdapter,
+            quicksum,
+            relax=False,
+            objective_mode="min_unplaced",
+        )
+        apply_start(vars1, start_selected)
+        stage1_limit = max(1.0, available / 2.0)
+        self._set_gurobi_param(stage1, "TimeLimit", stage1_limit)
+        self._set_gurobi_param(stage1, "MIPGap", 0.0)
+        stage1.optimize()
+        status1 = self._gurobi_status_name(stage1)
+        stats["lexicographic_stage1_status"] = status1
+        stats["lexicographic_stage1_optimal"] = status1 == "optimal"
+        if status1 != "optimal":
+            self._free_gurobi_model(stage1)
+            raise RuntimeError(
+                "Integer pattern-master stage 1 must be optimal before stage 2: "
+                f"status={status1}"
+            )
+        selected1 = self._gurobi_selected_patterns(stage1, vars1)
+        unplaced1 = self._unplaced_from_pattern_selection(selected1)
+        self._final_import_reservation = self._gurobi_import_reservation_values(
+            stage1, vars1
+        )
+        optimum_unplaced = int(sum(unplaced1.values()))
+        stats["lexicographic_stage1_unplaced_boxes"] = optimum_unplaced
+        stats["lexicographic_stage1_bound"] = self._gurobi_dual_bound(stage1)
+        self._free_gurobi_model(stage1)
+
+        stage2, vars2, _constraints2 = self._build_restricted_master(
+            _GurobiModelAdapter,
+            quicksum,
+            relax=False,
+            objective_mode="full",
+            fixed_unplaced_total=optimum_unplaced,
+        )
+        apply_start(vars2, selected1)
+        self._set_gurobi_param(
+            stage2, "TimeLimit", max(1.0, available - stage1_limit)
+        )
+        self._set_gurobi_param(
+            stage2, "MIPGap", max(0.0, float(self.config.mip_gap))
+        )
+        stage2.optimize()
+        status2 = self._gurobi_status_name(stage2)
+        stats["lexicographic_stage2_status"] = status2
+        stats["lexicographic_stage2_optimal"] = status2 == "optimal"
+        if self._gurobi_solution_count(stage2) <= 0:
+            self._free_gurobi_model(stage2)
+            stats["lexicographic_skip_reason"] = "stage2_no_solution"
+            return selected1, unplaced1, stats
+        selected2 = self._gurobi_selected_patterns(stage2, vars2)
+        unplaced2 = self._unplaced_from_pattern_selection(selected2)
+        self._final_import_reservation = self._gurobi_import_reservation_values(
+            stage2, vars2
+        )
+        stats.update(
+            {
+                "lexicographic_integer_master_used": True,
+                "lexicographic_stage2_objective": self._gurobi_objective_value(
+                    stage2
+                ),
+                "lexicographic_stage2_bound": self._gurobi_dual_bound(stage2),
+                "lexicographic_stage2_gap": self._gurobi_gap(stage2),
+            }
+        )
+        self._free_gurobi_model(stage2)
+        return selected2, unplaced2, stats
+
+    def _gurobi_selected_patterns(self, model, variables: dict) -> Counter[int]:
+        return Counter(
+            {
+                idx: int(round(self._gurobi_value(model, var)))
+                for idx, var in variables["pattern"].items()
+                if self._gurobi_value(model, var) > 0.5
+            }
+        )
+
+    def _unplaced_from_pattern_selection(
+        self,
+        selected: Counter[int],
+    ) -> Counter[str]:
+        unplaced: Counter[str] = Counter()
+        for idx, chosen in selected.items():
+            if chosen > 0:
+                pattern = self._patterns[idx]
+                unplaced[pattern.group_id] += int(pattern.unplaced) * int(chosen)
+        return Counter({key: value for key, value in unplaced.items() if value > 0})
+
+    def _iter_feasible_base_placements(
         self,
         group: ExportGroup,
     ) -> Iterable[PlacementColumn]:
-        """Generate feasible unit-flow columns without storing a full universe."""
+        """Enumerate feasible one-box row locations used by pattern pricing."""
         for bay_key, _max_qty, _unused_cost in self._candidate_bays_for_group(group):
             bay = self.bays[bay_key]
             footprint = self._placement_footprint_keys(bay_key, group.size)
@@ -2005,7 +3250,7 @@ class ColumnGenerationPlanner:
             ),
         )
 
-    def _unit_flow_location_capacity(
+    def _base_location_capacity(
         self,
         group: ExportGroup,
         column: PlacementColumn,
@@ -2051,22 +3296,6 @@ class ColumnGenerationPlanner:
         self._column_keys.add(key)
         return index
 
-    def _materialize_complete_unit_flow_universe(self) -> int:
-        """Append every missing feasible unit-flow column for small-case verification."""
-        added = 0
-        for group in self.groups:
-            for candidate in self._iter_feasible_unit_flow_columns(group):
-                if self._column_identity(candidate) in self._column_keys:
-                    continue
-                self._append_generated_column(candidate)
-                added += 1
-        if len(self._columns) != self._potential_unit_flow_count:
-            raise RuntimeError(
-                "complete unit-flow materialization count mismatch: "
-                f"materialized={len(self._columns)}, expected={self._potential_unit_flow_count}"
-            )
-        return added
-
     def _prepare_master_index_sets(self) -> None:
         """Create the fixed row index set shared by every restricted master."""
         self._master_bay_capacity_keys.clear()
@@ -2085,7 +3314,7 @@ class ColumnGenerationPlanner:
         self._master_row_attr_big_m.clear()
         self._master_group_area_big_m.clear()
         self._master_group_row_big_m.clear()
-        self._potential_unit_flow_count = 0
+        self._base_feasible_placement_count = 0
         bay_attr_groups: defaultdict[tuple[str, str, str, str], set[str]] = defaultdict(set)
         row_attr_groups: defaultdict[tuple[str, str, str, str, str], set[str]] = defaultdict(set)
         group_area_groups: defaultdict[tuple[tuple[str, ...], str], set[str]] = defaultdict(set)
@@ -2101,8 +3330,8 @@ class ColumnGenerationPlanner:
         for group in self.groups:
             group_key = self._operational_group_key(group)
             self._master_operational_group_keys.add(group_key)
-            for column in self._iter_feasible_unit_flow_columns(group):
-                self._potential_unit_flow_count += 1
+            for column in self._iter_feasible_base_placements(group):
+                self._base_feasible_placement_count += 1
                 footprint = self._placement_footprint_keys(column.bay_key, column.size)
                 self._master_bay_capacity_keys.update(footprint)
                 self._master_bay_size_keys.add((column.bay_key, column.size))
@@ -2152,10 +3381,10 @@ class ColumnGenerationPlanner:
                 group_row_key = (group_key, column.bay_key, anchor_row)
                 self._master_group_row_keys.add(group_row_key)
                 group_row_groups[group_row_key].add(group.group_id)
-                location_capacity = self._unit_flow_location_capacity(group, column)
+                location_capacity = self._base_location_capacity(group, column)
                 if location_capacity <= 0:
                     raise ValueError(
-                        "feasible unit-flow column has no positive location capacity: "
+                        "feasible base placement has no positive location capacity: "
                         f"group={group.group_id}, bay={column.bay_key}, row={anchor_row}"
                     )
                 location_key = (column.bay_key, anchor_row)
@@ -2260,86 +3489,6 @@ class ColumnGenerationPlanner:
             "group_area_links": self._bound_summary(self._master_group_area_big_m.values()),
             "group_row_links": self._bound_summary(self._master_group_row_big_m.values()),
         }
-
-    @staticmethod
-    def _constraint_dual(model, constraints: dict, section: str, key: object) -> float:
-        constraint = constraints.get(section, {}).get(key)
-        if constraint is None:
-            return 0.0
-        return float(model.getDualsolLinear(constraint))
-
-    def _column_reduced_cost(
-        self,
-        model,
-        constraints: dict,
-        column: PlacementColumn,
-        objective_mode: str,
-    ) -> float:
-        reduced_cost = 0.0 if objective_mode == "min_unplaced" else float(column.intrinsic_cost)
-
-        def apply(section: str, key: object, coefficient: float = 1.0) -> None:
-            nonlocal reduced_cost
-            reduced_cost -= coefficient * self._constraint_dual(
-                model,
-                constraints,
-                section,
-                key,
-            )
-
-        apply("group_cover", column.group_id)
-        footprint = self._placement_footprint_keys(column.bay_key, column.size)
-        stack_value = self._row_mix_key_for_column(column)
-        for footprint_key in footprint:
-            apply("bay_capacity_limit", footprint_key)
-            apply("bay_port_stack_link", (footprint_key, stack_value, column.size))
-            for attr in self._bay_no_mix_attrs_for_column(column):
-                scope = self._attr_voyage_scope(attr, column.voyage_id)
-                apply(
-                    "bay_attr_link",
-                    (
-                        footprint_key,
-                        attr,
-                        scope,
-                        self._column_attr_value(column, attr),
-                    ),
-                )
-        apply("bay_size_limit", (column.bay_key, column.size))
-        for footprint_key, row_no, qty in column.row_allocation:
-            apply("row_capacity_limit", (footprint_key, row_no), float(qty))
-            apply(
-                "row_size_limit",
-                (footprint_key, row_no, column.size),
-                float(qty),
-            )
-            for attr in self._row_no_mix_attrs_for_column(column):
-                scope = self._attr_voyage_scope(attr, column.voyage_id)
-                apply(
-                    "row_attr_link",
-                    (
-                        footprint_key,
-                        row_no,
-                        attr,
-                        scope,
-                        self._column_attr_value(column, attr),
-                    ),
-                )
-        apply("area_guidance_balance", column.quota_key)
-        fixed = constraints.get("fixed_use_objective_limit", {})
-        fixed_dual = lambda key: (
-            float(model.getDualsolLinear(fixed[key])) if key in fixed else 0.0
-        )
-        anchor_row = next(
-            row_no
-            for bay_key, row_no, _qty in column.row_allocation
-            if bay_key == column.bay_key
-        )
-        reduced_cost -= fixed_dual(("group_area", column.group_key, column.area_no))
-        reduced_cost -= fixed_dual(
-            ("group_row", column.group_key, column.bay_key, anchor_row)
-        )
-        reduced_cost -= fixed_dual(("group_used_upper",) + column.group_key)
-        reduced_cost += fixed_dual(("group_used_lower",) + column.group_key)
-        return float(reduced_cost)
 
     def _bay_no_mix_attrs(self, voyage_id: object = None) -> tuple[str, ...]:
         attrs = (
@@ -3449,7 +4598,11 @@ class ColumnGenerationPlanner:
                 qty_by_row[str(row_no)] = max(qty_by_row[str(row_no)], int(qty))
             for row_no, row_qty in qty_by_row.items():
                 row_allocation = self._format_row_allocation(
-                    tuple(item for item in col.row_allocation if str(item[1]) == row_no)
+                    tuple(
+                        (bay_key, candidate_row, 1)
+                        for bay_key, candidate_row, qty in col.row_allocation
+                        if str(candidate_row) == row_no and int(qty) > 0
+                    )
                 )
                 dynamic_attrs = tuple(sorted((str(k), str(v)) for k, v in (col.attributes or {}).items()))
                 key = (
@@ -3554,11 +4707,14 @@ def write_rows(path: str | Path, rows: list[dict]) -> None:
         writer.writerows(rows)
 
 
-def write_columns(path: str | Path, columns: Iterable[PlacementColumn]) -> None:
+def write_selected_locations(
+    path: str | Path,
+    locations: Iterable[PlacementColumn],
+) -> None:
     rows = []
-    for col in columns:
+    for col in locations:
         row = {
-            "column_id": col.column_id,
+            "location_id": col.column_id,
             "group_id": col.group_id,
             "voyage_id": col.voyage_id,
             "flow": col.flow,

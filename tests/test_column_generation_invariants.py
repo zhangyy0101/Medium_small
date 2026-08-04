@@ -4,6 +4,7 @@ import unittest
 import csv
 import importlib.util
 from collections import defaultdict
+from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -12,8 +13,6 @@ from yard_planning.models import AttributeRules, Bay, ExportGroup, ProblemData
 from yard_planning.planner import (
     ColumnGenerationConfig,
     ColumnGenerationPlanner,
-    PlacementColumn,
-    _GurobiModelAdapter,
 )
 from yard_planning.output_validator import _parse_integer, validate_output_files
 
@@ -266,176 +265,102 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         key = (planner._operational_group_key(group), "A")
         self.assertEqual(3, planner._master_group_area_big_m[key])
 
-    def test_pricing_enumerates_candidates_without_materializing_universe(self) -> None:
-        planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
-        planner.groups = [make_group("20")]
-        planner.config = ColumnGenerationConfig()
-        planner.bays = {
-            "A|01": Bay(
-                area_no="A", bay_no="01", bay_key="A|01",
-                bay_order=0, cap_by_size={"20": 9}, physical_capacity=9,
-            )
-        }
-        planner._columns = []
-        planner._column_keys = set()
-        planner._column_indices_by_triplet = defaultdict(list)
-        planner._candidate_bays_for_group = lambda group: [("A|01", 9, 0.0)]
-        planner._placement_footprint_keys = lambda bay_key, size: (bay_key,)
-        planner._row_capacity_items_for_group = lambda bay_key, size, group: [(str(i), 3) for i in range(1, 10)]
-        planner._quota_key = lambda group, area: (group.voyage_id, group.status, area, group.size)
-        planner._operational_group_key = lambda group: (group.voyage_id, group.status, group.port, group.size, group.height)
-        planner._column_base_cost = lambda group, bay: 0.0
-        planner._berth_distance_cost = lambda voyage, area, qty: 0.0
-
-        candidates = list(planner._iter_feasible_unit_flow_columns(planner.groups[0]))
-
-        self.assertEqual(9, len(candidates))
-        self.assertTrue(all(column.quantity == 1 for column in candidates))
-        self.assertEqual([], planner._columns)
-
-        index = planner._append_generated_column(candidates[0])
-        self.assertEqual(0, index)
-        self.assertEqual(1, len(planner._columns))
-        self.assertEqual("C0000001", planner._columns[0].column_id)
-
-    def test_pricing_reduced_cost_uses_master_row_duals(self) -> None:
-        planner = ColumnGenerationPlanner.__new__(ColumnGenerationPlanner)
-        planner._placement_footprint_keys = lambda bay_key, size: (bay_key,)
-        planner._row_mix_key_for_column = lambda column: "mix"
-        planner._bay_no_mix_attrs_for_column = lambda column: ("height",)
-        planner._row_no_mix_attrs_for_column = lambda column: ("voyage",)
-        planner._attr_voyage_scope = lambda attr, voyage: "scope"
-        planner._column_attr_value = lambda column, attr: f"{attr}-value"
-        column = PlacementColumn(
-            column_id="",
-            group_id="G1",
-            voyage_id="V1",
-            flow="OF",
-            port="P1",
-            size="20",
-            big_plan_size="20",
-            height="96",
-            attributes={},
-            area_no="A",
-            bay_key="B1",
-            bay_no="01",
-            quantity=1,
-            stack_units=1,
-            row_allocation=(("B1", "R1", 1),),
-            quota_key=("V1", "OF", "A", "20"),
-            group_key=("V1", "OF", "P1", "20", "96"),
-            intrinsic_cost=100.0,
+    def test_pattern_combines_multiple_row_allocations(self) -> None:
+        planner = ColumnGenerationPlanner(
+            make_small_problem(), ColumnGenerationConfig(verbose=False)
         )
-        constraints = {
-            "group_cover": {"G1": 2.0},
-            "bay_capacity_limit": {"B1": 3.0},
-            "bay_port_stack_link": {("B1", "mix", "20"): 5.0},
-            "bay_attr_link": {("B1", "height", "scope", "height-value"): 7.0},
-            "bay_size_limit": {("B1", "20"): 11.0},
-            "row_capacity_limit": {("B1", "R1"): 13.0},
-            "row_size_limit": {("B1", "R1", "20"): 17.0},
-            "row_attr_link": {("B1", "R1", "voyage", "scope", "voyage-value"): 19.0},
-            "area_guidance_balance": {("V1", "OF", "A", "20"): 23.0},
-            "fixed_use_objective_limit": {
-                ("group_area", column.group_key, "A"): 29.0,
-                ("group_row", column.group_key, "B1", "R1"): 31.0,
-                ("group_used_upper", *column.group_key): 37.0,
-                ("group_used_lower", *column.group_key): 41.0,
-            },
+        planner._prepare_master_index_sets()
+        planner._prepare_objective_normalization()
+        group = planner.groups_by_id["G1"]
+        placements = list(planner._iter_feasible_base_placements(group))
+        first = placements[0]
+        second = next(col for col in placements if col.bay_key != first.bay_key)
+        placements = [
+            replace(
+                first,
+                quantity=2,
+                row_allocation=tuple(
+                    (bay_key, row_no, 2)
+                    for bay_key, row_no, _qty in first.row_allocation
+                ),
+            ),
+            second,
+        ]
+        pattern = planner._make_pattern(group, placements, 0)
+        self.assertEqual(2, len(pattern.placements))
+        self.assertEqual(3, sum(col.quantity for col in pattern.placements))
+        self.assertEqual(0, pattern.unplaced)
+        self.assertGreater(pattern.phase2_cost, 0.0)
+
+    def test_pattern_reduced_cost_uses_convexity_and_capacity_duals(self) -> None:
+        planner = ColumnGenerationPlanner(
+            make_small_problem(), ColumnGenerationConfig(verbose=False)
+        )
+        planner._prepare_master_index_sets()
+        planner._prepare_objective_normalization()
+        group = planner.groups_by_id["G1"]
+        placement = next(planner._iter_feasible_base_placements(group))
+        pattern = planner._make_pattern(group, [placement], 2)
+        duals = {
+            ("group_convexity", group.group_id): 2.0,
+            ("bay_capacity_limit", placement.bay_key): 3.0,
+            ("fixed_unplaced_total", "total"): 5.0,
         }
-        model = SimpleNamespace(getDualsolLinear=lambda constraint: constraint)
-
-        reduced_cost = planner._column_reduced_cost(model, constraints, column, "full")
-
-        self.assertAlmostEqual(-56.0, reduced_cost)
+        expected = pattern.phase2_cost - 2.0 - 3.0 - 2 * 5.0
+        self.assertAlmostEqual(
+            expected,
+            planner._pattern_reduced_cost(pattern, duals, "full"),
+        )
 
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
-    def test_column_generation_lp_matches_complete_column_lp(self) -> None:
-        from gurobipy import quicksum
-
-        problem = make_small_problem()
+    def test_pattern_generation_reports_a_certified_small_case_lp_bound(self) -> None:
         config = ColumnGenerationConfig(
             min_columns_per_group_per_iteration=1,
-            max_columns_per_group_per_iteration=1,
+            max_columns_per_group_per_iteration=4,
             adaptive_pricing_fraction=1.0,
             max_iterations=30,
             mip_gap=0.0,
-            complete_integer_verification_max_columns=0,
+            pattern_lp_gap_tolerance=0.0,
             verbose=False,
         )
-        priced = ColumnGenerationPlanner(problem, config)
-        priced_result = priced.solve()
-
-        complete = ColumnGenerationPlanner(problem, config)
-        complete._initialize_column_generation()
-        complete._prepare_master_index_sets()
-        complete._prepare_objective_normalization()
-        complete._materialize_complete_unit_flow_universe()
-        phase1, phase1_vars, _ = complete._build_restricted_master(
-            _GurobiModelAdapter,
-            quicksum,
-            relax=True,
-            objective_mode="min_unplaced",
-        )
-        try:
-            phase1.optimize()
-            self.assertEqual("optimal", complete._gurobi_status_name(phase1))
-            phase1_unplaced = sum(
-                complete._gurobi_value(phase1, var)
-                for var in phase1_vars["unplaced"].values()
-            )
-        finally:
-            complete._free_gurobi_model(phase1)
-
-        phase2, _phase2_vars, _ = complete._build_restricted_master(
-            _GurobiModelAdapter,
-            quicksum,
-            relax=True,
-            objective_mode="full",
-            fixed_unplaced_total=phase1_unplaced,
-        )
-        try:
-            phase2.optimize()
-            self.assertEqual("optimal", complete._gurobi_status_name(phase2))
-            complete_objective = complete._gurobi_objective_value(phase2)
-        finally:
-            complete._free_gurobi_model(phase2)
-
-        diagnostics = priced_result.diagnostics
+        diagnostics = ColumnGenerationPlanner(
+            make_small_problem(), config
+        ).solve().diagnostics
+        self.assertEqual(0, diagnostics["pricing_phase1_lp_unplaced_boxes"])
         self.assertAlmostEqual(
-            phase1_unplaced,
-            diagnostics["pricing_phase1_lp_unplaced_boxes"],
+            diagnostics["pricing_phase2_rmp_objective"],
+            diagnostics["pricing_phase2_lp_lower_bound"],
             places=8,
         )
-        self.assertAlmostEqual(
-            complete_objective,
-            diagnostics["pricing_phase2_lp_objective"],
-            places=8,
-        )
+        self.assertEqual(0.0, diagnostics["pricing_phase2_certified_gap"])
         self.assertEqual(
-            "two_phase_reduced_cost_convergence",
+            "two_phase_certified_pattern_pricing",
             diagnostics["pricing_stop_reason"],
         )
 
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
-    def test_small_case_complete_integer_verification_reports_full_scope(self) -> None:
+    def test_small_case_uses_pattern_pool_integer_polishing(self) -> None:
         planner = ColumnGenerationPlanner(
             make_small_problem(),
             ColumnGenerationConfig(
-                complete_integer_verification_max_columns=100,
                 mip_gap=0.0,
                 verbose=False,
             ),
         )
         diagnostics = planner.solve().diagnostics
-        self.assertTrue(diagnostics["complete_integer_verification"]["performed"])
-        self.assertEqual(
-            diagnostics["potential_unit_flow_count"],
-            diagnostics["complete_integer_verification"]["complete_column_count"],
+        polishing = diagnostics["pattern_pool_integer_polishing"]
+        self.assertEqual("pattern_location_pool_fix_and_optimize", polishing["method"])
+        self.assertGreater(polishing["location_pool_size"], 0)
+        self.assertLessEqual(
+            polishing["objective_after_polishing"],
+            polishing["objective_before_polishing"],
         )
-        self.assertEqual("complete_unit_flow_universe", diagnostics["master_bound_scope"])
         self.assertEqual(
-            "complete_integer_master",
+            "complete_group_pattern_lp_relaxation",
+            diagnostics["master_bound_scope"],
+        )
+        self.assertEqual(
+            "exact_group_pattern_pricing_lp_lower_bound",
             diagnostics["complete_model_certified_gap_source"],
         )
 
