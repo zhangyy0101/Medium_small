@@ -2,103 +2,79 @@
 
 ## 1. Planning boundary
 
-The detailed row-allocation demand consists only of declared export containers that have not yet entered the yard. Every such container must be allocated. Export forecasts are excluded from both demand and capacity reservation.
+Detailed row-allocation demand consists only of declared export containers that have not yet entered the yard. Every such container must be allocated. Export forecasts are excluded from demand and capacity reservation.
 
-Import voyages are represented by anonymous capacity reservations. For an import large-plan record, only `new_qty` is treated as future demand; `planned_qty` already contains in-yard boxes and is not an incremental quantity. Import reservations obey:
+Import voyages are represented by anonymous capacity reservations. Only `new_qty` is future demand; `planned_qty` already includes in-yard boxes and is not incremental. Import reservations obey area-function compatibility, bay-size compatibility, and shared physical capacity. They do not inherit export voyage, discharge-port, height, or other no-mix constraints and do not receive detailed row assignments.
 
-1. yard-area function compatibility;
-2. bay-size compatibility;
-3. shared physical capacity.
+Large-plan size is restricted to `20` and `40`; `40` covers physical 40/45-ft containers. `ALL`, blank, `45`, and unknown values are rejected.
 
-They do not inherit export voyage, discharge-port, height, or other no-mix constraints and are not assigned to detailed rows.
+## 2. Common mathematical model
 
-The large-plan size is restricted to `20` and `40`; `40` covers physical 40/45-ft containers. `ALL`, blank, `45`, and unknown values are rejected.
+The compact M0 formulation uses integer export quantities at row locations, binary operational-group area and row activations, anonymous integer import reservations at bays, and binary auxiliaries for configured no-mix states.
 
-## 2. Decisions
-
-The underlying compact model uses integer export quantities at row locations, binary group-area activation, binary group-row activation, anonymous integer import reservations at bays, and auxiliary binary variables for configured no-mix states.
-
-The paper algorithm applies Dantzig-Wolfe decomposition by yard area. One column is a complete integer configuration of one area and contains:
-
-- export group quantities at row locations;
-- anonymous import reservations at compatible bays;
-- the corresponding local capacity, footprint, stack, no-mix, area-use, and row-use states;
-- its normalized business cost.
-
-The master selects exactly one configuration for each modeled area. It enforces every export group demand equality, every import flow-size reservation equality, and the export/import large-plan deviation balances.
-
-## 3. Hard constraints
-
-Both the paper algorithm and M0 enforce the same constraints:
+Both M0 and the paper algorithm enforce:
 
 - complete allocation of declared export demand;
 - shared physical bay and row capacity;
 - size-specific bay and row capacity;
-- large-bay paired footprints for 40/45-ft containers;
+- paired large-bay footprints for 40/45-ft containers;
 - stack availability and stack-height conversion;
 - area-function eligibility;
 - configured bay-level and row-level no-mix attributes;
-- mandatory row separation of export voyage and discharge port;
+- mandatory row separation by export voyage and discharge port;
 - mandatory height compatibility within a row;
 - 45-ft containers restricted to available edge large bays.
 
-The 45-ft rule does not prohibit non-45-ft containers from other feasible edge positions.
+The 45-ft rule does not prohibit non-45-ft containers from other feasible edge positions. Import reservations share physical and size capacity with exports but receive no detailed no-mix constraints.
 
-Import reservations share physical and size capacity with exports but receive no detailed no-mix constraints.
+## 3. Objective
 
-## 4. Objective
-
-The objective is a directly normalized weighted sum. The five components and empirical weights are:
+The objective is a directly normalized weighted sum:
 
 | Component | Weight | Natural normalization |
 |---|---:|---|
-| group-area dispersion | 0.290 | maximum reachable group-area activations |
-| group-row dispersion | 0.240 | maximum reachable group-row activations |
+| operational-group area dispersion | 0.290 | maximum reachable group-area activations |
+| operational-group row dispersion | 0.240 | maximum reachable group-row activations |
 | distance from existing same-group boxes | 0.070 | reachable anchored demand and normalized bay-order distance |
 | export/import large-plan deviation | 0.270 | guided export and reserved import quantities |
 | berth-area travel distance | 0.130 | assigned export quantity and voyage-specific distance range |
 
-All required berth-area distances must exist. A missing distance is an input error rather than a zero-cost fallback.
+All required berth-area distances must exist. Missing distance data is an input error.
 
-## 5. Adaptive area pricing
+## 4. Outer complete-voyage decomposition
 
-Area difficulty is determined from the instance rather than area names. Candidate row locations and large-bay footprints form a graph inside each area.
+The paper algorithm applies Dantzig-Wolfe decomposition by export voyage. One outer column is a complete integer row allocation for all groups of one voyage across all feasible yard areas. It contains the corresponding shared-resource and no-mix coefficients and its exact normalized business cost.
 
-- A small or single-component area is priced by one complete exact MIP.
-- A large multi-component area uses nested exact pricing.
+The outer restricted master selects exactly one complete plan per voyage. Export demand is already satisfied inside every column. The master coordinates shared bay/row resources, cross-voyage no-mix states, export large-plan deviation, and anonymous import reservation. Thus the number of convexity blocks grows with the number of voyages, not with voyage-area pairs.
 
-For nested pricing, each physical component has a persistent exact block MIP. A block configuration satisfies every local packing restriction. A persistent coordination LP chooses one configuration per block and links their group quantities to one group-area activation variable.
+Initial complete plans are obtained from single-voyage feasibility MIPs. Phase-I artificials relax only global coupling constraints and import balance. They are fixed to zero before activating the business objective and can never enter the final solution.
 
-Blocks with identical physical data, candidate semantics, and constraint structure are detected without using area names. One representative exact MIP supplies a small pool that is mapped bijectively to every block in the equivalence class. Because the block-convexity dual is a constant in each subproblem, this reuse preserves both the optimal configuration and its exact lower bound. Sharing is disabled whenever a row- or bay-specific branch decision breaks the equivalence.
+## 5. Nested voyage pricing
 
-For a fixed outer-master dual vector, block reduced-cost lower bounds are obtained from the global MIP bounds. The coordination-LP objective plus the sum of negative block lower-bound corrections is a valid lower bound for the complete integer area-pricing problem. If that value, after the outer area-convexity dual, is nonnegative, the area is exactly certified. The restricted coordination MIP is used only to construct feasible negative columns. If the nested bound is inconclusive and no new column is found, the solver falls back to the complete area MIP.
+For a fixed outer dual vector, each voyage is priced independently. Its inner master selects one integer local pattern for every feasible area and enforces all group demands of that voyage. A local pattern may be zero or may assign partial group quantities to row locations in one area.
 
-This fallback is part of the exactness mechanism and is not a secondary heuristic solver chain.
+Each area-pattern pricer is an integer MIP containing exact local physical, size, footprint, stack, bay/row no-mix, group-area activation, and group-row activation constraints. Full sweeps use raw inner duals, and time is allocated by the square root of candidate-row count. Up to three local patterns are returned per solve.
 
-## 6. Restricted master and convergence
+Local MIP bounds yield a valid lower-bound correction for the inner voyage relaxation. That bound, less the outer voyage-convexity dual, is a valid bound on complete-voyage reduced cost. A negative integer inner-master solution supplies a new complete outer column.
 
-The initial pool contains a zero configuration for each area. Temporary Phase-I artificial variables establish restricted-master feasibility; they are fixed to zero before the business objective is optimized and never enter the final model.
+Because the inner local-pattern relaxation may have an integrality gap, it is not by itself an exact pricing certificate. When it cannot certify nonnegative reduced cost, or when its integer improvement is weak relative to its bound, the persistent complete-voyage row MIP performs strict certification. A timed certification may still contribute its finite Gurobi bound, but exact outer closure is declared only when every voyage is certified under the same outer dual vector.
 
-Business pricing alternates between productive-area sweeps and periodic complete sweeps. A selective sweep may add columns but cannot update a valid global lower bound or declare closure. Exact node closure requires every area to have a valid nonnegative reduced-cost certificate under the same raw master dual vector.
+Every complete plan found by strict certification is split back into its area patterns, so information flows in both directions between the two pricing levels.
 
-The root and every branch node use the same column-generation engine. If the time limit interrupts pricing, the node retains its last valid bound and remains open.
+## 6. Bounds and convergence
 
-## 7. Branching and primal upper bound
+For each complete outer sweep, the restricted-master objective plus the sum of negative valid voyage-pricing bounds is a valid lower bound for the complete-voyage Dantzig-Wolfe relaxation. If a sweep is interrupted, the algorithm retains the best bound from an earlier complete finite sweep. A skipped voyage or nonfinite pricing bound cannot form a certificate.
 
-The branching order is:
+The implementation uses no stabilization, branch-and-price, isomorphic reuse, case-specific area selection, runtime solver switch, greedy backup, or alternative incumbent chain.
 
-1. group-area allocated quantity;
-2. group-row allocated quantity;
-3. group-row use;
-4. import reservation quantity;
-5. remaining original auxiliary integer states when required.
+## 7. Integer recovery
 
-Each decision is imposed in both the restricted master and subsequent area pricing, so generated configurations obey the node partition.
+After root column generation, one restricted compact row MILP is solved. Its support contains row locations exposed by LP-active complete-voyage plans, the eight most recent plans per voyage, and the minimum additional locations required to give every export group sufficient raw support capacity.
 
-A screened compact row MILP is solved once at the root to obtain an incumbent. Its support is built from LP-active area configurations, the two most recent configurations in each area, and the two most recent configurations of each nested physical block. This procedure supplies only a feasible upper bound and has no role in lower-bound certification.
+This MILP enforces the complete original model and is solved once with zero requested MIP gap within its allowance. It supplies only a feasible primal upper bound. Its restricted-model bound is never used as a complete-model lower bound; the reported global gap always uses the valid column-generation lower bound.
 
-## 8. M0 baseline
+## 8. M0 baseline and regression checks
 
-M0 is the complete compact row-location MILP. It creates all feasible row locations, uses the same hard constraints, import-reservation representation, normalization, and empirical weights, and is solved directly by Gurobi. It has no decomposition, pricing, Phase I, or alternative solution chain.
+M0 is the complete compact row-location MILP. It creates all feasible row locations and uses the same hard constraints, import representation, normalization, and weights. It has no decomposition, pricing, Phase I, or alternate solution chain.
 
-Small-instance regression tests require M0 and the paper algorithm to return the same objective and independently valid row output.
+Small-instance tests require M0 and the paper algorithm to return the same objective and independently valid row output. Additional tests verify strict root closure on a complete-column case and cross-voyage row separation.

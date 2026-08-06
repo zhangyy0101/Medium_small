@@ -1,0 +1,242 @@
+{
+  "case": "diverse_voyages_3x",
+  "base_input": "example/input_data.json",
+  "base_large_plan": "example/large_plan.csv",
+  "generation_policy": "deterministic_empirical_profile_perturbation",
+  "yard_snapshot_policy": "unchanged_from_base_case",
+  "import_commitment_policy": "unchanged_from_base_case",
+  "synthetic_snapshot_policy": "zero; planned_qty equals new_qty",
+  "demand_policy": "source-observed size-height-port combinations only; clone volumes and combination shares vary while the overall total is conserved",
+  "berth_policy": "distinct estimated berths selected only from complete B-columns in the supplied berth-area distance matrix",
+  "source_export_voyages": [
+    "390121",
+    "390131"
+  ],
+  "export_voyage_mapping": {
+    "390121": [
+      "390121",
+      "490121",
+      "590121"
+    ],
+    "390131": [
+      "390131",
+      "490131",
+      "590131"
+    ]
+  },
+  "synthetic_voyage_profiles": {
+    "490121": {
+      "source_voyage": "390121",
+      "declared_rows": 393,
+      "volume_ratio_to_source": 0.879195,
+      "estimated_berth": "B2",
+      "planned_berth_time": "2026-07-21T08:00:00",
+      "group_profile": [
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPHKT",
+          "source_qty": 103,
+          "synthetic_qty": 112
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPNGO",
+          "source_qty": 100,
+          "synthetic_qty": 91
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPHKT",
+          "source_qty": 39,
+          "synthetic_qty": 37
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPNGO",
+          "source_qty": 1,
+          "synthetic_qty": 2
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPHKT",
+          "source_qty": 105,
+          "synthetic_qty": 87
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPNGO",
+          "source_qty": 99,
+          "synthetic_qty": 64
+        }
+      ],
+      "large_plan_new_qty": {
+        "20": {
+          "4B": 166,
+          "84": 37
+        },
+        "40": {
+          "1A": 4,
+          "4A": 157,
+          "4B": 29
+        }
+      }
+    },
+    "590121": {
+      "source_voyage": "390121",
+      "declared_rows": 501,
+      "volume_ratio_to_source": 1.120805,
+      "estimated_berth": "B5",
+      "planned_berth_time": "2026-07-29T08:00:00",
+      "group_profile": [
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPHKT",
+          "source_qty": 103,
+          "synthetic_qty": 90
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPNGO",
+          "source_qty": 100,
+          "synthetic_qty": 108
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPHKT",
+          "source_qty": 39,
+          "synthetic_qty": 41
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPNGO",
+          "source_qty": 1,
+          "synthetic_qty": 2
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPHKT",
+          "source_qty": 105,
+          "synthetic_qty": 123
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPNGO",
+          "source_qty": 99,
+          "synthetic_qty": 137
+        }
+      ],
+      "large_plan_new_qty": {
+        "20": {
+          "4B": 132,
+          "84": 66
+        },
+        "40": {
+          "1A": 4,
+          "4A": 234,
+          "4B": 65
+        }
+      }
+    },
+    "490131": {
+      "source_voyage": "390131",
+      "declared_rows": 264,
+      "volume_ratio_to_source": 0.88,
+      "estimated_berth": "B4",
+      "planned_berth_time": "2026-07-24T10:00:00",
+      "group_profile": [
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "NLRTM",
+          "source_qty": 100,
+          "synthetic_qty": 92
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "DEHAM",
+          "source_qty": 100,
+          "synthetic_qty": 95
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "NLRTM",
+          "source_qty": 100,
+          "synthetic_qty": 77
+        }
+      ],
+      "large_plan_new_qty": {
+        "20": {
+          "11": 68,
+          "84": 24
+        },
+        "40": {
+          "11": 11,
+          "26": 71,
+          "75": 62,
+          "84": 28
+        }
+      }
+    },
+    "590131": {
+      "source_voyage": "390131",
+      "declared_rows": 336,
+      "volume_ratio_to_source": 1.12,
+      "estimated_berth": "B7",
+      "planned_berth_time": "2026-08-01T10:00:00",
+      "group_profile": [
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "NLRTM",
+          "source_qty": 100,
+          "synthetic_qty": 108
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "DEHAM",
+          "source_qty": 100,
+          "synthetic_qty": 104
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "NLRTM",
+          "source_qty": 100,
+          "synthetic_qty": 124
+        }
+      ],
+      "large_plan_new_qty": {
+        "20": {
+          "11": 60,
+          "84": 48
+        },
+        "40": {
+          "11": 9,
+          "26": 77,
+          "75": 89,
+          "84": 53
+        }
+      }
+    }
+  },
+  "detailed_export_voyage_count": 6,
+  "source_declared_export_rows": 747,
+  "declared_export_container_rows": 2241,
+  "declared_scale": 3.0,
+  "large_plan_row_count": 76
+}

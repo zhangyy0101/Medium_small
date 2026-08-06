@@ -3,7 +3,6 @@ from __future__ import annotations
 import unittest
 import csv
 import importlib.util
-from time import perf_counter
 from collections import defaultdict
 from dataclasses import replace
 from pathlib import Path
@@ -12,20 +11,15 @@ from types import SimpleNamespace
 
 from yard_planning.models import AttributeRules, Bay, ExportGroup, ProblemData
 from yard_planning.direct_milp import DirectMilpPlanner
-from yard_planning.area_configuration import (
-    AdaptiveAreaPricingConfig,
-    AreaConfigurationPlanner,
-)
-from yard_planning.area_branch_price import (
-    AreaConfigurationBranchPricePlanner,
-)
 from yard_planning.planner import (
-    BranchDecision,
-    BranchPriceNode,
     ColumnGenerationConfig,
     YardPlanningBase,
 )
 from yard_planning.output_validator import _parse_integer, validate_output_files
+from yard_planning.voyage_plan_column_generation import (
+    VoyagePlanColumnGenerationPlanner,
+    VoyagePlanPricingConfig,
+)
 
 
 def make_group(size: str) -> ExportGroup:
@@ -105,149 +99,74 @@ def make_small_problem() -> ProblemData:
     )
 
 
+def make_two_voyage_problem() -> ProblemData:
+    groups = [
+        ExportGroup(
+            group_id=f"G{index}",
+            voyage_id=f"V{index}",
+            status="OF",
+            port="P1",
+            size="20",
+            height="96",
+            demand=2,
+        )
+        for index in (1, 2)
+    ]
+    bays = {
+        bay.bay_key: bay
+        for bay in (
+            make_bay("A", "01", {"1": 2}),
+            make_bay("A", "03", {"1": 2}),
+        )
+    }
+    return ProblemData(
+        export_groups=groups,
+        bays=bays,
+        area_guidance_target={
+            ("V1", "OF", "A", "20"): 2,
+            ("V2", "OF", "A", "20"): 2,
+        },
+        area_functions={"A": {"OF"}},
+        target_voyages=["V1", "V2"],
+        export_voyages={"V1", "V2"},
+        berth_distances={
+            ("A", "Q1"): 1.0,
+            ("A", "Q2"): 1.0,
+        },
+        berth_by_voyage={"V1": "Q1", "V2": "Q2"},
+    )
+
+
 class ColumnGenerationInvariantTests(unittest.TestCase):
-    def test_adaptive_area_pricing_configuration_is_validated(self) -> None:
+    def test_voyage_plan_pricing_configuration_is_validated(self) -> None:
         with self.assertRaises(ValueError):
-            AreaConfigurationPlanner(
+            VoyagePlanColumnGenerationPlanner(
                 make_small_problem(),
                 ColumnGenerationConfig(verbose=False),
-                AdaptiveAreaPricingConfig(direct_candidate_limit=0),
-            )
-        with self.assertRaises(ValueError):
-            AreaConfigurationPlanner(
-                make_small_problem(),
-                ColumnGenerationConfig(verbose=False),
-                AdaptiveAreaPricingConfig(nested_max_iterations=0),
-            )
-        with self.assertRaises(ValueError):
-            AreaConfigurationPlanner(
-                make_small_problem(),
-                ColumnGenerationConfig(verbose=False),
-                AdaptiveAreaPricingConfig(nested_time_fraction=1.0),
+                VoyagePlanPricingConfig(plans_per_pricing=0),
             )
 
-    def test_area_pricing_strategy_uses_structure_not_area_name(self) -> None:
-        planner = AreaConfigurationPlanner(
+    def test_decomposition_builds_one_complete_block_per_voyage(self) -> None:
+        planner = VoyagePlanColumnGenerationPlanner(
             make_small_problem(),
             ColumnGenerationConfig(verbose=False),
-            AdaptiveAreaPricingConfig(direct_candidate_limit=1),
         )
-        planner._prepare_master_index_sets()
-        planner._prepare_objective_normalization()
-        profiles = {
-            area_no: planner._area_pricing_profile(area_no)
-            for area_no in planner._configuration_areas()
-        }
-        self.assertEqual({"A", "B"}, set(profiles))
+        voyages = planner._initialize_candidate_blocks()
+        self.assertEqual(("V1",), voyages)
+        self.assertEqual(0, len(planner._plans))
         self.assertTrue(
             all(
-                profile.strategy == "adaptive_block_guided_multicolumn"
-                for profile in profiles.values()
+                candidate.voyage_id == voyage_id
+                for voyage_id, candidates in planner._voyage_candidates.items()
+                for candidate in candidates
             )
-        )
-        self.assertTrue(
-            all(len(profile.footprint_blocks) == 2 for profile in profiles.values())
         )
 
     @unittest.skipUnless(
         importlib.util.find_spec("gurobipy"), "gurobipy is unavailable"
     )
-    def test_equivalent_block_sharing_stops_for_location_branching(
-        self,
-    ) -> None:
-        planner = AreaConfigurationPlanner(
-            make_small_problem(),
-            ColumnGenerationConfig(verbose=False),
-            AdaptiveAreaPricingConfig(direct_candidate_limit=1),
-        )
-        planner._initialize_area_configuration_pool()
-        try:
-            state = planner._nested_area_pricing_state("A")
-            self.assertEqual(((0, 1),), state.equivalent_block_classes)
-            self.assertEqual(
-                ((0, 1),),
-                planner._nested_block_classes_for_decisions(state, ()),
-            )
-            row_branch = BranchDecision(
-                "branch_row_use", ("G1", "A|01", "1"), "L", 0
-            )
-            self.assertEqual(
-                ((0,), (1,)),
-                planner._nested_block_classes_for_decisions(
-                    state, (row_branch,)
-                ),
-            )
-        finally:
-            planner._dispose_area_pricing_models()
-
-    def test_area_pricing_schedule_periodically_restores_full_sweep(
-        self,
-    ) -> None:
-        planner = AreaConfigurationBranchPricePlanner(
-            make_small_problem(),
-            ColumnGenerationConfig(verbose=False),
-            AdaptiveAreaPricingConfig(
-                full_sweep_frequency=3,
-            ),
-        )
-        areas = ("A", "B")
-        self.assertEqual(
-            ("A",), planner._scheduled_pricing_areas(areas, {"A"}, 2)
-        )
-        self.assertEqual(
-            areas, planner._scheduled_pricing_areas(areas, {"A"}, 3)
-        )
-
-    @unittest.skipUnless(
-        importlib.util.find_spec("gurobipy"), "gurobipy is unavailable"
-    )
-    def test_active_area_sweep_cannot_issue_exact_certificate(self) -> None:
-        planner = AreaConfigurationBranchPricePlanner(
-            make_small_problem(),
-            ColumnGenerationConfig(
-                total_time_limit=20.0,
-                mip_gap=0.0,
-                solver_threads=1,
-                verbose=False,
-            ),
-        )
-        areas = planner._initialize_area_configuration_pool()
-        model, _variables, constraints = planner._build_area_master(areas)
-        try:
-            model.optimize()
-            duals = planner._master_dual_snapshot(model, constraints)
-            partial, _new_indices = planner._price_all_areas(
-                areas,
-                duals,
-                "phase_one",
-                perf_counter() + 10.0,
-                pricing_areas=(areas[0],),
-            )
-            self.assertFalse(partial["all_areas_priced"])
-            self.assertFalse(partial["exact"])
-            self.assertIsNone(partial["valid_lower_bound_correction"])
-            certified, _certificate_indices = (
-                planner._complete_targeted_area_certificate(
-                    partial,
-                    duals,
-                    "phase_one",
-                    perf_counter() + 10.0,
-                )
-            )
-            self.assertTrue(certified["all_areas_priced"])
-            self.assertTrue(
-                certified["exact"] or bool(_certificate_indices)
-            )
-        finally:
-            planner._free_gurobi_model(model)
-            for pricing in planner._area_pricing_models.values():
-                planner._free_gurobi_model(pricing.model)
-
-    @unittest.skipUnless(
-        importlib.util.find_spec("gurobipy"), "gurobipy is unavailable"
-    )
-    def test_adaptive_area_root_is_exact_on_small_case(self) -> None:
-        result = AreaConfigurationBranchPricePlanner(
+    def test_complete_voyage_root_is_exact_on_small_case(self) -> None:
+        result = VoyagePlanColumnGenerationPlanner(
             make_small_problem(),
             ColumnGenerationConfig(
                 max_iterations=30,
@@ -255,10 +174,6 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
                 mip_gap=0.0,
                 solver_threads=1,
                 verbose=False,
-            ),
-            AdaptiveAreaPricingConfig(
-                direct_candidate_limit=1,
-                complex_area_pool_size=4,
             ),
         ).solve_root()
         self.assertEqual("optimal", result["status"])
@@ -269,25 +184,16 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         )
         self.assertTrue(
             all(
-                profile["strategy"]
-                == "adaptive_block_guided_multicolumn"
-                for profile in result["adaptive_pricing"]["profiles"]
+                record["priced_voyage_count"] == result["voyage_count"]
+                for record in result["records"]
             )
-        )
-        strategies = {
-            area_result["pricing_strategy"]
-            for record in result["records"]
-            for area_result in record["area_results"]
-        }
-        self.assertIn(
-            "nested_exact_block_column_generation", strategies
         )
 
     @unittest.skipUnless(
         importlib.util.find_spec("gurobipy"), "gurobipy is unavailable"
     )
-    def test_area_row_recombination_preserves_global_column_pool(self) -> None:
-        planner = AreaConfigurationBranchPricePlanner(
+    def test_restricted_row_recovery_uses_generated_plan_locations(self) -> None:
+        planner = VoyagePlanColumnGenerationPlanner(
             make_small_problem(),
             ColumnGenerationConfig(
                 max_iterations=30,
@@ -297,140 +203,18 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
                 verbose=False,
             ),
         )
-        root = planner.solve_root()
-        self.assertTrue(root["root_exact"])
-        columns_before = tuple(planner._columns)
-        keys_before = set(planner._column_keys)
-        heuristic = planner._solve_area_row_recombination(
-            planner._configuration_areas(), 5.0
-        )
-        self.assertIsNotNone(heuristic)
-        self.assertEqual(columns_before, tuple(planner._columns))
-        self.assertEqual(keys_before, planner._column_keys)
-
-    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
-    def test_area_branch_rows_are_enforced_after_pricing(self) -> None:
-        planner = AreaConfigurationBranchPricePlanner(
-            make_small_problem(),
-            ColumnGenerationConfig(
-                max_iterations=30,
-                total_time_limit=20.0,
-                mip_gap=0.0,
-                solver_threads=1,
-                verbose=False,
-            ),
-        )
-        areas = planner._initialize_area_configuration_pool()
-        try:
-            for sense, rhs in (("L", 0), ("G", 1)):
-                decision = BranchDecision(
-                    "branch_row_use", ("G1", "A|01", "1"), sense, rhs
-                )
-                result = planner._solve_area_node_lp(
-                    BranchPriceNode(
-                        node_id=1 if sense == "L" else 2,
-                        depth=1,
-                        decisions=(decision,),
-                    ),
-                    areas,
-                    perf_counter() + 10.0,
-                )
-                self.assertEqual("optimal", result["status"])
-                row_use, _row_quantity, _imports = (
-                    planner._aggregate_area_original_values(
-                        result["configuration_values"]
-                    )
-                )
-                value = row_use.get(("G1", "A|01", "1"), 0.0)
-                if sense == "L":
-                    self.assertLessEqual(value, 1e-7)
-                else:
-                    self.assertGreaterEqual(value, 1.0 - 1e-7)
-        finally:
-            for pricing in planner._area_pricing_models.values():
-                planner._free_gurobi_model(pricing.model)
-
-    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
-    def test_group_area_quantity_branch_is_enforced_after_pricing(self) -> None:
-        planner = AreaConfigurationBranchPricePlanner(
-            make_small_problem(),
-            ColumnGenerationConfig(
-                max_iterations=30,
-                total_time_limit=20.0,
-                mip_gap=0.0,
-                solver_threads=1,
-                verbose=False,
-            ),
-        )
-        areas = planner._initialize_area_configuration_pool()
-        try:
-            for sense, rhs in (("L", 0), ("G", 1)):
-                decision = BranchDecision(
-                    "branch_group_area_quantity",
-                    ("G1", "A"),
-                    sense,
-                    rhs,
-                )
-                result = planner._solve_area_node_lp(
-                    BranchPriceNode(
-                        node_id=3 if sense == "L" else 4,
-                        depth=1,
-                        decisions=(decision,),
-                    ),
-                    areas,
-                    perf_counter() + 10.0,
-                )
-                self.assertEqual("optimal", result["status"])
-                value = sum(
-                    float(weight)
-                    * int(
-                        dict(
-                            planner._area_configurations[index].group_quantities
-                        ).get("G1", 0)
-                    )
-                    for index, weight in result[
-                        "configuration_values"
-                    ].items()
-                    if planner._area_configurations[index].area_no == "A"
-                )
-                if sense == "L":
-                    self.assertLessEqual(value, 1e-7)
-                else:
-                    self.assertGreaterEqual(value, 1.0 - 1e-7)
-        finally:
-            for pricing in planner._area_pricing_models.values():
-                planner._free_gurobi_model(pricing.model)
-
-    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
-    def test_area_branch_and_price_is_exact_on_small_case(self) -> None:
-        result = AreaConfigurationBranchPricePlanner(
-            make_small_problem(),
-            ColumnGenerationConfig(
-                max_iterations=30,
-                total_time_limit=20.0,
-                mip_gap=0.0,
-                solver_threads=1,
-                verbose=False,
-            ),
-        ).solve_branch_and_price()
-        self.assertEqual("optimal", result["status"])
-        self.assertAlmostEqual(0.132, result["objective"], places=9)
-        self.assertAlmostEqual(
-            result["objective"], result["global_lower_bound"], places=9
+        result = planner.solve_column_generation()
+        self.assertIsNotNone(result["selected_locations"])
+        self.assertEqual("restricted_row_milp", result["incumbent_source"])
+        self.assertLess(
+            result["restricted_row_recovery"]["candidate_count"],
+            planner._base_feasible_placement_count + 1,
         )
 
-    def test_exact_branch_and_price_configuration_is_positive(self) -> None:
+    def test_column_generation_configuration_is_positive(self) -> None:
         config = ColumnGenerationConfig()
         self.assertGreater(config.reduced_cost_tolerance, 0.0)
         self.assertGreater(config.max_iterations, 0)
-        self.assertGreater(config.max_branch_nodes, 0)
-
-    def test_branch_node_limit_must_be_positive(self) -> None:
-        with self.assertRaises(ValueError):
-            YardPlanningBase(
-                make_small_problem(),
-                ColumnGenerationConfig(max_branch_nodes=0, verbose=False),
-            )
 
     def test_link_bound_uses_demand_capacity_minimum(self) -> None:
         self.assertEqual(4, YardPlanningBase._tight_link_bound(100, 4))
@@ -582,7 +366,7 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
-    def test_direct_milp_matches_branch_and_price_on_small_case(self) -> None:
+    def test_direct_milp_matches_column_generation_on_small_case(self) -> None:
         config = ColumnGenerationConfig(
             max_iterations=30,
             total_time_limit=20.0,
@@ -590,7 +374,7 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             verbose=False,
         )
         direct = DirectMilpPlanner(make_small_problem(), config).solve()
-        generated = AreaConfigurationBranchPricePlanner(
+        generated = VoyagePlanColumnGenerationPlanner(
             make_small_problem(), config
         ).solve()
         self.assertTrue(
@@ -610,7 +394,31 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
-    def test_direct_and_branch_and_price_reject_infeasible_hard_demand(self) -> None:
+    def test_two_voyage_plans_preserve_global_row_separation(self) -> None:
+        config = ColumnGenerationConfig(
+            max_iterations=30,
+            total_time_limit=20.0,
+            mip_time_limit=5.0,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        direct = DirectMilpPlanner(make_two_voyage_problem(), config).solve()
+        generated = VoyagePlanColumnGenerationPlanner(
+            make_two_voyage_problem(), config
+        ).solve()
+        self.assertAlmostEqual(
+            direct.diagnostics["final_business_objective"],
+            generated.diagnostics["final_business_objective"],
+            places=9,
+        )
+        row_voyages: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+        for row in generated.export_rows:
+            row_voyages[(row["bay_key"], row["row_no"])].add(row["voyage_id"])
+        self.assertTrue(all(len(voyages) == 1 for voyages in row_voyages.values()))
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_direct_and_column_generation_reject_infeasible_hard_demand(self) -> None:
         problem = make_small_problem()
         only_bay = make_bay("A", "01", {"1": 2})
         problem.bays = {only_bay.bay_key: only_bay}
@@ -625,22 +433,22 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "cannot assign all"):
             DirectMilpPlanner(problem, config).solve()
-        with self.assertRaisesRegex(RuntimeError, "feasible incumbent"):
-            AreaConfigurationBranchPricePlanner(problem, config).solve()
+        with self.assertRaisesRegex(RuntimeError, "complete feasible plan"):
+            VoyagePlanColumnGenerationPlanner(problem, config).solve()
 
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
-    def test_small_case_finishes_exact_branch_and_price(self) -> None:
-        diagnostics = AreaConfigurationBranchPricePlanner(
+    def test_small_case_finishes_exact_column_generation(self) -> None:
+        diagnostics = VoyagePlanColumnGenerationPlanner(
             make_small_problem(),
             ColumnGenerationConfig(mip_gap=0.0, verbose=False),
         ).solve().diagnostics
         self.assertEqual("optimal", diagnostics["master_status"])
         self.assertEqual(
-            "complete_branch_and_price_tree",
+            "complete_voyage_dantzig_wolfe_root_relaxation",
             diagnostics["master_bound_scope"],
         )
         self.assertEqual(
-            "exact_area_pricing_and_branch_tree",
+            "exact_complete_voyage_plan_lp",
             diagnostics["complete_model_gap_source"],
         )
         self.assertAlmostEqual(

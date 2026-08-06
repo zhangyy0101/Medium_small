@@ -46,7 +46,6 @@ class DirectMilpPlanner(YardPlanningBase):
             "base_feasible_placement_count": self._base_feasible_placement_count,
             "formulation": "complete_integer_row_location_milp",
             "decomposition": "none",
-            "branch_and_price": False,
             "gurobi_available": True,
             "business_objective_normalization": {
                 "weights": self._objective_weights(),

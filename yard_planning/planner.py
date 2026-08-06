@@ -51,24 +51,6 @@ class PlacementColumn:
     intrinsic_cost: float
 
 
-@dataclass(frozen=True)
-class BranchDecision:
-    """One branch bound on an original row-allocation or import variable."""
-
-    section: str
-    key: tuple[str, ...]
-    sense: str
-    rhs: int
-
-
-@dataclass(frozen=True)
-class BranchPriceNode:
-    node_id: int
-    depth: int
-    decisions: tuple[BranchDecision, ...] = ()
-    inherited_bound: float = -math.inf
-
-
 @dataclass
 class ColumnGenerationConfig:
     max_iterations: int = 60
@@ -79,7 +61,6 @@ class ColumnGenerationConfig:
     lp_method: int = 1
     solver_seed: int = 0
     solver_threads: int = 0
-    max_branch_nodes: int = 200
     verbose: bool = True
     # Business-policy weights. Every component is first mapped to a natural
     # dimensionless scale. The baseline is calibrated against realized
@@ -193,8 +174,6 @@ class YardPlanningBase:
     def _validate_column_generation_config(self) -> None:
         if int(self.config.max_iterations) <= 0:
             raise ValueError("max_iterations must be positive")
-        if int(self.config.max_branch_nodes) <= 0:
-            raise ValueError("max_branch_nodes must be positive")
 
     def _build_planning_groups(self) -> list[ExportGroup]:
         """Return declared, not-yet-arrived export groups only."""
@@ -840,8 +819,6 @@ class YardPlanningBase:
         out["area_guidance_balance"][col.quota_key] += quantity
         return out
 
-
-
     def _master_dual_snapshot(
         self,
         model,
@@ -855,9 +832,6 @@ class YardPlanningBase:
                 if row is not None:
                     duals[(section, key)] = float(model.getLinearDual(row))
         return duals
-
-
-
 
     def _add_bay_compatibility_constraints(
         self,
@@ -939,30 +913,13 @@ class YardPlanningBase:
             )
         return {"row_attr_link": links, "row_attr_one": choices}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
     @staticmethod
     def _seconds_until(deadline: float | None) -> float | None:
         if deadline is None:
             return None
         return max(0.0, float(deadline) - perf_counter())
 
-    def _set_node_time_limit(
+    def _set_remaining_time_limit(
         self, model, deadline: float | None
     ) -> bool:
         remaining = self._seconds_until(deadline)
@@ -972,31 +929,6 @@ class YardPlanningBase:
             return False
         self._set_gurobi_param(model, "TimeLimit", max(0.01, remaining))
         return True
-
-
-
-
-
-    @staticmethod
-    def _most_fractional_value(
-        values: dict[tuple[str, ...], float],
-        tolerance: float = 1e-6,
-    ) -> tuple[tuple[str, ...], float] | None:
-        candidates = [
-            (min(value - math.floor(value), math.ceil(value) - value), key, value)
-            for key, value in values.items()
-            if abs(value - round(value)) > tolerance
-        ]
-        if not candidates:
-            return None
-        _fractionality, key, value = max(
-            candidates, key=lambda item: (item[0], item[1])
-        )
-        return tuple(key), float(value)
-
-
-
-
 
     def _iter_feasible_base_placements(
         self,

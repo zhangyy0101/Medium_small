@@ -11,10 +11,6 @@ import pandas as pd
 
 from adapters.input_adapter_gd import InputAdapterGd, normalize_voyage_id
 from adapters.planning_input import load_planning_inputs
-from yard_planning.area_branch_price import (
-    AreaConfigurationBranchPricePlanner,
-)
-from yard_planning.area_configuration import AdaptiveAreaPricingConfig
 from yard_planning.direct_milp import DirectMilpPlanner
 from yard_planning.planner import (
     ColumnGenerationConfig,
@@ -23,6 +19,10 @@ from yard_planning.planner import (
     write_rows,
 )
 from yard_planning.output_validator import validate_output_files
+from yard_planning.voyage_plan_column_generation import (
+    VoyagePlanColumnGenerationPlanner,
+    VoyagePlanPricingConfig,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -49,32 +49,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mip-gap", type=float, default=0.01)
     parser.add_argument("--max-pricing-iterations", type=int, default=60)
     parser.add_argument(
-        "--full-pricing-frequency",
+        "--plans-per-pricing",
         type=int,
-        default=2,
-        help=(
-            "Run a complete exact area-pricing sweep every N business "
-            "iterations; intervening rounds revisit productive areas."
-        ),
+        default=3,
+        help="Maximum complete voyage plans returned by one pricing MIP.",
     )
-    parser.add_argument(
-        "--max-branch-nodes",
-        type=int,
-        default=200,
-        help=(
-            "Maximum branch-and-price nodes; every processed node is priced "
-            "to exact reduced-cost closure."
-        ),
-    )
-    parser.add_argument("--direct-candidate-limit", type=int, default=2_000)
-    parser.add_argument("--complex-area-pool-size", type=int, default=6)
-    parser.add_argument("--simple-area-pool-size", type=int, default=1)
-    parser.add_argument("--complex-time-weight", type=float, default=1.5)
-    parser.add_argument(
-        "--certificate-time-fraction", type=float, default=0.15
-    )
-    parser.add_argument("--nested-max-iterations", type=int, default=24)
-    parser.add_argument("--nested-time-fraction", type=float, default=0.70)
     parser.add_argument(
         "--solver-threads",
         type=int,
@@ -121,7 +100,6 @@ def main() -> None:
         total_time_limit=args.total_time_limit,
         mip_time_limit=args.mip_time_limit,
         mip_gap=args.mip_gap,
-        max_branch_nodes=args.max_branch_nodes,
         solver_threads=args.solver_threads,
         verbose=not args.quiet,
     )
@@ -129,20 +107,11 @@ def main() -> None:
     if args.solver == "direct":
         planner = DirectMilpPlanner(inputs.problem, config)
     else:
-        planner = AreaConfigurationBranchPricePlanner(
+        planner = VoyagePlanColumnGenerationPlanner(
             inputs.problem,
             config,
-            AdaptiveAreaPricingConfig(
-                direct_candidate_limit=args.direct_candidate_limit,
-                complex_area_pool_size=args.complex_area_pool_size,
-                simple_area_pool_size=args.simple_area_pool_size,
-                complex_time_weight=args.complex_time_weight,
-                certificate_time_fraction=(
-                    args.certificate_time_fraction
-                ),
-                full_sweep_frequency=args.full_pricing_frequency,
-                nested_max_iterations=args.nested_max_iterations,
-                nested_time_fraction=args.nested_time_fraction,
+            VoyagePlanPricingConfig(
+                plans_per_pricing=args.plans_per_pricing,
             ),
         )
     planner_initialization_seconds = perf_counter() - stage_start
