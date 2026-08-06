@@ -78,3 +78,15 @@ This MILP enforces the complete original model and is solved once with zero requ
 M0 is the complete compact row-location MILP. It creates all feasible row locations and uses the same hard constraints, import representation, normalization, and weights. It has no decomposition, pricing, Phase I, or alternate solution chain.
 
 Small-instance tests require M0 and the paper algorithm to return the same objective and independently valid row output. Additional tests verify strict root closure on a complete-column case and cross-voyage row separation.
+
+## 9. Alternative strengthened logic-based Benders solver
+
+The optional `lbbd` solver is isolated from both the complete-voyage column-generation implementation and M0. Its integer master allocates every export group and anonymous import reserve to yard areas. It also represents area activation, a lower bound on used rows, large-plan deviation, and berth distance.
+
+The master is strengthened before iteration by aggregate physical-capacity cuts, size-capacity cuts, 45-ft edge-capacity cuts, and maximal-clique/Hall cuts derived from the row no-mix conflict graph. For a fixed master assignment, one persistent exact MIP per active area performs the detailed bay-and-row allocation under the complete common model.
+
+An infeasible area subproblem extracts an IIS demand core. It generates a monotone logic feasibility cut on that core and, when the auxiliary core-packing problem closes, a globally valid aggregate core-capacity cut. A solved area subproblem generates a monotone conditional lower-bound cut on its local proximity and row-dispersion cost. Repeated exact area assignments are cached.
+
+If the first LBBD iteration produces no complete incumbent, a time-limited compact-row solve is used once as an adaptive primal seed. It can supply a verified upper bound and master start only. Its solver bound is explicitly discarded: every reported lower bound and every convergence claim still comes exclusively from the strengthened LBBD master and exact area subproblems.
+
+This implementation is an experimental third algorithm and does not modify the `cg` or `direct` execution paths. The optional primal seed reuses their common compact-model builder, but it does not call `DirectMilpPlanner.solve` and cannot contribute a bound.

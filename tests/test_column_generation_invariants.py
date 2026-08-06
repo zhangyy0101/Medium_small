@@ -11,6 +11,10 @@ from types import SimpleNamespace
 
 from yard_planning.models import AttributeRules, Bay, ExportGroup, ProblemData
 from yard_planning.direct_milp import DirectMilpPlanner
+from yard_planning.logic_benders import (
+    LogicBendersConfig,
+    LogicBendersPlanner,
+)
 from yard_planning.planner import (
     ColumnGenerationConfig,
     YardPlanningBase,
@@ -138,6 +142,14 @@ def make_two_voyage_problem() -> ProblemData:
 
 
 class ColumnGenerationInvariantTests(unittest.TestCase):
+    def test_logic_benders_configuration_is_validated(self) -> None:
+        with self.assertRaises(ValueError):
+            LogicBendersPlanner(
+                make_small_problem(),
+                ColumnGenerationConfig(verbose=False),
+                LogicBendersConfig(max_iterations=0),
+            )
+
     def test_voyage_plan_pricing_configuration_is_validated(self) -> None:
         with self.assertRaises(ValueError):
             VoyagePlanColumnGenerationPlanner(
@@ -394,6 +406,41 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_logic_benders_matches_m0_on_small_case(self) -> None:
+        config = ColumnGenerationConfig(
+            total_time_limit=20.0,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        direct = DirectMilpPlanner(make_small_problem(), config).solve()
+        decomposed = LogicBendersPlanner(
+            make_small_problem(),
+            config,
+            LogicBendersConfig(
+                max_iterations=20,
+                master_time_limit=3.0,
+                area_time_limit=3.0,
+                primal_seed_time_limit=0.0,
+            ),
+        ).solve()
+        self.assertTrue(decomposed.diagnostics["lbbd_converged"])
+        self.assertTrue(
+            decomposed.diagnostics["independent_solution_validation"]["passed"]
+        )
+        self.assertGreater(
+            decomposed.diagnostics["lbbd_cut_counts"][
+                "initial_conflict_clique"
+            ],
+            0,
+        )
+        self.assertAlmostEqual(
+            direct.diagnostics["final_business_objective"],
+            decomposed.diagnostics["final_business_objective"],
+            places=9,
+        )
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
     def test_two_voyage_plans_preserve_global_row_separation(self) -> None:
         config = ColumnGenerationConfig(
             max_iterations=30,
@@ -416,6 +463,39 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         for row in generated.export_rows:
             row_voyages[(row["bay_key"], row["row_no"])].add(row["voyage_id"])
         self.assertTrue(all(len(voyages) == 1 for voyages in row_voyages.values()))
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_logic_benders_preserves_cross_voyage_row_separation(self) -> None:
+        config = ColumnGenerationConfig(
+            total_time_limit=20.0,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        direct = DirectMilpPlanner(make_two_voyage_problem(), config).solve()
+        decomposed = LogicBendersPlanner(
+            make_two_voyage_problem(),
+            config,
+            LogicBendersConfig(
+                max_iterations=20,
+                master_time_limit=3.0,
+                area_time_limit=3.0,
+                primal_seed_time_limit=0.0,
+            ),
+        ).solve()
+        self.assertAlmostEqual(
+            direct.diagnostics["final_business_objective"],
+            decomposed.diagnostics["final_business_objective"],
+            places=9,
+        )
+        row_voyages: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+        for row in decomposed.export_rows:
+            row_voyages[(row["bay_key"], row["row_no"])].add(
+                row["voyage_id"]
+            )
+        self.assertTrue(
+            all(len(voyages) == 1 for voyages in row_voyages.values())
+        )
 
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
     def test_direct_and_column_generation_reject_infeasible_hard_demand(self) -> None:

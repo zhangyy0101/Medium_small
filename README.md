@@ -8,10 +8,11 @@
 
 ## 求解器
 
-仓库只保留两套求解器：
+仓库保留三套相互独立的求解器：
 
 - `cg`：论文算法——完整航次方案列生成、航次内部箱区局部模式协调、严格定价认证，以及一次受限排级整数恢复；
-- `direct`：同一数学模型的完整排位置 MILP，即对照基线 M0。
+- `direct`：同一数学模型的完整排位置 MILP，即对照基线 M0；
+- `lbbd`：实验性替代算法——强箱区容量割、排级不混冲突图割，以及按箱区精确求解的逻辑 Benders 分解。它不调用 `cg`；仅在首轮没有完整上界时复用共享紧凑模型构造器生成一次短时 primal seed，并丢弃该模型的下界。
 
 论文算法的外层一列表示“一个出口航次跨全部可行箱区的完整排级方案”。外层主问题只为每个航次选择一列，并统一协调共享排/贝容量、跨航次不混状态、进口预留和大计划偏差，因此凸性块数量等于航次数，而不是航次数乘箱区数。
 
@@ -39,6 +40,7 @@
 python -m pip install -r requirements.txt
 python -X utf8 -B run_yard_plan.py --solver cg --run-name voyage_plan_cg
 python -X utf8 -B run_yard_plan.py --solver direct --run-name m0_direct
+python -X utf8 -B run_yard_plan.py --solver lbbd --run-name strengthened_lbbd
 ```
 
 主要参数：
@@ -53,6 +55,7 @@ python -X utf8 -B run_yard_plan.py --solver direct --run-name m0_direct
 ```bash
 python -X utf8 -B example/generate_diverse_voyages_case.py --copies 3 --overwrite
 python -X utf8 -B benchmark_voyage_plans.py --input example/diverse_voyages_3x/input_data.json --large-plan example/diverse_voyages_3x/large_plan.csv --total-time-limit 120 --solver-threads 1
+python -X utf8 -B benchmark_logic_benders.py --input example/diverse_voyages_3x/input_data.json --large-plan example/diverse_voyages_3x/large_plan.csv --total-time-limit 120 --solver-threads 1 --compare-direct
 ```
 
 ## 输出

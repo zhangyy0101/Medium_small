@@ -1,0 +1,32 @@
+{
+  "lbbd": {
+    "algorithm": "logic_based_benders_capacity_conflict_gurobi",
+    "master_status": "timelimit",
+    "final_business_objective": 0.26700085,
+    "complete_model_lower_bound": 0.24217314798605394,
+    "complete_model_relative_gap": 0.09298735196515694,
+    "lbbd_converged": false,
+    "lbbd_termination_reason": "time_limit",
+    "lbbd_iteration_count": 7,
+    "lbbd_cut_counts": {
+      "initial_conflict_clique": 80,
+      "initial_conflict_hall_capacity": 80,
+      "dynamic_conflict_hall_capacity": 15,
+      "dynamic_conflict_core_capacity": 17,
+      "logic_feasibility": 20,
+      "logic_optimality": 19,
+      "dominance_binary_variables": 144
+    },
+    "lbbd_area_subproblem_solve_count": 123,
+    "lbbd_area_subproblem_cache_hits": 40,
+    "lbbd_compact_primal_seed": {
+      "attempted": true,
+      "feasible": true,
+      "status": "timelimit",
+      "seconds": 12.558,
+      "objective": 0.26700085,
+      "bound_used": false
+    },
+    "lbbd_total_solve_seconds": 120.009
+  }
+}
