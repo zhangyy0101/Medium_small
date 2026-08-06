@@ -106,20 +106,6 @@ def area_allows_flow(area: Any, flow: Any, area_functions: Mapping[str, set[str]
     return flow_code in area_functions.get(area_code, set())
 
 
-def yard_transshipment_mask(rows: pd.DataFrame) -> pd.Series:
-    if rows.empty or "IYC_EVOY_ID" not in rows.columns or "IYC_IVOY_ID" not in rows.columns:
-        return pd.Series(False, index=rows.index)
-    export_voyage = rows["IYC_EVOY_ID"].map(lambda value: bool(normalize_voyage(value)))
-    import_voyage = rows["IYC_IVOY_ID"].map(lambda value: bool(normalize_voyage(value)))
-    return export_voyage & import_voyage
-
-
-def active_yard_rows(rows: pd.DataFrame) -> pd.DataFrame:
-    if rows.empty:
-        return rows.copy()
-    return rows.loc[~yard_transshipment_mask(rows)].copy()
-
-
 def normalize_voyage_list(values: Sequence[str] | None) -> list[str]:
     if values is None:
         return []
@@ -641,16 +627,6 @@ def configured_operational_group_key(
     return (scope, f"flow={flow}", *(f"{attr}={values.get(attr, 'MIXED')}" for attr in attrs))
 
 
-def container_identity(row: pd.Series, index: object) -> str:
-    number = normalize_code(row.get("IYC_CNTRNO"))
-    if number:
-        return f"NO:{number}"
-    cntr_id = normalize_code(row.get("IYC_CNTRID"))
-    if cntr_id and cntr_id not in {"-1", "0"}:
-        return f"ID:{cntr_id}"
-    return f"ROW:{index}"
-
-
 def read_doc_by_port_size(input_guandong: InputAdapterGd, voyage_id: str) -> Counter[tuple[str, str, str]]:
     counter: Counter[tuple[str, str, str]] = Counter()
     frame = input_guandong.vessel_containers.get(voyage_id, {}).get("doc_cntrs", None)
@@ -969,16 +945,6 @@ def _object_column(
     if column not in frame.columns:
         return [default] * len(frame)
     return frame[column].to_numpy(dtype=object, copy=False)
-
-
-def slot_identity(row: Mapping[str, Any], area_no: str | None = None, bay_no: str | None = None) -> tuple[str, str, str, str, str]:
-    return (
-        normalize_code(area_no if area_no is not None else row.get("YAA_AREANO")),
-        normalize_bay(bay_no if bay_no is not None else row.get("YBY_BAYNO")),
-        normalize_row(row.get("YST_ROWNO")),
-        normalize_row(row.get("YST_TIERNO")),
-        normalize_row(row.get("YST_SLOTNO")),
-    )
 
 
 def slot_identities(frame: pd.DataFrame) -> list[tuple[str, str, str, str, str]]:

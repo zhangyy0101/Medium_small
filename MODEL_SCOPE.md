@@ -1,228 +1,104 @@
-# TRE-oriented model scope
+# Model and algorithm scope
 
-## Planning hierarchy
+## 1. Planning boundary
 
-The upstream big plan is an exogenous area-capacity allocation. For the
-long-format big-plan file, this project reads `new_qty` only:
+The detailed row-allocation demand consists only of declared export containers that have not yet entered the yard. Every such container must be allocated. Export forecasts are excluded from both demand and capacity reservation.
 
-- `new_qty`: allocation for containers that have not entered the yard;
-- `planned_qty`: snapshot occupancy plus `new_qty`, and is never used as
-  downstream demand or reservation.
+Import voyages are represented by anonymous capacity reservations. For an import large-plan record, only `new_qty` is treated as future demand; `planned_qty` already contains in-yard boxes and is not an incremental quantity. Import reservations obey:
 
-The upstream size field is mandatory and must be either `20` or `40`. The
-upstream `40` class combines physical 40-ft and 45-ft containers. Blank,
-unknown, `45`, and aggregate-size values are rejected instead of silently
-converted.
+1. yard-area function compatibility;
+2. bay-size compatibility;
+3. shared physical capacity.
 
-The detailed model allocates declared, not-yet-arrived export containers to
-yard rows. Imports receive anonymous bay-size capacity reservations, not
-container-group, individual-container, or row assignments.
+They do not inherit export voyage, discharge-port, height, or other no-mix constraints and are not assigned to detailed rows.
 
-## Demand and reservations
+The large-plan size is restricted to `20` and `40`; `40` covers physical 40/45-ft containers. `ALL`, blank, `45`, and unknown values are rejected.
 
-- Export detailed demand: declared containers (`doc_cntrs`) only.
-- Export big-plan guidance: export `new_qty` is normalized by voyage and size
-  and rescaled to the declared export demand. It supplies a soft area target
-  only; forecast-only export quantity is neither allocated nor reserved.
-- Import capacity total: import big-plan `new_qty`, conserved by flow and size.
-  Its upstream area allocation is a soft reference. Anonymous reservations may
-  move between areas that support the import flow when the original area lacks
-  usable size capacity.
-- Incumbent import and export containers: already reflected in available bay
-  and row capacity derived from the yard snapshot.
-- Incumbent import containers are conservatively assumed not to leave during
-  the planning horizon because release-time data are unavailable.
+## 2. Decisions
 
-The model is static and conservative: incumbent containers remain occupied
-throughout the horizon, while every declared export container in the demand
-set is assumed to enter before the end of the horizon and still occupy yard
-capacity at that point.
+The underlying compact model uses integer export quantities at row locations, binary group-area activation, binary group-row activation, anonymous integer import reservations at bays, and auxiliary binary variables for configured no-mix states.
 
-Import reservations consume bay-size and joint physical capacity. A 20-ft
-reservation uses a 20-ft-enabled bay; an upstream `40` reservation uses the
-paired physical footprint of a 40-ft-enabled large bay. The upstream data do
-not distinguish physical 40-ft and 45-ft imports, so no import-specific 45-ft
-edge rule is inferred.
+The paper algorithm applies Dantzig-Wolfe decomposition by yard area. One column is a complete integer configuration of one area and contains:
 
-## Detailed decision level
+- export group quantities at row locations;
+- anonymous import reservations at compatible bays;
+- the corresponding local capacity, footprint, stack, no-mix, area-use, and row-use states;
+- its normalized business cost.
 
-Every placement column contains a row allocation. The mathematical decisions
-therefore remain row-level; an area-bay summary is derived only for reporting.
+The master selects exactly one configuration for each modeled area. It enforces every export group demand equality, every import flow-size reservation equality, and the export/import large-plan deviation balances.
 
-There is one operational group definition throughout the model:
+## 3. Hard constraints
 
-`(voyage, flow, destination port, size, height)`.
+Both the paper algorithm and M0 enforce the same constraints:
 
-The former coarse/fine grouping distinction is removed from the model input.
-All active grouping rules resolve to the single operational group above.
+- complete allocation of declared export demand;
+- shared physical bay and row capacity;
+- size-specific bay and row capacity;
+- large-bay paired footprints for 40/45-ft containers;
+- stack availability and stack-height conversion;
+- area-function eligibility;
+- configured bay-level and row-level no-mix attributes;
+- mandatory row separation of export voyage and discharge port;
+- mandatory height compatibility within a row;
+- 45-ft containers restricted to available edge large bays.
 
-## Core hard constraints
+The 45-ft rule does not prohibit non-45-ft containers from other feasible edge positions.
 
-- declared export demand balance with an explicit unplaced slack variable;
-- physical, size-specific, stack, bay-row, and row-size capacity;
-- paired-slot footprint for 40 ft and 45 ft containers;
-- area-function compatibility;
-- no size mixing within a bay;
-- no height mixing within a bay;
-- different voyages cannot share a row, including conflicts with incumbent
-  containers;
-- destination-port row compatibility;
-- import flow-size total conservation and anonymous bay-size capacity;
-- 45-ft containers may use only the first or last feasible large-bay position
-  of an area. They remain subject to the same paired-bay, capacity, row, size,
-  height, voyage, and destination-port constraints as every other container.
-  This rule does not reserve every edge position for 45-ft containers and does
-  not impose area-wide mutual exclusion between 45-ft and non-45-ft demand.
+Import reservations share physical and size capacity with exports but receive no detailed no-mix constraints.
 
-Area-function compatibility is always hard. An area appearing in the upstream
-big plan is not exempt from its flow-function requirement; an incompatible
-upstream allocation contributes a soft guidance deviation but never creates a
-detailed-placement candidate.
+## 4. Objective
 
-## Pattern decomposition and retained objectives
+The objective is a directly normalized weighted sum. The five components and empirical weights are:
 
-A column is a complete integer row-layout pattern for one export operational
-group. It specifies all placements of that group across areas, bays, and rows,
-together with any unplaced quantity. Pattern construction enforces the group's
-size footprint, 45-ft edge rule, residual bay and row capacities, stack
-capacity, incumbent compatibility, and its own area/row dispersion. The master
-selects exactly one pattern per group and coordinates shared bay/row capacity,
-cross-group no-mix attributes, anonymous import reservation, and big-plan
-deviation. Thus the decomposition internalizes each group's combinatorial
-layout while retaining the shared yard interactions in the master.
+| Component | Weight | Natural normalization |
+|---|---:|---|
+| group-area dispersion | 0.290 | maximum reachable group-area activations |
+| group-row dispersion | 0.240 | maximum reachable group-row activations |
+| distance from existing same-group boxes | 0.070 | reachable anchored demand and normalized bay-order distance |
+| export/import large-plan deviation | 0.270 | guided export and reserved import quantities |
+| berth-area travel distance | 0.130 | assigned export quantity and voyage-specific distance range |
 
-The initial restricted master contains one all-unplaced artificial pattern per
-group. Early pricing rounds use stabilized duals and several deterministic
-constructive heuristics to populate the master cheaply. One pricing MIP is then
-built and retained for each group; later solves update only its objective and
-reuse the preceding incumbent as a MIP start. Non-certificate rounds apply a
-short selective solve only to groups that remain active according to cached
-negative patterns or their preceding pricing incumbent. Historical pricing
-patterns are re-evaluated under every new dual vector. Negative-reduced-cost
-patterns enter in an adaptive group-wise batch, and new variables are inserted
-into a persistent Gurobi master so its LP basis is retained.
+All required berth-area distances must exist. A missing distance is an input error rather than a zero-cost fallback.
 
-At configured certificate rounds, pricing uses the raw master duals and covers
-every group. If a group pricing MIP is optimal, its minimum reduced cost is
-known exactly. If it reaches its certificate time limit, Gurobi's valid
-objective lower bound is used instead; this may weaken but cannot invalidate
-the full-pattern LP lower bound. The sum of the negative group-wise reduced-cost
-lower bounds corrects the restricted-master value into a valid lower bound for
-the full implicit pattern LP. Incumbent reduced costs, pricing optimality, and
-time-limit counts are reported separately, so a bound certificate is never
-misreported as exact pricing.
+## 5. Adaptive area pricing
 
-The model is solved in two lexicographic stages. Stage 1
-minimizes the number of unplaced declared containers. Stage 2 fixes that
-minimum exactly and minimizes the following operational criteria:
+Area difficulty is determined from the instance rather than area names. Candidate row locations and large-bay footprints form a graph inside each area.
 
-- transferred boxes relative to upstream area-size guidance: normalized export
-  guidance plus the import reservation's original area reference, measured by
-  their combined L1 deviation;
-- quantity-weighted berth-to-yard distance;
-- operational-group area dispersion;
-- operational-group row dispersion;
-- proximity to incumbent containers of the exact same operational group;
+- A small or single-component area is priced by one complete exact MIP.
+- A large multi-component area uses nested exact pricing.
 
-Every secondary criterion is first converted to a dimensionless natural
-instance scale. Area and row dispersion count only activations beyond the first
-one used by each placed operational group, divided respectively by the maximum
-number of additional feasible areas and rows. Incumbent proximity is a
-quantity-weighted bay distance in `[0,1]`, divided by the demand of groups that
-have a reachable incumbent anchor area. An anchor is neutral and excluded from
-the normalization scale when no function-compatible bay in its area has a
-feasible residual position; this removes decision-independent constant costs.
-Big-plan deviation is divided by twice the sum of
-guided export demand and import reservation demand, because moving one box
-creates one shortage and one excess in the L1 vector. For each voyage, berth
-distance is mapped from its closest and farthest compatible areas to `[0,1]`
-and then averaged by declared quantity.
+For nested pricing, each physical component has a persistent exact block MIP. A block configuration satisfies every local packing restriction. A persistent coordination LP chooses one configuration per block and links their group quantities to one group-area activation variable.
 
-The baseline empirical weights are 0.290 for area dispersion, 0.240 for row
-dispersion, 0.070 for incumbent-group proximity, 0.270 for big-plan guidance,
-and 0.130 for berth distance. They sum to one. The first three terms jointly
-receive 0.600, expressing the policy order concentration and layout continuity
-> big-plan inheritance > travel efficiency. The weights were calibrated using
-the realized normalized component contributions and the coverage of reachable
-incumbent anchors. In particular, proximity is not allowed to dominate the
-objective when it applies to only a small share of declared demand. They are
-not inverse-value multipliers fitted to one solution, so good performance on a
-component does not mechanically reduce its policy importance.
+Blocks with identical physical data, candidate semantics, and constraint structure are detected without using area names. One representative exact MIP supplies a small pool that is mapped bijectively to every block in the equivalence class. Because the block-convexity dual is a constant in each subproblem, this reuse preserves both the optimal configuration and its exact lower bound. Sharing is disabled whenever a row- or bay-specific branch decision breaks the equivalence.
 
-After column generation, an integer pattern master supplies the first feasible
-integer allocation. A final fix-and-optimize model enriches its row-location
-pool with locations from all generated master patterns, cached pricing
-patterns, and feasible group-area neighborhoods supported by the final
-fractional pattern solution, the integer incumbent, or the latest raw-dual
-negative-reduced-cost patterns. It recombines integer quantities under the same
-constraints and objective. It may improve the integer incumbent but introduces
-neither a different business objective nor a free post-solve relayout.
+For a fixed outer-master dual vector, block reduced-cost lower bounds are obtained from the global MIP bounds. The coordination-LP objective plus the sum of negative block lower-bound corrections is a valid lower bound for the complete integer area-pricing problem. If that value, after the outer area-convexity dual, is nonnegative, the area is exactly certified. The restricted coordination MIP is used only to construct feasible negative columns. If the nested bound is inconclusive and no new column is found, the solver falls back to the complete area MIP.
 
-The stage-1 optimum for total unplaced demand is imposed as an equality in
-every stage-2 restricted master. Consequently, stage-2 unplaced variables have
-zero objective coefficients; no artificial million-scale penalty is mixed
-with the normalized operational objective. Activation links use
-constraint-specific bounds rather than one global Big-M. In particular, an
-operational-group/area bound is the smaller of its relevant demand and its
-feasible bay-row capacity in that area, with each bay additionally capped by
-its size, footprint, and stack capacity. It does not use unrelated total area
-capacity.
+This fallback is part of the exactness mechanism and is not a secondary heuristic solver chain.
 
-Stage 1 stops immediately at zero unplaced boxes because its nonnegative
-objective then proves optimality. In stage 2, the default stopping condition is
-a certified full-pattern relative LP gap of at most `0.5%`, calculated as the
-restricted-master upper bound minus the corrected lower bound, divided by the
-absolute restricted-master upper bound. Setting `pattern_lp_gap_tolerance` to
-zero requires a lower-bound certificate with no negative reduced cost. The code
-reports the absolute and relative pattern-LP gaps, integer-master MIP gap, and
-the valid absolute and relative gaps between the final integer incumbent and
-that LP lower bound separately. The method is column generation plus integer
-recovery, not branch-and-price, so it makes no full integer-optimality claim.
+## 6. Restricted master and convergence
 
-The import variables are anonymous capacity reservations indexed only by flow,
-size, and bay. Their totals equal the corresponding import `new_qty`. Their
-area totals may deviate from the big plan and the same big-plan L1 criterion
-selects the minimum adjustment. Import variables enter only area-function,
-bay-size, paired-footprint, and joint physical-capacity constraints. They do
-not enter size/height no-mix, voyage no-mix, destination-port compatibility,
-stack, or row constraints. If all compatible bays together cannot reserve the
-full import total, the model reports infeasibility instead of truncating demand.
+The initial pool contains a zero configuration for each area. Temporary Phase-I artificial variables establish restricted-master feasibility; they are fixed to zero before the business objective is optimized and never enter the final model.
 
-Berth-to-area distance is weighted by assigned quantity. Every export voyage
-in the detailed model must have a berth mapping, and every candidate area must
-have a positive finite distance to that berth. Missing or invalid values are
-input errors; the model neither imputes them nor silently excludes the travel
-criterion.
+Business pricing alternates between productive-area sweeps and periodic complete sweeps. A selective sweep may add columns but cannot update a valid global lower bound or declare closure. Exact node closure requires every area to have a valid nonnegative reduced-cost certificate under the same raw master dual vector.
 
-The independent output validator reconstructs every export footprint from the
-input group and bay data. It checks group identity and dynamic attributes,
-area-function eligibility, 40/45-ft paired-row signatures, configured bay and
-row no-mix attributes (including incumbent conflicts), demand and unplaced
-balances, joint export/import capacities, anonymous import metadata, and the
-45-ft edge rule without consulting the solver incumbent.
+The root and every branch node use the same column-generation engine. If the time limit interrupts pricing, the node retains its last valid bound and remains open.
 
-## Removed from the paper model
+## 7. Branching and primal upper bound
 
-- detailed placement of forecast export containers;
-- aggregate reservation of forecast-only export containers;
-- detailed group, container, or row placement of import containers;
-- weight classes;
-- reefer, dangerous, over-limit, and other special-container rules;
-- manual required/allowed/blocked area or bay overrides;
-- E-area naming rules;
-- fixed multi-bay planning blocks;
-- coarse/fine group-specific dispersion and balancing terms;
-- bay-count dispersion (replaced by row-count dispersion);
-- fixed maximum run length for consecutive 20 ft bays;
-- tiered alternative-area penalties;
-- misplaced-bay exclusion ratio;
-- post-window loading rewards;
-- document-floor and forecast-substitution demand construction.
-- concurrent-operation conflict penalties.
+The branching order is:
 
-When an entire voyage-flow-size demand has no matching upstream allocation, it
-is excluded from the area-guidance transfer objective. Once that combination
-has valid guidance, however, every candidate area is evaluated: areas absent
-from its upstream allocation have target zero. This makes one half of the L1
-deviation exactly equal to the number of boxes transferred away from the
-normalized upstream area pattern.
+1. group-area allocated quantity;
+2. group-row allocated quantity;
+3. group-row use;
+4. import reservation quantity;
+5. remaining original auxiliary integer states when required.
+
+Each decision is imposed in both the restricted master and subsequent area pricing, so generated configurations obey the node partition.
+
+A screened compact row MILP is solved once at the root to obtain an incumbent. Its support is built from LP-active area configurations, the two most recent configurations in each area, and the two most recent configurations of each nested physical block. This procedure supplies only a feasible upper bound and has no role in lower-bound certification.
+
+## 8. M0 baseline
+
+M0 is the complete compact row-location MILP. It creates all feasible row locations, uses the same hard constraints, import-reservation representation, normalization, and empirical weights, and is solved directly by Gurobi. It has no decomposition, pricing, Phase I, or alternative solution chain.
+
+Small-instance regression tests require M0 and the paper algorithm to return the same objective and independently valid row output.

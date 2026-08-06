@@ -11,9 +11,13 @@ import pandas as pd
 
 from adapters.input_adapter_gd import InputAdapterGd, normalize_voyage_id
 from adapters.planning_input import load_planning_inputs
+from yard_planning.area_branch_price import (
+    AreaConfigurationBranchPricePlanner,
+)
+from yard_planning.area_configuration import AdaptiveAreaPricingConfig
+from yard_planning.direct_milp import DirectMilpPlanner
 from yard_planning.planner import (
     ColumnGenerationConfig,
-    ColumnGenerationPlanner,
     write_selected_locations,
     write_json,
     write_rows,
@@ -32,26 +36,45 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--large-plan", type=Path, default=DEFAULT_LARGE_PLAN, help="Large-plan allocation CSV.")
     parser.add_argument("--output-root", type=Path, default=ROOT / "outputs")
     parser.add_argument("--run-name", default=None)
+    parser.add_argument(
+        "--solver",
+        choices=("cg", "direct"),
+        default="cg",
+        help="cg runs the proposed column generation; direct runs the M0 MILP.",
+    )
     parser.add_argument("--voyages", nargs="+", default=None, help="Optional voyage subset; default is every voyage in the large plan.")
     parser.add_argument("--planning-time", default=None, help="Optional override; default is the JSON planning_time.")
     parser.add_argument("--total-time-limit", type=float, default=60.0)
-    parser.add_argument("--mip-time-limit", type=float, default=30.0)
+    parser.add_argument("--mip-time-limit", type=float, default=15.0)
     parser.add_argument("--mip-gap", type=float, default=0.01)
     parser.add_argument("--max-pricing-iterations", type=int, default=60)
-    parser.add_argument("--pricing-min-batch", type=int, default=1)
-    parser.add_argument("--pricing-max-batch", type=int, default=12)
-    parser.add_argument("--pricing-fraction", type=float, default=0.75)
-    parser.add_argument("--heuristic-pricing-variants", type=int, default=12)
-    parser.add_argument("--dual-stabilization-alpha", type=float, default=0.65)
-    parser.add_argument("--selective-pricing-time-limit", type=float, default=2.0)
-    parser.add_argument("--exact-pricing-time-limit", type=float, default=60.0)
     parser.add_argument(
-        "--pattern-lp-gap",
-        type=float,
-        default=0.005,
-        help="Relative full-pattern LP gap tolerance; 0 requires no negative reduced cost.",
+        "--full-pricing-frequency",
+        type=int,
+        default=2,
+        help=(
+            "Run a complete exact area-pricing sweep every N business "
+            "iterations; intervening rounds revisit productive areas."
+        ),
     )
-    parser.add_argument("--raw-dual-check-interval", type=int, default=5)
+    parser.add_argument(
+        "--max-branch-nodes",
+        type=int,
+        default=200,
+        help=(
+            "Maximum branch-and-price nodes; every processed node is priced "
+            "to exact reduced-cost closure."
+        ),
+    )
+    parser.add_argument("--direct-candidate-limit", type=int, default=2_000)
+    parser.add_argument("--complex-area-pool-size", type=int, default=6)
+    parser.add_argument("--simple-area-pool-size", type=int, default=1)
+    parser.add_argument("--complex-time-weight", type=float, default=1.5)
+    parser.add_argument(
+        "--certificate-time-fraction", type=float, default=0.15
+    )
+    parser.add_argument("--nested-max-iterations", type=int, default=24)
+    parser.add_argument("--nested-time-fraction", type=float, default=0.70)
     parser.add_argument(
         "--solver-threads",
         type=int,
@@ -98,20 +121,30 @@ def main() -> None:
         total_time_limit=args.total_time_limit,
         mip_time_limit=args.mip_time_limit,
         mip_gap=args.mip_gap,
-        min_columns_per_group_per_iteration=args.pricing_min_batch,
-        max_columns_per_group_per_iteration=args.pricing_max_batch,
-        adaptive_pricing_fraction=args.pricing_fraction,
-        heuristic_pricing_variants=args.heuristic_pricing_variants,
-        dual_stabilization_alpha=args.dual_stabilization_alpha,
-        selective_pricing_time_limit=args.selective_pricing_time_limit,
-        exact_pricing_time_limit=args.exact_pricing_time_limit,
-        pattern_lp_gap_tolerance=args.pattern_lp_gap,
-        raw_dual_check_interval=args.raw_dual_check_interval,
+        max_branch_nodes=args.max_branch_nodes,
         solver_threads=args.solver_threads,
         verbose=not args.quiet,
     )
     stage_start = perf_counter()
-    planner = ColumnGenerationPlanner(inputs.problem, config)
+    if args.solver == "direct":
+        planner = DirectMilpPlanner(inputs.problem, config)
+    else:
+        planner = AreaConfigurationBranchPricePlanner(
+            inputs.problem,
+            config,
+            AdaptiveAreaPricingConfig(
+                direct_candidate_limit=args.direct_candidate_limit,
+                complex_area_pool_size=args.complex_area_pool_size,
+                simple_area_pool_size=args.simple_area_pool_size,
+                complex_time_weight=args.complex_time_weight,
+                certificate_time_fraction=(
+                    args.certificate_time_fraction
+                ),
+                full_sweep_frequency=args.full_pricing_frequency,
+                nested_max_iterations=args.nested_max_iterations,
+                nested_time_fraction=args.nested_time_fraction,
+            ),
+        )
     planner_initialization_seconds = perf_counter() - stage_start
     stage_start = perf_counter()
     result = planner.solve()
@@ -132,7 +165,6 @@ def main() -> None:
         output_dir / "import_capacity_reservation.csv",
         result.import_reservation_rows,
     )
-    write_rows(output_dir / "unplaced_boxes.csv", result.unplaced_rows)
     write_selected_locations(
         output_dir / "selected_row_locations.csv",
         result.columns,
@@ -143,7 +175,6 @@ def main() -> None:
     output_validation = validate_output_files(
         inputs.problem,
         output_dir / "export_row_plan.csv",
-        output_dir / "unplaced_boxes.csv",
         output_dir / "import_capacity_reservation.csv",
     )
     write_json(output_dir / "output_validation.json", output_validation)
@@ -157,20 +188,19 @@ def main() -> None:
             "bay_summary_row_count": len(result.bay_summary_rows),
             "export_row_plan_row_count": len(result.export_rows),
             "import_capacity_reservation_row_count": len(result.import_reservation_rows),
-            "unplaced_row_count": len(result.unplaced_rows),
-            "unplaced_boxes": result.diagnostics.get("unplaced_boxes"),
             "algorithm": result.diagnostics.get("algorithm"),
             "master_status": result.diagnostics.get("master_status"),
             "master_bound_scope": result.diagnostics.get("master_bound_scope"),
-            "pattern_lp_absolute_gap": result.diagnostics.get(
-                "pricing_phase2_absolute_gap"
+            "root_lp_lower_bound": result.diagnostics.get(
+                "root_lp_lower_bound"
             ),
-            "pattern_lp_relative_gap": result.diagnostics.get(
-                "pricing_phase2_relative_gap"
+            "root_lp_exact": result.diagnostics.get(
+                "root_lp_exact"
             ),
-            "integer_master_mip_gap": result.diagnostics.get(
-                "master_mip_gap"
+            "complete_model_lower_bound": result.diagnostics.get(
+                "complete_model_lower_bound"
             ),
+            "reported_mip_gap": result.diagnostics.get("master_mip_gap"),
             "complete_model_absolute_gap": result.diagnostics.get(
                 "complete_model_absolute_gap"
             ),
@@ -180,13 +210,16 @@ def main() -> None:
             "complete_model_gap_source": result.diagnostics.get(
                 "complete_model_gap_source"
             ),
+            "direct_solve_seconds": result.diagnostics.get(
+                "direct_total_solve_seconds"
+            ),
+            "direct_bound": result.diagnostics.get("direct_bound"),
             "runtime_breakdown_seconds": runtime_breakdown,
         },
     )
     print(f"runtime_seconds: {runtime_breakdown}")
     print(f"bay_summary: {output_dir / 'bay_summary.csv'}")
     print(f"export_row_plan: {output_dir / 'export_row_plan.csv'}")
-    print(f"unplaced_boxes: {output_dir / 'unplaced_boxes.csv'}")
     print(f"import_capacity_reservation: {output_dir / 'import_capacity_reservation.csv'}")
     print(f"diagnostics: {output_dir / 'diagnostics.json'}")
 

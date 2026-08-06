@@ -138,19 +138,16 @@ def _parse_integer(raw_value: object, label: str, errors: list[str]) -> int | No
 def validate_output_files(
     problem: ProblemData,
     export_row_plan_path: str | Path,
-    unplaced_path: str | Path,
     import_reservation_path: str | Path,
 ) -> dict[str, int | bool]:
     """Validate written CSVs using input data only, without planner state."""
     plan = _read_rows(export_row_plan_path)
-    unplaced_rows = _read_rows(unplaced_path)
     import_rows = _read_rows(import_reservation_path)
     errors: list[str] = []
 
     groups_by_id = {group.group_id: group for group in problem.export_groups}
     demand = {group_id: int(group.demand) for group_id, group in groups_by_id.items()}
     assigned: Counter[str] = Counter()
-    unplaced: Counter[str] = Counter()
     bay_load: Counter[str] = Counter()
     bay_size_load: Counter[tuple[str, str]] = Counter()
     row_load: Counter[tuple[str, str]] = Counter()
@@ -402,42 +399,11 @@ def validate_output_files(
             bay_load[key] += qty
         bay_size_load[(bay_key, size)] += qty
 
-    for row in unplaced_rows:
-        group_id = str(row.get("group_id", ""))
-        qty = _parse_integer(
-            row.get("unplaced_boxes", row.get("quantity", 0)),
-            f"unplaced_boxes[group={group_id}]",
-            errors,
-        )
-        if qty is None:
-            continue
-        if group_id not in demand:
-            errors.append(f"unknown group in unplaced output: {group_id}")
-            continue
-        if qty <= 0:
-            errors.append(f"invalid unplaced quantity: group={group_id}, qty={qty}")
-            continue
-        group = groups_by_id[group_id]
-        for field, expected in {
-            "voyage_id": group.voyage_id,
-            "flow": group.status,
-            "port": group.port,
-            "size": group.size,
-            "height": group.height,
-        }.items():
-            actual = str(row.get(field, ""))
-            if field in row and actual != str(expected):
-                errors.append(
-                    f"unplaced identity mismatch: group={group_id}, field={field}, "
-                    f"output={actual}, input={expected}"
-                )
-        unplaced[group_id] += qty
-
     for group_id, qty in demand.items():
-        if assigned[group_id] + unplaced[group_id] != qty:
+        if assigned[group_id] != qty:
             errors.append(
                 f"demand balance: {group_id}, assigned={assigned[group_id]}, "
-                f"unplaced={unplaced[group_id]}, demand={qty}"
+                f"demand={qty}"
             )
     for key in sorted(set(import_required) | set(import_reserved)):
         if int(import_reserved[key]) != int(import_required[key]):
@@ -497,7 +463,6 @@ def validate_output_files(
         "plan_rows_checked": len(plan),
         "groups_checked": len(demand),
         "assigned_boxes_checked": int(sum(assigned.values())),
-        "unplaced_boxes_checked": int(sum(unplaced.values())),
         "import_reservation_rows_checked": len(import_rows),
         "import_reserved_boxes_checked": int(sum(import_reserved.values())),
         "bay_attribute_states_checked": len(bay_attribute_values),
