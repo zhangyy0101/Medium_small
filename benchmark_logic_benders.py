@@ -31,11 +31,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total-time-limit", type=float, default=120.0)
     parser.add_argument("--solver-threads", type=int, default=1)
     parser.add_argument("--max-iterations", type=int, default=40)
-    parser.add_argument("--master-time-limit", type=float, default=10.0)
-    parser.add_argument("--area-time-limit", type=float, default=5.0)
-    parser.add_argument("--primal-seed-time-limit", type=float, default=10.0)
-    parser.add_argument("--support-repair-iterations", type=int, default=5)
-    parser.add_argument("--support-repair-fraction", type=float, default=0.02)
+    parser.add_argument(
+        "--master-feasibility-time-limit", type=float, default=30.0
+    )
+    parser.add_argument("--master-time-limit", type=float, default=20.0)
+    parser.add_argument("--voyage-time-limit", type=float, default=8.0)
     parser.add_argument("--compare-direct", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
@@ -47,35 +47,88 @@ def _summary(diagnostics: dict) -> dict:
         for key in (
             "algorithm",
             "master_status",
+            "planned_group_count",
+            "planned_box_count",
+            "candidate_row_location_count",
             "final_business_objective",
             "complete_model_lower_bound",
+            "complete_model_absolute_gap",
             "complete_model_relative_gap",
             "lbbd_converged",
             "lbbd_termination_reason",
             "lbbd_iteration_count",
             "lbbd_cut_counts",
-            "lbbd_area_subproblem_solve_count",
-            "lbbd_area_subproblem_cache_hits",
+            "lbbd_voyage_subproblem_solve_count",
+            "lbbd_voyage_subproblem_cache_hits",
+            "lbbd_voyage_subproblem_count",
+            "lbbd_voyage_subproblem_build_seconds",
+            "lbbd_voyage_subproblem_variable_count",
             "lbbd_best_incumbent_source",
-            "lbbd_support_repair",
+            "lbbd_preparation_seconds",
+            "lbbd_master_build_seconds",
+            "lbbd_master_feasibility",
             "lbbd_total_solve_seconds",
+            "direct_model_build_seconds",
             "direct_total_solve_seconds",
+            "direct_bound",
+            "direct_mip_gap",
+            "direct_solver_incumbent_objective",
+            "direct_objective_auxiliary_slack",
         )
         if diagnostics.get(key) is not None
     }
-    seed = diagnostics.get("lbbd_compact_primal_seed", {})
-    summary["lbbd_compact_primal_seed"] = {
-        key: seed.get(key)
-        for key in (
-            "attempted",
-            "feasible",
-            "status",
-            "seconds",
-            "objective",
-            "bound_used",
-        )
-        if seed.get(key) is not None
-    }
+    summary["lbbd_iterations"] = [
+        {
+            key: row.get(key)
+            for key in (
+                "iteration",
+                "master_status",
+                "master_allowance",
+                "master_seconds",
+                "master_objective",
+                "master_bound",
+                "active_row_class_count",
+                "cuts_added",
+                "all_voyage_subproblems_feasible",
+                "all_voyage_subproblems_optimal",
+                "candidate_objective",
+            )
+        }
+        for row in diagnostics.get("lbbd_iterations", [])
+    ]
+    for section, keys in (
+        (
+            "lbbd_master",
+            (
+                "master_variable_count",
+                "group_bay_quantity_count",
+                "row_footprint_template_count",
+                "voyage_row_class_binary_count",
+                "continuous_routing_flow_count",
+                "operational_bay_row_count_count",
+                "physical_row_owner_constraint_count",
+                "owner_positive_flow_constraint_count",
+                "row_count_box_upper_constraint_count",
+                "row_count_owner_upper_constraint_count",
+                "row_class_owner_cover_constraint_count",
+                "row_capacity_envelope_count",
+                "row_conflict_clique_count",
+                "row_conflict_hall_capacity_count",
+            ),
+        ),
+        (
+            "direct_model",
+            (
+                "row_location_variable_count",
+                "import_reservation_variable_count",
+                "model_variable_count",
+            ),
+        ),
+    ):
+        values = diagnostics.get(section, {})
+        summary[section] = {
+            key: values.get(key) for key in keys if values.get(key) is not None
+        }
     return summary
 
 
@@ -106,11 +159,11 @@ def main() -> None:
         common_config,
         LogicBendersConfig(
             max_iterations=args.max_iterations,
+            master_feasibility_time_limit=(
+                args.master_feasibility_time_limit
+            ),
             master_time_limit=args.master_time_limit,
-            area_time_limit=args.area_time_limit,
-            primal_seed_time_limit=args.primal_seed_time_limit,
-            support_repair_iterations=args.support_repair_iterations,
-            support_repair_fraction=args.support_repair_fraction,
+            voyage_time_limit=args.voyage_time_limit,
         ),
     ).solve()
     results = {"lbbd": _summary(lbbd.diagnostics)}

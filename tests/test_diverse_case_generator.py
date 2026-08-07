@@ -12,6 +12,7 @@ from example.generate_diverse_voyages_case import (
     SOURCE_EXPORT_VOYAGES,
     build_case,
 )
+from example.generate_many_groups_case import build_case as build_many_groups_case
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -74,6 +75,37 @@ class DiverseCaseGeneratorTests(unittest.TestCase):
         for berth in berths.values():
             self.assertIn(berth, matrix)
             self.assertTrue(pd.to_numeric(matrix[berth], errors="coerce").notna().all())
+
+
+class ManyGroupsCaseGeneratorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.adapter, cls.large_plan, cls.manifest = build_many_groups_case(
+            ROOT / "example" / "input_data.json",
+            ROOT / "example" / "large_plan.csv",
+        )
+
+    def test_every_detailed_voyage_has_twelve_positive_groups(self) -> None:
+        self.assertEqual(6, self.manifest["detailed_export_voyage_count"])
+        self.assertEqual(72, self.manifest["total_export_group_count"])
+        self.assertEqual(2241, self.manifest["declared_export_container_rows"])
+        for voyage in self.manifest["detailed_export_voyages"]:
+            documents = self.adapter.vessel_containers[voyage]["doc_cntrs"]
+            profile = demand_profile(documents)
+            self.assertEqual(12, len(profile))
+            self.assertTrue(all(quantity > 0 for quantity in profile.values()))
+
+    def test_group_expansion_preserves_original_voyage_size_totals(self) -> None:
+        for voyage in self.manifest["detailed_export_voyages"]:
+            documents = self.adapter.vessel_containers[voyage]["doc_cntrs"]
+            sizes = documents["IYC_CSZ_CSIZECD"].map(normalize_container_size)
+            demand = sizes.value_counts().to_dict()
+            profile = self.manifest["voyage_profiles"][voyage]
+            self.assertEqual(
+                profile["source_size_totals"],
+                profile["expanded_size_totals"],
+            )
+            self.assertEqual(demand, profile["expanded_size_totals"])
 
 
 if __name__ == "__main__":

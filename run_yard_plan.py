@@ -16,6 +16,9 @@ from yard_planning.logic_benders import (
     LogicBendersConfig,
     LogicBendersPlanner,
 )
+from yard_planning.profile_resource_benders import (
+    ProfileResourceBendersPlanner,
+)
 from yard_planning.planner import (
     ColumnGenerationConfig,
     write_selected_locations,
@@ -42,11 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument(
         "--solver",
-        choices=("cg", "direct", "lbbd"),
+        choices=("cg", "direct", "lbbd", "lbbd_profile"),
         default="cg",
         help=(
             "cg runs column generation; direct runs M0; lbbd runs the "
-            "capacity- and conflict-strengthened logic-based Benders solver."
+            "capacity- and conflict-strengthened logic-based Benders solver; "
+            "lbbd_profile runs the separate row-profile aggregation variant."
         ),
     )
     parser.add_argument("--voyages", nargs="+", default=None, help="Optional voyage subset; default is every voyage in the large plan.")
@@ -68,11 +72,11 @@ def parse_args() -> argparse.Namespace:
         help="0 lets Gurobi choose; use a fixed positive value for experiments.",
     )
     parser.add_argument("--lbbd-max-iterations", type=int, default=40)
-    parser.add_argument("--lbbd-master-time-limit", type=float, default=10.0)
-    parser.add_argument("--lbbd-area-time-limit", type=float, default=5.0)
-    parser.add_argument("--lbbd-primal-seed-time-limit", type=float, default=10.0)
-    parser.add_argument("--lbbd-support-repair-iterations", type=int, default=5)
-    parser.add_argument("--lbbd-support-repair-fraction", type=float, default=0.02)
+    parser.add_argument(
+        "--lbbd-master-feasibility-time-limit", type=float, default=30.0
+    )
+    parser.add_argument("--lbbd-master-time-limit", type=float, default=20.0)
+    parser.add_argument("--lbbd-voyage-time-limit", type=float, default=8.0)
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
 
@@ -119,19 +123,22 @@ def main() -> None:
     stage_start = perf_counter()
     if args.solver == "direct":
         planner = DirectMilpPlanner(inputs.problem, config)
-    elif args.solver == "lbbd":
-        planner = LogicBendersPlanner(
+    elif args.solver in {"lbbd", "lbbd_profile"}:
+        planner_class = (
+            ProfileResourceBendersPlanner
+            if args.solver == "lbbd_profile"
+            else LogicBendersPlanner
+        )
+        planner = planner_class(
             inputs.problem,
             config,
             LogicBendersConfig(
                 max_iterations=args.lbbd_max_iterations,
-                master_time_limit=args.lbbd_master_time_limit,
-                area_time_limit=args.lbbd_area_time_limit,
-                primal_seed_time_limit=args.lbbd_primal_seed_time_limit,
-                support_repair_iterations=(
-                    args.lbbd_support_repair_iterations
+                master_feasibility_time_limit=(
+                    args.lbbd_master_feasibility_time_limit
                 ),
-                support_repair_fraction=args.lbbd_support_repair_fraction,
+                master_time_limit=args.lbbd_master_time_limit,
+                voyage_time_limit=args.lbbd_voyage_time_limit,
             ),
         )
     else:

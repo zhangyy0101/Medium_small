@@ -8,11 +8,12 @@
 
 ## 求解器
 
-仓库保留三套相互独立的求解器：
+仓库保留四套相互独立的求解器：
 
 - `cg`：论文算法——完整航次方案列生成、航次内部箱区局部模式协调、严格定价认证，以及一次受限排级整数恢复；
 - `direct`：同一数学模型的完整排位置 MILP，即对照基线 M0；
-- `lbbd`：实验性替代算法——强箱区容量割、排级不混冲突图割，以及按箱区精确求解的逻辑 Benders 分解。它不调用 `cg`；仅在首轮没有完整上界时复用共享紧凑模型构造器生成一次短时 primal seed，再通过逐轮扩张的 L1 箱区箱量邻域改进上界。seed 和临时邻域的下界均不参与全局 gap。
+- `lbbd`：实验性替代算法——主问题以“箱组—箱区整数箱量 + 航次—排足迹—行不混类别二元状态 + 连续候选排流”协调进口预留、物理排冲突和业务目标；每个出口航次由一个持久化精确排级子问题独立验证并恢复整数落位，必要时生成 Hall 容量割、IIS 核逻辑可行性割和条件最优性割。算法不调用 M0 修复，也没有备用求解链。
+- `lbbd_profile`：独立的严格资源类型聚合 LBBD——把容量、尺寸能力、20/40/45 英尺足迹兼容性相同的具体排聚合为整数资源类型；主问题使用部分重叠足迹池的 Hall 型容量界和资源类型—不可混类容量约束。候选先经全局物理足迹匹配和精确航次子问题快速验证：匹配被证明不可行时生成打包割或条件匹配可行性割；匹配可行但航次解聚失败、或精确排代价高于 `theta` 时，按需调用联合选择全部具体足迹与排落位的精确 oracle，并生成 IIS 核条件可行性割或条件最优性割后重解主问题。只有主问题最优且精确 recourse 已认证时才报告收敛。初始化骨架只有通过精确解聚才可作为 MIP Start；该版本不覆盖或调用 `lbbd`、`cg`、`direct`。
 
 论文算法的外层一列表示“一个出口航次跨全部可行箱区的完整排级方案”。外层主问题只为每个航次选择一列，并统一协调共享排/贝容量、跨航次不混状态、进口预留和大计划偏差，因此凸性块数量等于航次数，而不是航次数乘箱区数。
 
@@ -41,6 +42,7 @@ python -m pip install -r requirements.txt
 python -X utf8 -B run_yard_plan.py --solver cg --run-name voyage_plan_cg
 python -X utf8 -B run_yard_plan.py --solver direct --run-name m0_direct
 python -X utf8 -B run_yard_plan.py --solver lbbd --run-name strengthened_lbbd
+python -X utf8 -B run_yard_plan.py --solver lbbd_profile --run-name profile_lbbd
 ```
 
 主要参数：
@@ -48,7 +50,11 @@ python -X utf8 -B run_yard_plan.py --solver lbbd --run-name strengthened_lbbd
 - `--total-time-limit`、`--solver-threads`：总时限和线程数；
 - `--mip-gap`：M0 的停止 gap；CG 的受限整数恢复仍请求零 gap，但受总时限约束；
 - `--max-pricing-iterations`：外层和内层列生成的最大迭代数；
-- `--plans-per-pricing`：一次定价最多返回的候选方案/局部模式数。
+- `--plans-per-pricing`：一次定价最多返回的候选方案/局部模式数；
+- `--lbbd-max-iterations`：`lbbd` 和 `lbbd_profile` 的主问题—逻辑割最大迭代轮数；
+- `--lbbd-master-feasibility-time-limit`：`lbbd` 初始可行骨架与原目标抛光的总时限；`lbbd_profile` 只使用其中的可行骨架阶段，随后立即进行精确解聚；
+- `--lbbd-master-time-limit`：生成新割后的主问题重优化时限，默认20秒；首次主搜索连续使用扣除航次验证预留后的剩余时间；
+- `--lbbd-voyage-time-limit`：单个航次精确排级子问题的时限。
 
 生成并运行多样化 3 倍航次压力算例：
 
@@ -56,6 +62,7 @@ python -X utf8 -B run_yard_plan.py --solver lbbd --run-name strengthened_lbbd
 python -X utf8 -B example/generate_diverse_voyages_case.py --copies 3 --overwrite
 python -X utf8 -B benchmark_voyage_plans.py --input example/diverse_voyages_3x/input_data.json --large-plan example/diverse_voyages_3x/large_plan.csv --total-time-limit 120 --solver-threads 1
 python -X utf8 -B benchmark_logic_benders.py --input example/diverse_voyages_3x/input_data.json --large-plan example/diverse_voyages_3x/large_plan.csv --total-time-limit 120 --solver-threads 1 --compare-direct
+python -X utf8 -B benchmark_profile_benders.py --input example/many_groups_6v_12g/input_data.json --large-plan example/many_groups_6v_12g/large_plan.csv --total-time-limit 120 --solver-threads 1
 ```
 
 ## 输出
@@ -72,6 +79,9 @@ python -X utf8 -B benchmark_logic_benders.py --input example/diverse_voyages_3x/
 
 - `yard_planning/planner.py`：两套求解器共享的数据索引、业务规则、目标与输出校验；
 - `yard_planning/voyage_plan_column_generation.py`：完整航次外层列生成、内层局部模式定价、严格认证和整数恢复；
+- `yard_planning/voyage_resource_benders.py`：航次—排资源 LBBD 主问题、航次子问题与逻辑割；
+- `yard_planning/profile_resource_benders.py`：排资源类型聚合主问题、共享物理资源池、快速足迹解聚、全局精确反聚合子问题及条件逻辑割；
+- `yard_planning/logic_benders.py`：LBBD 的稳定公共导入入口；
 - `yard_planning/direct_milp.py`：M0 紧凑排位置模型；
 - `yard_planning/gurobi_backend.py`：统一 Gurobi 接口；
 - `adapters/planning_input.py`：业务输入清洗与模型数据构造；

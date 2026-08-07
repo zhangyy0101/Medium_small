@@ -163,11 +163,13 @@ class DirectMilpPlanner(YardPlanningBase):
             self._free_gurobi_model(model)
 
         reconstructed = self._selected_solution_energy(selected)
-        if abs(solver_objective - reconstructed) > 1e-6:
-            raise RuntimeError(
-                "M0 objective differs from reconstructed row plan: "
-                f"model={solver_objective}, reconstructed={reconstructed}"
+        objective_auxiliary_slack = (
+            self._absolute_deviation_auxiliary_slack(
+                solver_objective,
+                reconstructed,
+                context="M0",
             )
+        )
         absolute_gap = max(0.0, reconstructed - solver_bound)
         relative_gap = absolute_gap / max(abs(reconstructed), 1e-12)
         return selected, {
@@ -176,11 +178,16 @@ class DirectMilpPlanner(YardPlanningBase):
             "master_bound_scope": "complete_direct_milp",
             "master_objective": reconstructed,
             "master_mip_gap": solver_gap,
+            "complete_model_lower_bound": solver_bound,
             "complete_model_absolute_gap": absolute_gap,
             "complete_model_relative_gap": relative_gap,
             "complete_model_gap_source": "gurobi_direct_milp_bound",
             "direct_status": status,
-            "direct_objective": solver_objective,
+            "direct_objective": reconstructed,
+            "direct_solver_incumbent_objective": solver_objective,
+            "direct_objective_auxiliary_slack": (
+                objective_auxiliary_slack
+            ),
             "direct_bound": solver_bound,
             "direct_mip_gap": solver_gap,
             "direct_total_solve_seconds": round(

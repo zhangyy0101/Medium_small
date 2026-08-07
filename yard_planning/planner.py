@@ -547,6 +547,31 @@ class YardPlanningBase:
         return float(self._selected_objective_components(selected)["weighted_total"])
 
     @staticmethod
+    def _absolute_deviation_auxiliary_slack(
+        solver_objective: float,
+        reconstructed_objective: float,
+        *,
+        context: str,
+        tolerance: float = 1e-6,
+    ) -> float:
+        """Validate and measure removable slack in L1 auxiliary variables.
+
+        A time-limited MIP incumbent can retain equal positive and negative
+        deviation values although reducing both preserves feasibility and
+        improves its objective.  The row plan reconstruction evaluates the
+        canonical minimum deviation for the same integer assignment.  It may
+        therefore be lower than Gurobi's stored incumbent, but never higher.
+        """
+        slack = float(solver_objective) - float(reconstructed_objective)
+        if slack < -abs(float(tolerance)):
+            raise RuntimeError(
+                f"{context} objective is below the reconstructed row plan: "
+                f"model={solver_objective}, "
+                f"reconstructed={reconstructed_objective}"
+            )
+        return max(0.0, slack)
+
+    @staticmethod
     def _row_area_summary_consistency_stats(export_rows: list[dict], bay_summary_rows: list[dict]) -> dict[str, int]:
         row_counter: Counter[tuple[str, str, str, str, str]] = Counter()
         summary_counter: Counter[tuple[str, str, str, str, str]] = Counter()

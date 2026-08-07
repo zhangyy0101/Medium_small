@@ -1,0 +1,573 @@
+{
+  "case": "many_groups_6v_12g",
+  "base_input": "example/input_data.json",
+  "base_large_plan": "example/large_plan.csv",
+  "generation_policy": "six diversified voyages with deterministic recombination of globally observed size-height-port values",
+  "yard_snapshot_policy": "unchanged_from_base_case",
+  "import_commitment_policy": "unchanged_from_base_case",
+  "large_plan_policy": "unchanged from the diversified six-voyage case; voyage and size totals are conserved",
+  "attribute_palette": {
+    "ports": [
+      "DEHAM",
+      "JPHKT",
+      "JPNGO",
+      "NLRTM"
+    ],
+    "heights_by_size": {
+      "20": [
+        "PQ"
+      ],
+      "40": [
+        "HQ",
+        "PQ"
+      ]
+    }
+  },
+  "source_export_voyages": [
+    "390121",
+    "390131"
+  ],
+  "export_voyage_mapping": {
+    "390121": [
+      "390121",
+      "490121",
+      "590121"
+    ],
+    "390131": [
+      "390131",
+      "490131",
+      "590131"
+    ]
+  },
+  "detailed_export_voyages": [
+    "390121",
+    "490121",
+    "590121",
+    "390131",
+    "490131",
+    "590131"
+  ],
+  "detailed_export_voyage_count": 6,
+  "groups_per_voyage": 12,
+  "total_export_group_count": 72,
+  "declared_export_container_rows": 2241,
+  "voyage_profiles": {
+    "390121": {
+      "declared_rows": 447,
+      "group_count": 12,
+      "source_size_totals": {
+        "20": 203,
+        "40": 244
+      },
+      "expanded_size_totals": {
+        "20": 203,
+        "40": 244
+      },
+      "group_profile": [
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "DEHAM",
+          "quantity": 55
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPHKT",
+          "quantity": 61
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPNGO",
+          "quantity": 41
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "NLRTM",
+          "quantity": 46
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "DEHAM",
+          "quantity": 34
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPHKT",
+          "quantity": 38
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPNGO",
+          "quantity": 25
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "NLRTM",
+          "quantity": 29
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "DEHAM",
+          "quantity": 32
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPHKT",
+          "quantity": 36
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPNGO",
+          "quantity": 23
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "NLRTM",
+          "quantity": 27
+        }
+      ]
+    },
+    "490121": {
+      "declared_rows": 393,
+      "group_count": 12,
+      "source_size_totals": {
+        "20": 203,
+        "40": 190
+      },
+      "expanded_size_totals": {
+        "20": 203,
+        "40": 190
+      },
+      "group_profile": [
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "DEHAM",
+          "quantity": 43
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPHKT",
+          "quantity": 53
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPNGO",
+          "quantity": 64
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "NLRTM",
+          "quantity": 43
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "DEHAM",
+          "quantity": 20
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPHKT",
+          "quantity": 24
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPNGO",
+          "quantity": 29
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "NLRTM",
+          "quantity": 20
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "DEHAM",
+          "quantity": 24
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPHKT",
+          "quantity": 29
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPNGO",
+          "quantity": 20
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "NLRTM",
+          "quantity": 24
+        }
+      ]
+    },
+    "590121": {
+      "declared_rows": 501,
+      "group_count": 12,
+      "source_size_totals": {
+        "20": 198,
+        "40": 303
+      },
+      "expanded_size_totals": {
+        "20": 198,
+        "40": 303
+      },
+      "group_profile": [
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "DEHAM",
+          "quantity": 45
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPHKT",
+          "quantity": 57
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPNGO",
+          "quantity": 42
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "NLRTM",
+          "quantity": 54
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "DEHAM",
+          "quantity": 37
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPHKT",
+          "quantity": 46
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPNGO",
+          "quantity": 34
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "NLRTM",
+          "quantity": 44
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "DEHAM",
+          "quantity": 32
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPHKT",
+          "quantity": 41
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPNGO",
+          "quantity": 30
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "NLRTM",
+          "quantity": 39
+        }
+      ]
+    },
+    "390131": {
+      "declared_rows": 300,
+      "group_count": 12,
+      "source_size_totals": {
+        "20": 100,
+        "40": 200
+      },
+      "expanded_size_totals": {
+        "20": 100,
+        "40": 200
+      },
+      "group_profile": [
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "DEHAM",
+          "quantity": 27
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPHKT",
+          "quantity": 22
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPNGO",
+          "quantity": 28
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "NLRTM",
+          "quantity": 23
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "DEHAM",
+          "quantity": 27
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPHKT",
+          "quantity": 22
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPNGO",
+          "quantity": 29
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "NLRTM",
+          "quantity": 23
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "DEHAM",
+          "quantity": 30
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPHKT",
+          "quantity": 24
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPNGO",
+          "quantity": 19
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "NLRTM",
+          "quantity": 26
+        }
+      ]
+    },
+    "490131": {
+      "declared_rows": 264,
+      "group_count": 12,
+      "source_size_totals": {
+        "20": 92,
+        "40": 172
+      },
+      "expanded_size_totals": {
+        "20": 92,
+        "40": 172
+      },
+      "group_profile": [
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "DEHAM",
+          "quantity": 20
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPHKT",
+          "quantity": 28
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPNGO",
+          "quantity": 24
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "NLRTM",
+          "quantity": 20
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "DEHAM",
+          "quantity": 18
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPHKT",
+          "quantity": 25
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPNGO",
+          "quantity": 22
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "NLRTM",
+          "quantity": 18
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "DEHAM",
+          "quantity": 25
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPHKT",
+          "quantity": 21
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPNGO",
+          "quantity": 18
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "NLRTM",
+          "quantity": 25
+        }
+      ]
+    },
+    "590131": {
+      "declared_rows": 336,
+      "group_count": 12,
+      "source_size_totals": {
+        "20": 108,
+        "40": 228
+      },
+      "expanded_size_totals": {
+        "20": 108,
+        "40": 228
+      },
+      "group_profile": [
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "DEHAM",
+          "quantity": 25
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPHKT",
+          "quantity": 22
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "JPNGO",
+          "quantity": 32
+        },
+        {
+          "size": "20",
+          "height": "PQ",
+          "port": "NLRTM",
+          "quantity": 29
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "DEHAM",
+          "quantity": 27
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPHKT",
+          "quantity": 24
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "JPNGO",
+          "quantity": 35
+        },
+        {
+          "size": "40",
+          "height": "HQ",
+          "port": "NLRTM",
+          "quantity": 32
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "DEHAM",
+          "quantity": 29
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPHKT",
+          "quantity": 25
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "JPNGO",
+          "quantity": 22
+        },
+        {
+          "size": "40",
+          "height": "PQ",
+          "port": "NLRTM",
+          "quantity": 34
+        }
+      ]
+    }
+  },
+  "large_plan_row_count": 76
+}

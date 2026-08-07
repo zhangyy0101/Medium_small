@@ -7,6 +7,7 @@ from collections import defaultdict
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import perf_counter
 from types import SimpleNamespace
 
 from yard_planning.models import AttributeRules, Bay, ExportGroup, ProblemData
@@ -14,6 +15,9 @@ from yard_planning.direct_milp import DirectMilpPlanner
 from yard_planning.logic_benders import (
     LogicBendersConfig,
     LogicBendersPlanner,
+)
+from yard_planning.profile_resource_benders import (
+    ProfileResourceBendersPlanner,
 )
 from yard_planning.planner import (
     ColumnGenerationConfig,
@@ -142,6 +146,22 @@ def make_two_voyage_problem() -> ProblemData:
 
 
 class ColumnGenerationInvariantTests(unittest.TestCase):
+    def test_reconstructed_objective_can_remove_l1_auxiliary_slack(self) -> None:
+        slack = YardPlanningBase._absolute_deviation_auxiliary_slack(
+            0.28979699,
+            0.28970275,
+            context="test",
+        )
+        self.assertAlmostEqual(0.00009424, slack)
+
+    def test_reconstructed_objective_cannot_exceed_solver_objective(self) -> None:
+        with self.assertRaises(RuntimeError):
+            YardPlanningBase._absolute_deviation_auxiliary_slack(
+                0.2,
+                0.21,
+                context="test",
+            )
+
     def test_logic_benders_configuration_is_validated(self) -> None:
         with self.assertRaises(ValueError):
             LogicBendersPlanner(
@@ -153,7 +173,7 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             LogicBendersPlanner(
                 make_small_problem(),
                 ColumnGenerationConfig(verbose=False),
-                LogicBendersConfig(support_repair_fraction=1.1),
+                LogicBendersConfig(voyage_time_limit=0.0),
             )
 
     def test_voyage_plan_pricing_configuration_is_validated(self) -> None:
@@ -426,8 +446,7 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             LogicBendersConfig(
                 max_iterations=20,
                 master_time_limit=3.0,
-                area_time_limit=3.0,
-                primal_seed_time_limit=0.0,
+                voyage_time_limit=3.0,
             ),
         ).solve()
         self.assertTrue(decomposed.diagnostics["lbbd_converged"])
@@ -436,7 +455,7 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         )
         self.assertGreater(
             decomposed.diagnostics["lbbd_cut_counts"][
-                "initial_conflict_clique"
+                "initial_row_conflict_clique"
             ],
             0,
         )
@@ -447,7 +466,7 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         )
 
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
-    def test_logic_benders_removes_temporary_repair_neighborhood(self) -> None:
+    def test_logic_benders_master_contains_voyage_row_resources(self) -> None:
         config = ColumnGenerationConfig(
             total_time_limit=20.0,
             mip_gap=0.0,
@@ -457,36 +476,365 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         planner = LogicBendersPlanner(
             make_small_problem(),
             config,
-            LogicBendersConfig(
-                support_repair_iterations=2,
-                support_repair_fraction=0.02,
-            ),
+            LogicBendersConfig(voyage_time_limit=3.0),
         )
-        planner._prepare_lbbd()
-        selected, _stats = planner._solve_direct_milp()
-        master, variables, _master_stats = planner._build_master()
+        planner._prepare_decomposition()
+        master, variables, master_stats = planner._build_master()
         try:
-            original_variable_count = len(master.getVars())
-            export_by_area, import_by_area = planner._apply_master_start(
-                variables,
-                selected,
-                planner._final_import_reservation,
+            self.assertGreater(
+                master_stats["voyage_row_class_binary_count"], 0
             )
-            neighborhood = planner._add_support_repair_neighborhood(
-                master,
-                variables,
-                export_by_area,
-                import_by_area,
+            self.assertEqual(
+                master_stats["voyage_row_class_binary_count"],
+                len(variables["owner"]),
             )
-            self.assertIsNotNone(neighborhood)
-            self.assertEqual(0.0, float(neighborhood.limit.RHS))
-            self.assertGreater(len(master.getVars()), original_variable_count)
-            planner._remove_support_repair_neighborhood(
-                master, neighborhood
+            self.assertLessEqual(
+                master_stats["voyage_row_class_binary_count"],
+                len(planner._columns),
             )
-            self.assertEqual(original_variable_count, len(master.getVars()))
+            self.assertLessEqual(
+                master_stats["row_footprint_template_count"],
+                master_stats["voyage_row_class_binary_count"],
+            )
         finally:
             planner._free_gurobi_model(master)
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_profile_resource_benders_matches_m0_on_small_case(self) -> None:
+        config = ColumnGenerationConfig(
+            total_time_limit=20.0,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        direct = DirectMilpPlanner(make_small_problem(), config).solve()
+        profile = ProfileResourceBendersPlanner(
+            make_small_problem(),
+            config,
+            LogicBendersConfig(
+                max_iterations=10,
+                master_time_limit=3.0,
+                voyage_time_limit=3.0,
+            ),
+        ).solve()
+        self.assertTrue(
+            profile.diagnostics["independent_solution_validation"]["passed"]
+        )
+        self.assertAlmostEqual(
+            direct.diagnostics["final_business_objective"],
+            profile.diagnostics["final_business_objective"],
+            places=9,
+        )
+        stats = profile.diagnostics["profile_lbbd_master"]
+        self.assertLessEqual(
+            stats["row_resource_profile_count"],
+            stats["concrete_row_template_count"],
+        )
+        self.assertEqual(
+            stats["profile_state_capacity_constraint_count"],
+            stats["profile_owner_integer_count"],
+        )
+        self.assertTrue(
+            profile.diagnostics["profile_lbbd_master_feasibility"].get(
+                "exact_start_verified", False
+            )
+        )
+        self.assertGreaterEqual(
+            profile.diagnostics["profile_lbbd_master_round_count"], 1
+        )
+        self.assertTrue(
+            profile.diagnostics["profile_lbbd_initial_disaggregation"]
+        )
+        self.assertNotIn("profile_lbbd_iterations", profile.diagnostics)
+        self.assertIn(
+            "profile_lbbd_aggregate_feasibility_cut_count",
+            profile.diagnostics,
+        )
+        self.assertIn(
+            "profile_lbbd_aggregate_optimality_cut_count",
+            profile.diagnostics,
+        )
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_profile_global_oracle_exactly_disaggregates_master_point(
+        self,
+    ) -> None:
+        config = ColumnGenerationConfig(
+            total_time_limit=20.0,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        planner = ProfileResourceBendersPlanner(
+            make_small_problem(),
+            config,
+            LogicBendersConfig(voyage_time_limit=3.0),
+        )
+        planner._prepare_decomposition()
+        planner._prepare_profiles()
+        master, variables, _stats = planner._build_profile_master()
+        try:
+            planner._set_gurobi_param(master, "TimeLimit", 5.0)
+            master.optimize()
+            self.assertGreater(planner._gurobi_solution_count(master), 0)
+            quantities, profile_counts, routing, imports, _theta = (
+                planner._profile_master_assignment(master, variables)
+            )
+            fast = planner._verify_profile_assignment(
+                quantities,
+                profile_counts,
+                routing,
+                imports,
+                perf_counter() + 5.0,
+                {},
+            )
+            exact = planner._solve_global_profile_subproblem(
+                quantities,
+                profile_counts,
+                5.0,
+                fast["selected"] if fast["verified"] else None,
+            )
+            self.assertTrue(exact["feasible"])
+            self.assertTrue(exact["optimal"])
+            self.assertAlmostEqual(
+                exact["objective"], fast["subproblem_objective"], places=9
+            )
+            self.assertAlmostEqual(
+                planner._selected_solution_energy(exact["selected"]),
+                planner._selected_solution_energy(fast["selected"]),
+                places=9,
+            )
+        finally:
+            planner._free_gurobi_model(master)
+            for subproblem in planner._voyage_subproblems.values():
+                planner._free_gurobi_model(subproblem.model)
+            if planner._global_profile_subproblem is not None:
+                planner._free_gurobi_model(
+                    planner._global_profile_subproblem.model
+                )
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_profile_aggregate_logic_cuts_bind_certified_point(self) -> None:
+        config = ColumnGenerationConfig(
+            total_time_limit=20.0,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        planner = ProfileResourceBendersPlanner(
+            make_small_problem(), config
+        )
+        planner._prepare_decomposition()
+        planner._prepare_profiles()
+        master, variables, _stats = planner._build_profile_master()
+        try:
+            planner._set_gurobi_param(master, "TimeLimit", 5.0)
+            master.optimize()
+            quantities, profile_counts, _routing, _imports, theta = (
+                planner._profile_master_assignment(master, variables)
+            )
+            signatures: set[tuple] = set()
+            certified_bound = sum(theta.values()) + 0.01
+            added, binary_count = planner._add_aggregate_logic_cut(
+                master,
+                variables,
+                quantities,
+                profile_counts,
+                1,
+                "optimality",
+                signatures,
+                lower_bound=certified_bound,
+            )
+            self.assertTrue(added)
+            self.assertGreater(binary_count, 0)
+            for key, variable in variables["quantity"].items():
+                variable.LB = float(quantities.get(key, 0))
+                variable.UB = float(quantities.get(key, 0))
+            for state, variable in variables["profile_use"].items():
+                variable.LB = float(profile_counts.get(state, 0))
+                variable.UB = float(profile_counts.get(state, 0))
+            master.update()
+            master.optimize()
+            self.assertGreater(planner._gurobi_solution_count(master), 0)
+            self.assertGreaterEqual(
+                sum(
+                    planner._gurobi_value(master, variable)
+                    for variable in variables["theta"].values()
+                ),
+                certified_bound - 1e-8,
+            )
+
+            added, _binary_count = planner._add_aggregate_logic_cut(
+                master,
+                variables,
+                quantities,
+                profile_counts,
+                1,
+                "feasibility",
+                signatures,
+            )
+            self.assertTrue(added)
+            master.optimize()
+            self.assertEqual(
+                planner._gurobi_status_name(master), "infeasible"
+            )
+        finally:
+            planner._free_gurobi_model(master)
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_profile_solve_uses_global_oracle_after_fast_failure(self) -> None:
+        config = ColumnGenerationConfig(
+            total_time_limit=20.0,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        planner = ProfileResourceBendersPlanner(
+            make_small_problem(),
+            config,
+            LogicBendersConfig(
+                max_iterations=10,
+                master_time_limit=3.0,
+                voyage_time_limit=3.0,
+            ),
+        )
+        original_verify = planner._verify_profile_assignment
+        call_count = 0
+
+        def force_one_fast_failure(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            result = original_verify(*args, **kwargs)
+            if call_count == 2:
+                result["verified"] = False
+            return result
+
+        planner._verify_profile_assignment = force_one_fast_failure
+        result = planner.solve()
+        self.assertTrue(
+            result.diagnostics["independent_solution_validation"]["passed"]
+        )
+        self.assertEqual(
+            result.diagnostics[
+                "profile_lbbd_global_subproblem_solve_count"
+            ],
+            1,
+        )
+        self.assertTrue(
+            result.diagnostics["profile_lbbd_global_subproblem_records"][0][
+                "feasible"
+            ]
+        )
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_profile_conditional_optimality_cut_is_enforced(self) -> None:
+        config = ColumnGenerationConfig(
+            total_time_limit=20.0,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        planner = ProfileResourceBendersPlanner(
+            make_small_problem(),
+            config,
+            LogicBendersConfig(voyage_time_limit=3.0),
+        )
+        planner._prepare_decomposition()
+        planner._prepare_profiles()
+        master, variables, _stats = planner._build_profile_master()
+        try:
+            planner._set_gurobi_param(master, "TimeLimit", 5.0)
+            master.optimize()
+            self.assertGreater(planner._gurobi_solution_count(master), 0)
+            quantities, counts, _routing, _imports, theta = (
+                planner._profile_master_assignment(master, variables)
+            )
+            incumbent_signature = (
+                tuple(sorted(quantities.items())),
+                tuple(sorted(counts.items())),
+            )
+            required_recourse = sum(theta.values()) + 0.25
+            added, binary_count = planner._add_aggregate_logic_cut(
+                master,
+                variables,
+                quantities,
+                counts,
+                1,
+                "optimality",
+                set(),
+                lower_bound=required_recourse,
+            )
+            self.assertTrue(added)
+            self.assertGreater(binary_count, 0)
+            master.optimize()
+            self.assertGreater(planner._gurobi_solution_count(master), 0)
+            new_quantities, new_counts, _routing, _imports, new_theta = (
+                planner._profile_master_assignment(master, variables)
+            )
+            new_signature = (
+                tuple(sorted(new_quantities.items())),
+                tuple(sorted(new_counts.items())),
+            )
+            self.assertTrue(
+                new_signature != incumbent_signature
+                or sum(new_theta.values()) >= required_recourse - 1e-7
+            )
+        finally:
+            planner._free_gurobi_model(master)
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_profile_resource_benders_preserves_physical_row_separation(
+        self,
+    ) -> None:
+        config = ColumnGenerationConfig(
+            total_time_limit=20.0,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        direct = DirectMilpPlanner(
+            make_two_voyage_problem(), config
+        ).solve()
+        profile = ProfileResourceBendersPlanner(
+            make_two_voyage_problem(),
+            config,
+            LogicBendersConfig(
+                max_iterations=10,
+                master_time_limit=3.0,
+                voyage_time_limit=3.0,
+            ),
+        ).solve()
+        self.assertAlmostEqual(
+            direct.diagnostics["final_business_objective"],
+            profile.diagnostics["final_business_objective"],
+            places=9,
+        )
+        row_voyages: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+        for row in profile.export_rows:
+            row_voyages[(row["bay_key"], row["row_no"])].add(
+                row["voyage_id"]
+            )
+        self.assertTrue(
+            all(len(voyages) == 1 for voyages in row_voyages.values())
+        )
+        self.assertGreaterEqual(
+            profile.diagnostics["profile_lbbd_master"][
+                "overlap_physical_pool_constraint_count"
+            ],
+            0,
+        )
+
+    def test_profile_overlap_pool_interval_bound(self) -> None:
+        footprints = {
+            (("A|01", "01"), ("A|03", "01")),
+            (("A|03", "01"), ("A|05", "01")),
+        }
+        self.assertEqual(
+            ProfileResourceBendersPlanner._interval_packing_bound(
+                footprints
+            ),
+            1,
+        )
 
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
     def test_two_voyage_plans_preserve_global_row_separation(self) -> None:
@@ -527,8 +875,7 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             LogicBendersConfig(
                 max_iterations=20,
                 master_time_limit=3.0,
-                area_time_limit=3.0,
-                primal_seed_time_limit=0.0,
+                voyage_time_limit=3.0,
             ),
         ).solve()
         self.assertAlmostEqual(
