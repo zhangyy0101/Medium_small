@@ -2,31 +2,44 @@
   "lbbd": {
     "algorithm": "logic_based_benders_capacity_conflict_gurobi",
     "master_status": "timelimit",
-    "final_business_objective": 0.26700085,
-    "complete_model_lower_bound": 0.24217314798605394,
-    "complete_model_relative_gap": 0.09298735196515694,
+    "final_business_objective": 0.25796814,
+    "complete_model_lower_bound": 0.24212079564936456,
+    "complete_model_relative_gap": 0.061431401376291855,
     "lbbd_converged": false,
     "lbbd_termination_reason": "time_limit",
-    "lbbd_iteration_count": 7,
+    "lbbd_iteration_count": 9,
     "lbbd_cut_counts": {
       "initial_conflict_clique": 80,
       "initial_conflict_hall_capacity": 80,
-      "dynamic_conflict_hall_capacity": 15,
-      "dynamic_conflict_core_capacity": 17,
-      "logic_feasibility": 20,
-      "logic_optimality": 19,
-      "dominance_binary_variables": 144
+      "dynamic_conflict_hall_capacity": 7,
+      "dynamic_conflict_core_capacity": 9,
+      "logic_feasibility": 9,
+      "logic_optimality": 10,
+      "dominance_binary_variables": 67
     },
-    "lbbd_area_subproblem_solve_count": 123,
-    "lbbd_area_subproblem_cache_hits": 40,
+    "lbbd_area_subproblem_solve_count": 132,
+    "lbbd_area_subproblem_cache_hits": 115,
+    "lbbd_best_incumbent_source": "exact_area_subproblems",
+    "lbbd_support_repair": {
+      "enabled": true,
+      "iterations": 5,
+      "iteration_limit": 5,
+      "radius_step_boxes": 58,
+      "maximum_planned_radius_boxes": 232,
+      "last_used_radius_boxes": 232,
+      "quantity_deviation_variable_count": 1181,
+      "incumbent_improvements": 5,
+      "skipped_conditional_optimality_cuts": 28,
+      "bound_used": false
+    },
+    "lbbd_total_solve_seconds": 120.008,
     "lbbd_compact_primal_seed": {
       "attempted": true,
       "feasible": true,
       "status": "timelimit",
-      "seconds": 12.558,
-      "objective": 0.26700085,
+      "seconds": 14.344,
+      "objective": 0.26934216,
       "bound_used": false
-    },
-    "lbbd_total_solve_seconds": 120.009
+    }
   }
 }

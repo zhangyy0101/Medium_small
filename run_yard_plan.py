@@ -71,6 +71,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lbbd-master-time-limit", type=float, default=10.0)
     parser.add_argument("--lbbd-area-time-limit", type=float, default=5.0)
     parser.add_argument("--lbbd-primal-seed-time-limit", type=float, default=10.0)
+    parser.add_argument("--lbbd-support-repair-iterations", type=int, default=5)
+    parser.add_argument("--lbbd-support-repair-fraction", type=float, default=0.02)
     parser.add_argument("--quiet", action="store_true")
     return parser.parse_args()
 
@@ -126,6 +128,10 @@ def main() -> None:
                 master_time_limit=args.lbbd_master_time_limit,
                 area_time_limit=args.lbbd_area_time_limit,
                 primal_seed_time_limit=args.lbbd_primal_seed_time_limit,
+                support_repair_iterations=(
+                    args.lbbd_support_repair_iterations
+                ),
+                support_repair_fraction=args.lbbd_support_repair_fraction,
             ),
         )
     else:

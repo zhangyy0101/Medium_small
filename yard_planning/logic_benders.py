@@ -23,6 +23,8 @@ class LogicBendersConfig:
     master_time_limit: float = 10.0
     area_time_limit: float = 5.0
     primal_seed_time_limit: float = 10.0
+    support_repair_iterations: int = 5
+    support_repair_fraction: float = 0.02
     max_cliques_per_area: int = 100
 
 
@@ -35,6 +37,14 @@ class _AreaSubproblem:
     group_balance: dict[str, object]
     import_balance: dict[tuple[str, str], object]
     build_seconds: float
+
+
+@dataclass
+class _SupportRepairNeighborhood:
+    limit: object
+    variables: tuple[object, ...]
+    constraints: tuple[object, ...]
+    target_radius: int
 
 
 class LogicBendersPlanner(DirectMilpPlanner):
@@ -56,6 +66,14 @@ class LogicBendersPlanner(DirectMilpPlanner):
             raise ValueError("LBBD area_time_limit must be positive")
         if float(self.benders_config.primal_seed_time_limit) < 0.0:
             raise ValueError("LBBD primal_seed_time_limit cannot be negative")
+        if int(self.benders_config.support_repair_iterations) < 0:
+            raise ValueError("LBBD support_repair_iterations cannot be negative")
+        if not 0.0 <= float(
+            self.benders_config.support_repair_fraction
+        ) <= 1.0:
+            raise ValueError(
+                "LBBD support_repair_fraction must be between zero and one"
+            )
         if int(self.benders_config.max_cliques_per_area) <= 0:
             raise ValueError("LBBD max_cliques_per_area must be positive")
 
@@ -86,6 +104,12 @@ class LogicBendersPlanner(DirectMilpPlanner):
         ] = {}
         self._import_area_capacity: dict[tuple[str, str, str], int] = {}
         self._area_subproblems: dict[str, _AreaSubproblem] = {}
+        self._primal_seed_selected: Counter[int] = Counter()
+        self._primal_seed_import: Counter[tuple[str, str, str]] = Counter()
+        self._primal_seed_group_area: Counter[tuple[str, str]] = Counter()
+        self._primal_seed_import_area: Counter[
+            tuple[str, str, str]
+        ] = Counter()
 
     @staticmethod
     def _footprint_units(size: str) -> int:
@@ -1047,6 +1071,25 @@ class LogicBendersPlanner(DirectMilpPlanner):
             self._set_constraint_rhs(
                 constraint, int(import_quantities.get(key, 0))
             )
+        seed_groups = {
+            group_id: int(quantity)
+            for (group_id, candidate_area), quantity
+            in self._primal_seed_group_area.items()
+            if candidate_area == area_no and int(quantity) > 0
+        }
+        seed_imports = {
+            (flow, size): int(quantity)
+            for (flow, size, candidate_area), quantity
+            in self._primal_seed_import_area.items()
+            if candidate_area == area_no and int(quantity) > 0
+        }
+        if group_quantities == seed_groups and import_quantities == seed_imports:
+            for index, variable in subproblem.placement_variables.items():
+                variable.Start = float(
+                    self._primal_seed_selected.get(index, 0)
+                )
+            for key, variable in subproblem.import_variables.items():
+                variable.Start = float(self._primal_seed_import.get(key, 0))
         subproblem.model.update()
         self._set_gurobi_param(
             subproblem.model, "TimeLimit", max(0.01, time_limit)
@@ -1575,7 +1618,10 @@ class LogicBendersPlanner(DirectMilpPlanner):
         variables: dict,
         selected: Counter[int],
         import_reservation: Counter[tuple[str, str, str]],
-    ) -> None:
+    ) -> tuple[
+        Counter[tuple[str, str]],
+        Counter[tuple[str, str, str]],
+    ]:
         export_by_area: Counter[tuple[str, str]] = Counter()
         rows_by_area: defaultdict[
             tuple[OperationalKey, str], set[tuple[str, str]]
@@ -1609,6 +1655,98 @@ class LogicBendersPlanner(DirectMilpPlanner):
             ) > 0 else 0.0
         for key, variable in variables["row_count"].items():
             variable.Start = float(len(rows_by_area.get(key, ())))
+        self._primal_seed_selected = Counter(selected)
+        self._primal_seed_import = Counter(import_reservation)
+        self._primal_seed_group_area = Counter(export_by_area)
+        self._primal_seed_import_area = Counter(import_by_area)
+        return export_by_area, import_by_area
+
+    def _add_support_repair_neighborhood(
+        self,
+        master,
+        variables: dict,
+        export_by_area: Counter[tuple[str, str]],
+        import_by_area: Counter[tuple[str, str, str]],
+    ) -> _SupportRepairNeighborhood | None:
+        """Create an exact L1 neighborhood, initially fixed at the seed."""
+        from gurobipy import quicksum
+
+        if int(self.benders_config.support_repair_iterations) <= 0:
+            return None
+        seeded_variables = [
+            (variable, int(export_by_area.get(key, 0)), f"export_{index}")
+            for index, (key, variable) in enumerate(
+                sorted(variables["quantity"].items())
+            )
+        ]
+        seeded_variables.extend(
+            (
+                variable,
+                int(import_by_area.get(key, 0)),
+                f"import_{index}",
+            )
+            for index, (key, variable) in enumerate(
+                sorted(variables["import_quantity"].items())
+            )
+        )
+        if not seeded_variables:
+            return None
+        total_quantity = sum(self.group_demand.values()) + sum(
+            self.import_total_by_flow_size.values()
+        )
+        target_radius = max(
+            0,
+            int(
+                math.ceil(
+                    float(self.benders_config.support_repair_fraction)
+                    * total_quantity
+                )
+            ),
+        )
+        deviations = []
+        links = []
+        for variable, seed_value, label in seeded_variables:
+            deviation = master.addVar(
+                lb=0.0,
+                name=f"support_repair_deviation_{label}",
+            )
+            links.append(
+                master.addConstr(
+                    deviation >= variable - seed_value,
+                    name=f"support_repair_positive_{label}",
+                )
+            )
+            links.append(
+                master.addConstr(
+                    deviation >= seed_value - variable,
+                    name=f"support_repair_negative_{label}",
+                )
+            )
+            deviations.append(deviation)
+        limit = master.addConstr(
+            quicksum(deviations) <= 0,
+            name="primal_support_repair_neighborhood",
+        )
+        master.update()
+        return _SupportRepairNeighborhood(
+            limit=limit,
+            variables=tuple(deviations),
+            constraints=tuple(links),
+            target_radius=target_radius,
+        )
+
+    @staticmethod
+    def _remove_support_repair_neighborhood(
+        master,
+        neighborhood: _SupportRepairNeighborhood | None,
+    ) -> None:
+        if neighborhood is None:
+            return
+        master._model.remove(
+            [neighborhood.limit, *neighborhood.constraints]
+        )
+        master._model.remove(list(neighborhood.variables))
+        master.update()
 
     def solve(self) -> ColumnGenerationResult:
         """Run the capacity-strengthened conflict-graph LBBD algorithm."""
@@ -1646,23 +1784,36 @@ class LogicBendersPlanner(DirectMilpPlanner):
         converged = False
         termination_reason = "iteration_limit"
         primal_seed = {"attempted": False, "bound_used": False}
+        best_source = "none"
+        support_repair_neighborhood = None
+        support_repair_radius = 0
+        support_repair_variable_count = 0
+        support_repair_iterations = 0
+        support_repair_iteration_limit = 0
+        support_repair_improvements = 0
+        support_repair_skipped_optimality_cuts = 0
 
         try:
             for iteration in range(1, int(self.benders_config.max_iterations) + 1):
+                iteration_in_support_repair = (
+                    support_repair_neighborhood is not None
+                )
                 remaining = deadline - perf_counter()
                 if remaining <= 1e-6:
                     termination_reason = "time_limit"
                     break
+                master_time_slice = float(
+                    self.benders_config.master_time_limit
+                )
+                if iteration_in_support_repair:
+                    master_time_slice = min(
+                        master_time_slice,
+                        float(self.benders_config.area_time_limit),
+                    )
                 self._set_gurobi_param(
                     master,
                     "TimeLimit",
-                    max(
-                        0.01,
-                        min(
-                            float(self.benders_config.master_time_limit),
-                            remaining,
-                        ),
-                    ),
+                    max(0.01, min(master_time_slice, remaining)),
                 )
                 master_started = perf_counter()
                 master.optimize()
@@ -1675,7 +1826,10 @@ class LogicBendersPlanner(DirectMilpPlanner):
                         termination_reason = "master_without_incumbent"
                     break
                 master_bound = self._gurobi_dual_bound(master)
-                if math.isfinite(master_bound):
+                if (
+                    not iteration_in_support_repair
+                    and math.isfinite(master_bound)
+                ):
                     valid_lower_bound = max(valid_lower_bound, master_bound)
                 master_objective = self._gurobi_objective_value(master)
                 quantities, imports, theta = self._master_assignment(
@@ -1878,18 +2032,21 @@ class LogicBendersPlanner(DirectMilpPlanner):
                         math.isfinite(cut_value)
                         and cut_value > float(theta.get(area_no, 0.0)) + 1e-7
                     ):
-                        dominance_binary_count += self._add_dominance_cut(
-                            master,
-                            variables,
-                            area_no,
-                            quantities,
-                            imports,
-                            logic_optimality_cuts + 1,
-                            "optimality",
-                            cut_value,
-                        )
-                        logic_optimality_cuts += 1
-                        cuts_this_iteration += 1
+                        if iteration_in_support_repair:
+                            support_repair_skipped_optimality_cuts += 1
+                        else:
+                            dominance_binary_count += self._add_dominance_cut(
+                                master,
+                                variables,
+                                area_no,
+                                quantities,
+                                imports,
+                                logic_optimality_cuts + 1,
+                                "optimality",
+                                cut_value,
+                            )
+                            logic_optimality_cuts += 1
+                            cuts_this_iteration += 1
 
                 candidate_objective = None
                 decomposition_objective = None
@@ -1909,10 +2066,13 @@ class LogicBendersPlanner(DirectMilpPlanner):
                             f"reconstructed={candidate_objective}"
                         )
                     if candidate_objective + 1e-9 < best_objective:
+                        if iteration_in_support_repair:
+                            support_repair_improvements += 1
                         best_objective = candidate_objective
                         best_selected = Counter(selected)
                         best_import = Counter(import_reservation)
                         best_iteration = iteration
+                        best_source = "exact_area_subproblems"
 
                 iteration_rows.append(
                     {
@@ -1921,6 +2081,12 @@ class LogicBendersPlanner(DirectMilpPlanner):
                         "master_seconds": round(master_seconds, 4),
                         "master_objective": master_objective,
                         "master_bound": master_bound,
+                        "master_bound_is_global": (
+                            not iteration_in_support_repair
+                        ),
+                        "support_repair_iteration": (
+                            iteration_in_support_repair
+                        ),
                         "active_area_count": len(active_areas),
                         "cuts_added": cuts_this_iteration,
                         "all_area_subproblems_feasible": all_feasible,
@@ -1946,13 +2112,61 @@ class LogicBendersPlanner(DirectMilpPlanner):
                         best_import = seeded_import
                         best_objective = seeded_objective
                         best_iteration = iteration
-                        self._apply_master_start(
-                            variables,
-                            seeded_selected,
-                            seeded_import,
+                        best_source = "compact_primal_seed"
+                        seed_export, seed_import_by_area = (
+                            self._apply_master_start(
+                                variables,
+                                seeded_selected,
+                                seeded_import,
+                            )
+                        )
+                        support_repair_neighborhood = (
+                            self._add_support_repair_neighborhood(
+                                master,
+                                variables,
+                                seed_export,
+                                seed_import_by_area,
+                            )
+                        )
+                        if support_repair_neighborhood is not None:
+                            support_repair_radius = (
+                                support_repair_neighborhood.target_radius
+                            )
+                            support_repair_iteration_limit = (
+                                1
+                                if support_repair_radius <= 0
+                                else int(
+                                    self.benders_config.support_repair_iterations
+                                )
+                            )
+                            support_repair_variable_count = len(
+                                support_repair_neighborhood.variables
+                            )
+                        master.update()
+                if iteration_in_support_repair:
+                    support_repair_iterations += 1
+                    if support_repair_neighborhood is not None:
+                        support_repair_neighborhood.limit.RHS = float(
+                            support_repair_neighborhood.target_radius
+                            * support_repair_iterations
                         )
                         master.update()
+                    if (
+                        support_repair_iterations
+                        >= support_repair_iteration_limit
+                    ):
+                        self._remove_support_repair_neighborhood(
+                            master, support_repair_neighborhood
+                        )
+                        support_repair_neighborhood = None
                 if incomplete and cuts_this_iteration == 0:
+                    if iteration_in_support_repair:
+                        self._remove_support_repair_neighborhood(
+                            master, support_repair_neighborhood
+                        )
+                        support_repair_neighborhood = None
+                        termination_reason = "support_repair_stalled"
+                        continue
                     break
                 if incomplete:
                     termination_reason = "continuing_after_feasibility_cuts"
@@ -1962,6 +2176,7 @@ class LogicBendersPlanner(DirectMilpPlanner):
                     and all_optimal
                     and cuts_this_iteration == 0
                     and master_status == "optimal"
+                    and not iteration_in_support_repair
                 ):
                     converged = True
                     termination_reason = "optimality_proven"
@@ -2004,6 +2219,7 @@ class LogicBendersPlanner(DirectMilpPlanner):
                 "lbbd_termination_reason": termination_reason,
                 "lbbd_iteration_count": len(iteration_rows),
                 "lbbd_best_iteration": best_iteration,
+                "lbbd_best_incumbent_source": best_source,
                 "lbbd_iterations": iteration_rows,
                 "lbbd_cut_counts": {
                     "initial_conflict_clique": master_stats[
@@ -2037,6 +2253,33 @@ class LogicBendersPlanner(DirectMilpPlanner):
                         "import_reservation",
                     }
                 },
+                "lbbd_support_repair": {
+                    "enabled": int(
+                        self.benders_config.support_repair_iterations
+                    ) > 0,
+                    "iterations": support_repair_iterations,
+                    "iteration_limit": support_repair_iteration_limit,
+                    "radius_step_boxes": support_repair_radius,
+                    "maximum_planned_radius_boxes": (
+                        support_repair_radius
+                        * max(
+                            0,
+                            support_repair_iteration_limit - 1,
+                        )
+                    ),
+                    "last_used_radius_boxes": (
+                        support_repair_radius
+                        * max(0, support_repair_iterations - 1)
+                    ),
+                    "quantity_deviation_variable_count": (
+                        support_repair_variable_count
+                    ),
+                    "incumbent_improvements": support_repair_improvements,
+                    "skipped_conditional_optimality_cuts": (
+                        support_repair_skipped_optimality_cuts
+                    ),
+                    "bound_used": False,
+                },
                 "persistent_area_subproblems": True,
                 "compact_primal_seed_bound_used": False,
                 "column_generation_called": False,
@@ -2045,6 +2288,13 @@ class LogicBendersPlanner(DirectMilpPlanner):
             result.columns = self._selected_lbbd_columns(best_selected)
             return result
         finally:
+            if support_repair_neighborhood is not None:
+                try:
+                    self._remove_support_repair_neighborhood(
+                        master, support_repair_neighborhood
+                    )
+                except Exception:
+                    pass
             self._free_gurobi_model(master)
             for subproblem in self._area_subproblems.values():
                 self._free_gurobi_model(subproblem.model)

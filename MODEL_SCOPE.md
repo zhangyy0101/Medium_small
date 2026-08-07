@@ -89,4 +89,6 @@ An infeasible area subproblem extracts an IIS demand core. It generates a monoto
 
 If the first LBBD iteration produces no complete incumbent, a time-limited compact-row solve is used once as an adaptive primal seed. It can supply a verified upper bound and master start only. Its solver bound is explicitly discarded: every reported lower bound and every convergence claim still comes exclusively from the strengthened LBBD master and exact area subproblems.
 
+The seed activates a fixed-count primal-repair phase in the same LBBD master. The first repair iteration fixes all group-area and import-area quantities at the seed; subsequent iterations expand an L1 quantity neighborhood by a fixed instance-scaled step. Exact area subproblems validate every candidate. Conditional optimality cuts and temporary-neighborhood bounds are skipped during this upper-bound phase, while globally valid feasibility and capacity cuts are retained after the neighborhood is removed.
+
 This implementation is an experimental third algorithm and does not modify the `cg` or `direct` execution paths. The optional primal seed reuses their common compact-model builder, but it does not call `DirectMilpPlanner.solve` and cannot contribute a bound.

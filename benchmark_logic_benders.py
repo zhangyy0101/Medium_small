@@ -34,6 +34,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--master-time-limit", type=float, default=10.0)
     parser.add_argument("--area-time-limit", type=float, default=5.0)
     parser.add_argument("--primal-seed-time-limit", type=float, default=10.0)
+    parser.add_argument("--support-repair-iterations", type=int, default=5)
+    parser.add_argument("--support-repair-fraction", type=float, default=0.02)
     parser.add_argument("--compare-direct", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
@@ -54,6 +56,8 @@ def _summary(diagnostics: dict) -> dict:
             "lbbd_cut_counts",
             "lbbd_area_subproblem_solve_count",
             "lbbd_area_subproblem_cache_hits",
+            "lbbd_best_incumbent_source",
+            "lbbd_support_repair",
             "lbbd_total_solve_seconds",
             "direct_total_solve_seconds",
         )
@@ -105,6 +109,8 @@ def main() -> None:
             master_time_limit=args.master_time_limit,
             area_time_limit=args.area_time_limit,
             primal_seed_time_limit=args.primal_seed_time_limit,
+            support_repair_iterations=args.support_repair_iterations,
+            support_repair_fraction=args.support_repair_fraction,
         ),
     ).solve()
     results = {"lbbd": _summary(lbbd.diagnostics)}

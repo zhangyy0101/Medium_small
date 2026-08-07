@@ -149,6 +149,12 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
                 ColumnGenerationConfig(verbose=False),
                 LogicBendersConfig(max_iterations=0),
             )
+        with self.assertRaises(ValueError):
+            LogicBendersPlanner(
+                make_small_problem(),
+                ColumnGenerationConfig(verbose=False),
+                LogicBendersConfig(support_repair_fraction=1.1),
+            )
 
     def test_voyage_plan_pricing_configuration_is_validated(self) -> None:
         with self.assertRaises(ValueError):
@@ -439,6 +445,48 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             decomposed.diagnostics["final_business_objective"],
             places=9,
         )
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_logic_benders_removes_temporary_repair_neighborhood(self) -> None:
+        config = ColumnGenerationConfig(
+            total_time_limit=20.0,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        planner = LogicBendersPlanner(
+            make_small_problem(),
+            config,
+            LogicBendersConfig(
+                support_repair_iterations=2,
+                support_repair_fraction=0.02,
+            ),
+        )
+        planner._prepare_lbbd()
+        selected, _stats = planner._solve_direct_milp()
+        master, variables, _master_stats = planner._build_master()
+        try:
+            original_variable_count = len(master.getVars())
+            export_by_area, import_by_area = planner._apply_master_start(
+                variables,
+                selected,
+                planner._final_import_reservation,
+            )
+            neighborhood = planner._add_support_repair_neighborhood(
+                master,
+                variables,
+                export_by_area,
+                import_by_area,
+            )
+            self.assertIsNotNone(neighborhood)
+            self.assertEqual(0.0, float(neighborhood.limit.RHS))
+            self.assertGreater(len(master.getVars()), original_variable_count)
+            planner._remove_support_repair_neighborhood(
+                master, neighborhood
+            )
+            self.assertEqual(original_variable_count, len(master.getVars()))
+        finally:
+            planner._free_gurobi_model(master)
 
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
     def test_two_voyage_plans_preserve_global_row_separation(self) -> None:
