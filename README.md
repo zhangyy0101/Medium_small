@@ -68,7 +68,15 @@ python -X utf8 -B benchmark_profile_benders.py --input example/many_groups_6v_12
 python -X utf8 -B benchmark_selective_benders.py --input example/many_groups_6v_12g/input_data.json --large-plan example/many_groups_6v_12g/large_plan.csv --total-time-limit 120 --solver-threads 1
 python -X utf8 -B example/generate_natural_conflict_case.py --overwrite
 python -X utf8 -B benchmark_selective_benders.py --input example/natural_conflict_peak/input_data.json --large-plan example/natural_conflict_peak/large_plan.csv --total-time-limit 90 --solver-threads 1 --output outputs/selective_natural_conflict_peak_90s.json
+python -X utf8 -B benchmark_row_configurations.py --root-only --compare-m0-lp --input example/many_groups_6v_12g/input_data.json --large-plan example/many_groups_6v_12g/large_plan.csv --total-time-limit 120 --solver-threads 1
 ```
+
+`benchmark_row_configurations.py` is an isolated research prototype for
+physical-row-track Dantzig--Wolfe decomposition. It implements exact root
+pricing, a Lagrangian lower bound, integer-friendly group consolidation, and
+the restricted configuration MIP. The Branch-and-Price tree is deliberately
+not implemented because the root-LP and restricted-MIP stage gates were not
+met; the prototype does not alter any production solver entry point.
 
 ## 输出
 
@@ -87,6 +95,7 @@ python -X utf8 -B benchmark_selective_benders.py --input example/natural_conflic
 - `yard_planning/voyage_resource_benders.py`：航次—排资源 LBBD 主问题、航次子问题与逻辑割；
 - `yard_planning/profile_resource_benders.py`：排资源类型聚合主问题、共享物理资源池、快速足迹解聚、全局精确反聚合子问题及条件逻辑割；
 - `yard_planning/selective_resource_benders.py`：冲突超图初始化、IIS 驱动单向状态提升、选择性整数资源状态与排数主问题、联合精确排级 recourse、物理容量证书与单调 IIS 后备割、条件最优性割，以及独立的冲突修复与受限排级邻域上界改进；
+- `yard_planning/row_configuration_generation.py`：独立的物理排轨道配置列生成实验，包括精确定价、Lagrangian 根节点下界、集中配置初始列和整数受限主问题；
 - `yard_planning/logic_benders.py`：LBBD 的稳定公共导入入口；
 - `yard_planning/direct_milp.py`：M0 紧凑排位置模型；
 - `yard_planning/gurobi_backend.py`：统一 Gurobi 接口；

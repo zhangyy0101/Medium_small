@@ -22,6 +22,9 @@ from yard_planning.profile_resource_benders import (
 from yard_planning.selective_resource_benders import (
     SelectiveResourceBendersPlanner,
 )
+from yard_planning.row_configuration_generation import (
+    RowConfigurationGenerationPlanner,
+)
 from yard_planning.planner import (
     ColumnGenerationConfig,
     YardPlanningBase,
@@ -616,6 +619,52 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             ]
         )
         self.assertNotIn("primal_support_state_integer_count", stats)
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_row_configuration_root_matches_m0_lp_on_small_case(self) -> None:
+        config = ColumnGenerationConfig(
+            total_time_limit=10.0,
+            max_iterations=20,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        root = RowConfigurationGenerationPlanner(
+            make_small_problem(), config
+        ).solve_root_relaxation(5.0)
+        m0_lp = RowConfigurationGenerationPlanner(
+            make_small_problem(), config
+        ).solve_m0_lp_relaxation(5.0)
+        self.assertTrue(root["closed"])
+        self.assertEqual(root["status"], "optimal")
+        self.assertEqual(m0_lp["status"], "optimal")
+        self.assertAlmostEqual(
+            float(root["objective"]), float(m0_lp["objective"]), places=9
+        )
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_row_configuration_integer_master_matches_m0(self) -> None:
+        config = ColumnGenerationConfig(
+            total_time_limit=10.0,
+            max_iterations=20,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        configuration = RowConfigurationGenerationPlanner(
+            make_small_problem(), config
+        ).solve()
+        direct = DirectMilpPlanner(make_small_problem(), config).solve()
+        self.assertAlmostEqual(
+            configuration.diagnostics["final_business_objective"],
+            direct.diagnostics["final_business_objective"],
+            places=9,
+        )
+        self.assertTrue(
+            configuration.diagnostics["independent_solution_validation"][
+                "passed"
+            ]
+        )
 
     def test_selective_recourse_fixes_quantities_not_profile_states(
         self,
