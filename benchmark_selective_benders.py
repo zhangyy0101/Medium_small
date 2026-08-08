@@ -36,6 +36,12 @@ def _selective_summary(diagnostics: dict) -> dict:
     }
     for key in (
         "selective_profile_state_count",
+        "selective_initial_profile_state_count",
+        "selective_promoted_profile_state_count",
+        "selective_promoted_row_count",
+        "selective_conflict_hyperedge_count",
+        "selective_initial_conflict_hyperedge_coverage",
+        "selective_initial_conflict_seed_count",
         "selective_profile_state_score_min",
         "selective_profile_state_score_max",
         "selective_oracle_solve_count",
@@ -56,6 +62,7 @@ def _selective_summary(diagnostics: dict) -> dict:
         "selective_lbbd_local_optimality_cut_count",
         "selective_lbbd_global_optimality_cut_count",
         "selective_lbbd_cut_binary_count",
+        "selective_lbbd_state_promotion_round_count",
         "selective_lbbd_bound_tightening_cut_count",
         "selective_lbbd_oracle_build_seconds",
         "selective_lbbd_oracle_variable_count",
@@ -85,6 +92,9 @@ def _selective_summary(diagnostics: dict) -> dict:
     )
     summary["selective_lbbd_cut_records"] = diagnostics.get(
         "selective_lbbd_cut_records", []
+    )
+    summary["selective_lbbd_state_promotion_records"] = diagnostics.get(
+        "selective_lbbd_state_promotion_records", []
     )
     summary["selective_lbbd_oracle_records"] = diagnostics.get(
         "selective_lbbd_oracle_records", []

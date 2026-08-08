@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter, defaultdict
+from heapq import heappop, heappush
 from itertools import combinations
 from time import perf_counter
 
@@ -29,7 +30,7 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
     # envelopes, not reservations: unused time immediately returns to the
     # common pool and every solve is also capped by the time still available.
     _TIME_SHARES = {
-        "initial_feasibility": 0.22,
+        "initial_feasibility": 0.28,
         "formal_master_reserve": 0.35,
         "oracle": 0.06,
         "initial_repair": 0.13,
@@ -46,6 +47,13 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
         super().__init__(problem, config, benders_config)
         self._selected_profile_states: tuple[ProfileState, ...] = ()
         self._selection_scores: dict[ProfileState, float] = {}
+        self._conflict_hyperedges: tuple[tuple[ProfileState, ...], ...] = ()
+        self._state_conflict_incidence: Counter[ProfileState] = Counter()
+        self._initial_conflict_edge_coverage = 0
+        self._initial_conflict_seed_count = 0
+        self._initial_profile_state_count = 0
+        self._promoted_profile_states: set[ProfileState] = set()
+        self._promoted_row_keys: set[tuple] = set()
         self._selective_oracle_cache: dict[tuple, dict] = {}
         self._selective_oracle_solve_count = 0
         self._selective_oracle_cache_hits = 0
@@ -86,7 +94,7 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
         self._select_resource_states()
 
     def _select_resource_states(self) -> None:
-        """Select a sublinear, voyage-balanced set of scarce states."""
+        """Add a bounded conflict cover to the voyage-balanced score set."""
         overlap_count: Counter[int] = Counter()
         for profile_ids, _upper in self._overlap_pool_bounds:
             overlap_count.update(profile_ids)
@@ -163,8 +171,65 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
             state_count,
             max(64, int(math.ceil(state_count**0.75))),
         )
-        voyage_quota = max(1, budget // max(1, len(states_by_voyage)))
         ranking_key = lambda state: (-scores[state], repr(state))
+
+        states_by_profile: defaultdict[int, set[ProfileState]] = (
+            defaultdict(set)
+        )
+        for state in self._profile_states:
+            states_by_profile[state[0]].add(state)
+        edge_weight_by_states: dict[frozenset[ProfileState], float] = {}
+
+        def register_edge(
+            profile_ids: tuple[int, ...],
+            upper: int,
+        ) -> None:
+            states = frozenset(
+                state
+                for profile_id in profile_ids
+                for state in states_by_profile[profile_id]
+            )
+            if len(states) <= 1:
+                return
+            total_multiplicity = sum(
+                int(self._profiles[profile_id].multiplicity)
+                for profile_id in profile_ids
+            )
+            overload = max(0, total_multiplicity - int(upper))
+            weight = 1.0 + overload / max(1, int(upper))
+            edge_weight_by_states[states] = max(
+                edge_weight_by_states.get(states, 0.0),
+                float(weight),
+            )
+
+        for pool_signature, profile_ids in sorted(
+            self._profile_ids_by_physical_pool.items(),
+            key=lambda item: repr(item[0]),
+        ):
+            if len(profile_ids) > 1:
+                register_edge(profile_ids, len(pool_signature))
+        for profile_ids, upper in self._overlap_pool_bounds:
+            register_edge(profile_ids, int(upper))
+
+        ordered_edges = sorted(
+            edge_weight_by_states,
+            key=lambda edge: repr(tuple(sorted(edge))),
+        )
+        edge_weights = tuple(
+            edge_weight_by_states[edge] for edge in ordered_edges
+        )
+        incidence: defaultdict[ProfileState, list[int]] = defaultdict(list)
+        for edge_index, edge in enumerate(ordered_edges):
+            for state in edge:
+                incidence[state].append(edge_index)
+        gains = {
+            state: sum(edge_weights[index] for index in incidence[state])
+            for state in self._profile_states
+        }
+        uncovered = set(range(len(ordered_edges)))
+        voyage_quota = max(
+            1, budget // max(1, len(states_by_voyage))
+        )
         selected: set[ProfileState] = set()
         for states in states_by_voyage.values():
             selected.update(
@@ -177,8 +242,72 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                     break
         elif len(selected) > budget:
             selected = set(sorted(selected, key=ranking_key)[:budget])
+
+        conflict_seeds: set[ProfileState] = set()
+
+        def cover_with(state: ProfileState) -> None:
+            if state in conflict_seeds:
+                return
+            conflict_seeds.add(state)
+            newly_covered = [
+                index
+                for index in incidence[state]
+                if index in uncovered
+            ]
+            for edge_index in newly_covered:
+                uncovered.remove(edge_index)
+                weight = edge_weights[edge_index]
+                for neighbour in ordered_edges[edge_index]:
+                    gains[neighbour] -= weight
+
+        heap = []
+        for state in self._profile_states:
+            heappush(
+                heap,
+                (-gains[state], -scores[state], repr(state), state),
+            )
+        seed_budget = min(
+            budget,
+            len(ordered_edges),
+            max(
+                len(states_by_voyage),
+                int(math.ceil(math.sqrt(len(ordered_edges)))),
+            ),
+        )
+        while uncovered and len(conflict_seeds) < seed_budget and heap:
+            negative_gain, _negative_score, _name, state = heappop(heap)
+            if state in conflict_seeds:
+                continue
+            if abs(-negative_gain - gains[state]) > 1e-9:
+                heappush(
+                    heap,
+                    (-gains[state], -scores[state], repr(state), state),
+                )
+                continue
+            cover_with(state)
+
+        selected.update(conflict_seeds)
+        if len(selected) > budget:
+            removable = sorted(
+                selected - conflict_seeds,
+                key=lambda state: (scores[state], repr(state)),
+            )
+            for state in removable[: len(selected) - budget]:
+                selected.remove(state)
+        covered_edge_count = sum(
+            bool(selected.intersection(edge)) for edge in ordered_edges
+        )
         self._selection_scores = scores
         self._selected_profile_states = tuple(sorted(selected))
+        self._conflict_hyperedges = tuple(
+            tuple(sorted(edge)) for edge in ordered_edges
+        )
+        self._state_conflict_incidence = Counter(
+            {state: len(indices) for state, indices in incidence.items()}
+        )
+        self._initial_conflict_edge_coverage = covered_edge_count
+        self._initial_conflict_seed_count = len(conflict_seeds)
+        self._initial_profile_state_count = len(selected)
 
     def _build_profile_master(self):
         model, variables, stats = super()._build_profile_master()
@@ -275,13 +404,123 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                     "voyage_balanced_profile_relaxation_and_row_pressure"
                 ),
                 "selection_rule": (
-                    "voyage_balanced_scarcity_and_business_relevance_"
-                    "score_with_sublinear_budget"
+                    "voyage_balanced_scarcity_score_with_bounded_"
+                    "conflict_hypergraph_seeds"
+                ),
+                "conflict_hyperedge_count": len(
+                    self._conflict_hyperedges
+                ),
+                "initial_conflict_hyperedge_coverage": (
+                    self._initial_conflict_edge_coverage
+                ),
+                "initial_conflict_seed_count": (
+                    self._initial_conflict_seed_count
                 ),
             }
         )
         self._selective_master_variables = variables
         return model, variables, stats
+
+    def _promote_conflict_resources(
+        self,
+        master,
+        variables: dict,
+        quantities: dict[QuantityKey, int],
+        conflict_keys: tuple[QuantityKey, ...],
+    ) -> dict:
+        """Integerize a bounded IIS neighbourhood exactly once per state."""
+        core = tuple(
+            sorted(
+                key
+                for key in set(conflict_keys)
+                if int(quantities.get(key, 0)) > 0
+            )
+        )
+        profile_hits: Counter[ProfileState] = Counter()
+        row_hits: Counter[tuple] = Counter()
+        for key in core:
+            key_states = {
+                (
+                    self._profile_by_template[
+                        self._template_by_candidate[index]
+                    ],
+                    self._owner_key_by_candidate[index][1],
+                )
+                for index in self._candidate_indices_by_group_bay.get(
+                    key, ()
+                )
+            }
+            amount = int(quantities[key])
+            for state in key_states:
+                profile_hits[state] += amount
+            representative = self._columns[
+                self._quantity_representative[key]
+            ]
+            row_hits[(representative.group_key, key[1])] += amount
+
+        profile_candidates = [
+            state
+            for state in profile_hits
+            if state in variables["profile_use"]
+            and variables["profile_use"][state].VType == "C"
+        ]
+        row_candidates = [
+            key
+            for key in row_hits
+            if key in variables["row_count"]
+            and variables["row_count"][key].VType == "C"
+        ]
+        profile_limit = min(
+            24,
+            max(4, int(math.ceil(math.sqrt(max(1, len(core)))))),
+        )
+        row_limit = min(
+            12,
+            max(2, int(math.ceil(math.sqrt(max(1, len(row_hits)))))),
+        )
+        promoted_states = tuple(
+            sorted(
+                profile_candidates,
+                key=lambda state: (
+                    -profile_hits[state],
+                    -self._state_conflict_incidence[state],
+                    -self._selection_scores.get(state, 0.0),
+                    repr(state),
+                ),
+            )[:profile_limit]
+        )
+        promoted_rows = tuple(
+            sorted(
+                row_candidates,
+                key=lambda key: (-row_hits[key], repr(key)),
+            )[:row_limit]
+        )
+        for state in promoted_states:
+            variables["profile_use"][state].VType = "I"
+        for key in promoted_rows:
+            variables["row_count"][key].VType = "I"
+        if promoted_states or promoted_rows:
+            master.update()
+            self._promoted_profile_states.update(promoted_states)
+            self._promoted_row_keys.update(promoted_rows)
+            self._selected_profile_states = tuple(
+                sorted(
+                    set(self._selected_profile_states)
+                    | set(promoted_states)
+                )
+            )
+        return {
+            "promoted": bool(promoted_states or promoted_rows),
+            "conflict_quantity_count": len(core),
+            "profile_candidate_count": len(profile_candidates),
+            "row_candidate_count": len(row_candidates),
+            "profile_promotion_limit": profile_limit,
+            "row_promotion_limit": row_limit,
+            "promoted_profile_states": promoted_states,
+            "promoted_row_keys": promoted_rows,
+            "promoted_profile_state_count": len(promoted_states),
+            "promoted_row_count": len(promoted_rows),
+        }
 
     def _master_feasibility_slice(self, allowance: float) -> float:
         """Scale the feasibility cap with the common wall-clock budget.
@@ -296,20 +535,23 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
         )
 
     def _initialize_master_incumbent(self, model, deadline: float) -> dict:
-        """Probe a coarse row relaxation, then restore the formal master.
+        """Probe a row-count relaxation, then restore the formal master.
 
         This phase supplies only a quantity point for the exact oracle and the
         conflict-repair neighbourhood.  The formal master keeps its selected
-        row-count integrality, and no profile state is promoted from the
-        resulting primal solution.
+        profile and row-count integrality; no state is promoted merely because
+        it appears in the relaxed skeleton.
         """
         if self._selective_master_variables is None:
             raise RuntimeError("selective master variables are unavailable")
         row_variables = tuple(
             self._selective_master_variables["row_count"].values()
         )
-        original_types = tuple(variable.VType for variable in row_variables)
-        for variable in row_variables:
+        relaxed_variables = row_variables
+        original_types = tuple(
+            variable.VType for variable in relaxed_variables
+        )
+        for variable in relaxed_variables:
             variable.VType = "C"
         self._try_set_gurobi_param(model, "Heuristics", 1.0)
         self._try_set_gurobi_param(model, "PumpPasses", 20)
@@ -320,7 +562,7 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
             self._try_set_gurobi_param(model, "Heuristics", 0.5)
             self._try_set_gurobi_param(model, "PumpPasses", -1)
             for variable, variable_type in zip(
-                row_variables, original_types
+                relaxed_variables, original_types
             ):
                 variable.VType = variable_type
             model.update()
@@ -1561,8 +1803,8 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                     "row_count_integrality"
                 ),
                 "decomposition": (
-                    "group_bay_master_joint_exact_row_recourse_conflict_"
-                    "repair_and_row_neighbourhood"
+                    "conflict_guided_adaptive_integrality_group_bay_"
+                    "master_joint_exact_row_recourse"
                 ),
                 "benders_cut_validity": (
                     "certified_physical_capacity_or_monotone_IIS_"
@@ -1570,6 +1812,24 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                 ),
                 "selective_profile_state_count": len(
                     self._selected_profile_states
+                ),
+                "selective_initial_profile_state_count": (
+                    self._initial_profile_state_count
+                ),
+                "selective_promoted_profile_state_count": len(
+                    self._promoted_profile_states
+                ),
+                "selective_promoted_row_count": len(
+                    self._promoted_row_keys
+                ),
+                "selective_conflict_hyperedge_count": len(
+                    self._conflict_hyperedges
+                ),
+                "selective_initial_conflict_hyperedge_coverage": (
+                    self._initial_conflict_edge_coverage
+                ),
+                "selective_initial_conflict_seed_count": (
+                    self._initial_conflict_seed_count
                 ),
                 "selective_profile_state_score_min": (
                     round(min(selected_scores), 6)
@@ -1659,6 +1919,9 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
         cut_signatures: set[tuple] = set()
         cut_records: list[dict] = []
         pending_cut_records: list[int] = []
+        promotion_records: list[dict] = []
+        pending_promotion_records: list[int] = []
+        state_promotion_round_count = 0
         feasibility_cut_count = 0
         optimality_cut_count = 0
         cut_binary_count = 0
@@ -1989,6 +2252,10 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                         conflict_keys = tuple(
                             warm_recourse["conflict_quantity_keys"]
                         )
+                        # The warm skeleton is only a relaxed search aid, not
+                        # a formal master incumbent.  Its IIS therefore
+                        # separates that quantity point but must not promote
+                        # integer states prematurely.
                         cut_info = self._add_certified_feasibility_cut(
                             master,
                             variables,
@@ -2116,6 +2383,18 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                             else None
                         )
                     pending_cut_records.clear()
+                    for record_index in pending_promotion_records:
+                        record = promotion_records[record_index]
+                        record["lower_bound_after_next_master"] = (
+                            valid_lower_bound
+                        )
+                        before = record.get("lower_bound_before")
+                        record["certified_lower_bound_lift"] = (
+                            max(0.0, valid_lower_bound - float(before))
+                            if before is not None
+                            else None
+                        )
+                    pending_promotion_records.clear()
                     master_rounds.append(
                         {
                             "master_round": master_round,
@@ -2161,6 +2440,18 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                         else None
                     )
                 pending_cut_records.clear()
+                for record_index in pending_promotion_records:
+                    record = promotion_records[record_index]
+                    record["lower_bound_after_next_master"] = (
+                        valid_lower_bound
+                    )
+                    before = record.get("lower_bound_before")
+                    record["certified_lower_bound_lift"] = (
+                        max(0.0, valid_lower_bound - float(before))
+                        if before is not None
+                        else None
+                    )
+                pending_promotion_records.clear()
 
                 master_objective = self._gurobi_objective_value(master)
                 quantities, _counts, _routing, imports, theta = (
@@ -2211,6 +2502,8 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                 recourse_bound = float(recourse["bound"])
                 new_cut_details = []
                 local_cut_added = False
+                promoted_this_round = 0
+                promotion_kind = None
                 if recourse["feasible"]:
                     row_cost_by_voyage = (
                         self._selected_row_cost_by_voyage(selected)
@@ -2323,45 +2616,81 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                                 )
                         voyage_bound_records.append(bound_record)
                 if recourse["status"] == "infeasible":
-                    cut_info = self._add_certified_feasibility_cut(
+                    conflict_keys = tuple(
+                        recourse["conflict_quantity_keys"]
+                    )
+                    promotion = self._promote_conflict_resources(
                         master,
                         variables,
                         quantities,
-                        tuple(recourse["conflict_quantity_keys"]),
-                        feasibility_cut_count + 1,
-                        cut_signatures,
+                        conflict_keys,
                     )
-                    if cut_info["added"]:
-                        feasibility_cut_count += 1
-                        feasibility_recovery_pending = True
-                        new_cut_details.append(
+                    if promotion["promoted"]:
+                        state_promotion_round_count += 1
+                        promoted_this_round = int(
+                            promotion["promoted_profile_state_count"]
+                        ) + int(promotion["promoted_row_count"])
+                        promotion_kind = (
+                            "conflict_guided_integrality_promotion"
+                        )
+                        promotion_records.append(
                             {
-                                "kind": cut_info["kind"],
-                                "binary_count": int(
-                                    cut_info["binary_count"]
-                                ),
-                                "theta_before": 0.0,
-                                "recourse_lower_bound": None,
-                                "component_id": recourse.get(
-                                    "conflict_component_id"
-                                ),
-                                "capacity_upper_bound": cut_info[
-                                    "capacity_upper_bound"
-                                ],
-                                "capacity_core": cut_info[
-                                    "capacity_core"
-                                ],
-                                "incumbent_core_quantity": cut_info[
-                                    "incumbent_core_quantity"
-                                ],
-                                "capacity_certificate": cut_info[
-                                    "capacity_certificate"
-                                ],
-                                "monotone_support_limit": cut_info.get(
-                                    "monotone_support_limit"
+                                "promotion_index": len(promotion_records)
+                                + 1,
+                                "master_round": master_round,
+                                "kind": promotion_kind,
+                                **promotion,
+                                "lower_bound_before": (
+                                    valid_lower_bound
+                                    if math.isfinite(valid_lower_bound)
+                                    else None
                                 ),
                             }
                         )
+                        pending_promotion_records.append(
+                            len(promotion_records) - 1
+                        )
+                        feasibility_recovery_pending = True
+                    else:
+                        cut_info = self._add_certified_feasibility_cut(
+                            master,
+                            variables,
+                            quantities,
+                            conflict_keys,
+                            feasibility_cut_count + 1,
+                            cut_signatures,
+                        )
+                        if cut_info["added"]:
+                            feasibility_cut_count += 1
+                            feasibility_recovery_pending = True
+                            new_cut_details.append(
+                                {
+                                    "kind": cut_info["kind"],
+                                    "binary_count": int(
+                                        cut_info["binary_count"]
+                                    ),
+                                    "theta_before": 0.0,
+                                    "recourse_lower_bound": None,
+                                    "component_id": recourse.get(
+                                        "conflict_component_id"
+                                    ),
+                                    "capacity_upper_bound": cut_info[
+                                        "capacity_upper_bound"
+                                    ],
+                                    "capacity_core": cut_info[
+                                        "capacity_core"
+                                    ],
+                                    "incumbent_core_quantity": cut_info[
+                                        "incumbent_core_quantity"
+                                    ],
+                                    "capacity_certificate": cut_info[
+                                        "capacity_certificate"
+                                    ],
+                                    "monotone_support_limit": cut_info.get(
+                                        "monotone_support_limit"
+                                    ),
+                                }
+                            )
                 elif (
                     recourse["feasible"]
                     and not local_cut_added
@@ -2483,6 +2812,8 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                         "recourse_bound": recourse_bound,
                         "cuts_added": cuts_added,
                         "cut_kind": cut_kind,
+                        "states_promoted": promoted_this_round,
+                        "promotion_kind": promotion_kind,
                         "candidate_objective": candidate_objective,
                         "repair_status": (
                             repair["status"] if repair else None
@@ -2490,7 +2821,7 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                     }
                 )
 
-                if cuts_added:
+                if cuts_added or promoted_this_round:
                     termination_reason = "master_strengthened"
                     continue
                 if not recourse["feasible"]:
@@ -2583,6 +2914,12 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                 ),
                 "selective_lbbd_cut_binary_count": cut_binary_count,
                 "selective_lbbd_cut_records": cut_records,
+                "selective_lbbd_state_promotion_round_count": (
+                    state_promotion_round_count
+                ),
+                "selective_lbbd_state_promotion_records": (
+                    promotion_records
+                ),
                 "selective_lbbd_bound_tightening_cut_count": (
                     tightened_cut_count
                 ),
@@ -2654,6 +2991,8 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                         self._monotone_iis_support_limit()
                     ),
                     "uncertified_timeout_generates_cut": False,
+                    "formal_iis_promotes_before_feasibility_cut": True,
+                    "relaxed_probe_promotes_states": False,
                 },
                 "selective_lbbd_master": master_stats,
             }

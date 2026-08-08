@@ -626,6 +626,79 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         self.assertEqual(planner._global_fixed_profile_states(), ())
         self.assertEqual(planner._logic_cut_profile_states(), ())
 
+    def test_selective_initial_states_record_conflict_hypergraph_coverage(
+        self,
+    ) -> None:
+        planner = SelectiveResourceBendersPlanner(
+            make_two_voyage_problem(),
+            ColumnGenerationConfig(verbose=False),
+        )
+        planner._prepare_decomposition()
+        planner._prepare_profiles()
+        selected = set(planner._selected_profile_states)
+        self.assertGreater(len(planner._conflict_hyperedges), 0)
+        covered = sum(
+            bool(selected.intersection(edge))
+            for edge in planner._conflict_hyperedges
+        )
+        self.assertEqual(
+            planner._initial_conflict_edge_coverage,
+            covered,
+        )
+        self.assertGreater(covered, 0)
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_selective_iis_promotion_is_one_way(self) -> None:
+        planner = SelectiveResourceBendersPlanner(
+            make_two_voyage_problem(),
+            ColumnGenerationConfig(verbose=False),
+        )
+        planner._prepare_decomposition()
+        planner._prepare_profiles()
+        master, variables, _stats = planner._build_profile_master()
+        try:
+            quantity_key = ("G1", "A|01")
+            candidate_index = planner._candidate_indices_by_group_bay[
+                quantity_key
+            ][0]
+            state = (
+                planner._profile_by_template[
+                    planner._template_by_candidate[candidate_index]
+                ],
+                planner._owner_key_by_candidate[candidate_index][1],
+            )
+            representative = planner._columns[
+                planner._quantity_representative[quantity_key]
+            ]
+            row_key = (representative.group_key, quantity_key[1])
+            variables["profile_use"][state].VType = "C"
+            variables["row_count"][row_key].VType = "C"
+            planner._selected_profile_states = tuple(
+                candidate
+                for candidate in planner._selected_profile_states
+                if candidate != state
+            )
+            master.update()
+
+            promotion = planner._promote_conflict_resources(
+                master,
+                variables,
+                {quantity_key: 1},
+                (quantity_key,),
+            )
+            self.assertTrue(promotion["promoted"])
+            self.assertEqual(variables["profile_use"][state].VType, "I")
+            self.assertEqual(variables["row_count"][row_key].VType, "I")
+            repeated = planner._promote_conflict_resources(
+                master,
+                variables,
+                {quantity_key: 1},
+                (quantity_key,),
+            )
+            self.assertFalse(repeated["promoted"])
+        finally:
+            planner._free_gurobi_model(master)
+
     def test_selective_time_budget_scales_with_common_deadline(self) -> None:
         small = SelectiveResourceBendersPlanner(
             make_small_problem(),
