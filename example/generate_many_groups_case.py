@@ -44,6 +44,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument(
+        "--copies",
+        type=int,
+        default=3,
+        help="Total diversified scale, with two source voyage families.",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Replace an existing generated input, plan, and manifest.",
@@ -143,11 +149,12 @@ def expand_voyage_groups(
 def build_case(
     base_input: Path,
     base_large_plan: Path,
+    copies: int = 3,
 ) -> tuple[InputAdapterGd, pd.DataFrame, dict]:
     adapter, large_plan, diverse_manifest = build_diverse_case(
         base_input,
         base_large_plan,
-        copies=3,
+        copies=copies,
     )
     detailed_voyages = [
         voyage
@@ -194,7 +201,7 @@ def build_case(
         }
 
     manifest = {
-        "case": "many_groups_6v_12g",
+        "case": f"many_groups_{len(detailed_voyages)}v_12g",
         "base_input": diverse_manifest["base_input"],
         "base_large_plan": diverse_manifest["base_large_plan"],
         "generation_policy": (
@@ -238,6 +245,7 @@ def main() -> None:
     adapter, large_plan, manifest = build_case(
         args.base_input.resolve(),
         args.base_large_plan.resolve(),
+        copies=args.copies,
     )
     write_case(
         adapter,

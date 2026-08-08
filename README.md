@@ -8,12 +8,13 @@
 
 ## 求解器
 
-仓库保留四套相互独立的求解器：
+仓库保留五套相互独立的求解器：
 
 - `cg`：论文算法——完整航次方案列生成、航次内部箱区局部模式协调、严格定价认证，以及一次受限排级整数恢复；
 - `direct`：同一数学模型的完整排位置 MILP，即对照基线 M0；
 - `lbbd`：实验性替代算法——主问题以“箱组—箱区整数箱量 + 航次—排足迹—行不混类别二元状态 + 连续候选排流”协调进口预留、物理排冲突和业务目标；每个出口航次由一个持久化精确排级子问题独立验证并恢复整数落位，必要时生成 Hall 容量割、IIS 核逻辑可行性割和条件最优性割。算法不调用 M0 修复，也没有备用求解链。
 - `lbbd_profile`：独立的严格资源类型聚合 LBBD——把容量、尺寸能力、20/40/45 英尺足迹兼容性相同的具体排聚合为整数资源类型；主问题使用部分重叠足迹池的 Hall 型容量界和资源类型—不可混类容量约束。候选先经全局物理足迹匹配和精确航次子问题快速验证：匹配被证明不可行时生成打包割或条件匹配可行性割；匹配可行但航次解聚失败、或精确排代价高于 `theta` 时，按需调用联合选择全部具体足迹与排落位的精确 oracle，并生成 IIS 核条件可行性割或条件最优性割后重解主问题。只有主问题最优且精确 recourse 已认证时才报告收敛。初始化骨架只有通过精确解聚才可作为 MIP Start；该版本不覆盖或调用 `lbbd`、`cg`、`direct`。
+- `lbbd_selective`：与上述求解器并列的选择性资源状态 LBBD。箱组—贝位数量保持整数，箱组—箱区激活使用候选容量上界收紧的 Big-M 和最少启用箱区覆盖割；profile 状态按资源稀缺性和业务相关性选择整数核心，少量高压力排数作连续松弛，其余排数保持整数。初始化仅临时放松排数以取得候选数量点，随后立即恢复正式主问题类型；持久化联合精确排级 oracle 对 IIS 提取设置短时限，优先把小型不可行核提升为无额外二元变量的物理容量割，无法证明更强容量界时退回单调 IIS 割，并对低估的排级代价生成数量条件最优性割。不可行点另由冲突定向受限排级 MIP 恢复上界，再以“未访问优先、业务损失次优、航次均衡”的箱组批量排级邻域轮换改善；这些解只作为 MIP Start，不会永久提升变量类型。该入口不调用 M0、`lbbd_profile` 或备用求解链。
 
 论文算法的外层一列表示“一个出口航次跨全部可行箱区的完整排级方案”。外层主问题只为每个航次选择一列，并统一协调共享排/贝容量、跨航次不混状态、进口预留和大计划偏差，因此凸性块数量等于航次数，而不是航次数乘箱区数。
 
@@ -43,6 +44,7 @@ python -X utf8 -B run_yard_plan.py --solver cg --run-name voyage_plan_cg
 python -X utf8 -B run_yard_plan.py --solver direct --run-name m0_direct
 python -X utf8 -B run_yard_plan.py --solver lbbd --run-name strengthened_lbbd
 python -X utf8 -B run_yard_plan.py --solver lbbd_profile --run-name profile_lbbd
+python -X utf8 -B run_yard_plan.py --solver lbbd_selective --run-name selective_lbbd
 ```
 
 主要参数：
@@ -51,8 +53,8 @@ python -X utf8 -B run_yard_plan.py --solver lbbd_profile --run-name profile_lbbd
 - `--mip-gap`：M0 的停止 gap；CG 的受限整数恢复仍请求零 gap，但受总时限约束；
 - `--max-pricing-iterations`：外层和内层列生成的最大迭代数；
 - `--plans-per-pricing`：一次定价最多返回的候选方案/局部模式数；
-- `--lbbd-max-iterations`：`lbbd` 和 `lbbd_profile` 的主问题—逻辑割最大迭代轮数；
-- `--lbbd-master-feasibility-time-limit`：`lbbd` 初始可行骨架与原目标抛光的总时限；`lbbd_profile` 只使用其中的可行骨架阶段，随后立即进行精确解聚；
+- `--lbbd-max-iterations`：`lbbd`、`lbbd_profile` 和 `lbbd_selective` 的主问题—逻辑割最大迭代轮数；
+- `--lbbd-master-feasibility-time-limit`：`lbbd` 初始可行骨架与原目标抛光的总时限；`lbbd_profile` 使用可行骨架后立即精确解聚；`lbbd_selective` 用临时排数松弛探测候选点，再由联合精确 oracle 与冲突修复产生完整 MIP Start；
 - `--lbbd-master-time-limit`：生成新割后的主问题重优化时限，默认20秒；首次主搜索连续使用扣除航次验证预留后的剩余时间；
 - `--lbbd-voyage-time-limit`：单个航次精确排级子问题的时限。
 
@@ -63,6 +65,9 @@ python -X utf8 -B example/generate_diverse_voyages_case.py --copies 3 --overwrit
 python -X utf8 -B benchmark_voyage_plans.py --input example/diverse_voyages_3x/input_data.json --large-plan example/diverse_voyages_3x/large_plan.csv --total-time-limit 120 --solver-threads 1
 python -X utf8 -B benchmark_logic_benders.py --input example/diverse_voyages_3x/input_data.json --large-plan example/diverse_voyages_3x/large_plan.csv --total-time-limit 120 --solver-threads 1 --compare-direct
 python -X utf8 -B benchmark_profile_benders.py --input example/many_groups_6v_12g/input_data.json --large-plan example/many_groups_6v_12g/large_plan.csv --total-time-limit 120 --solver-threads 1
+python -X utf8 -B benchmark_selective_benders.py --input example/many_groups_6v_12g/input_data.json --large-plan example/many_groups_6v_12g/large_plan.csv --total-time-limit 120 --solver-threads 1
+python -X utf8 -B example/generate_natural_conflict_case.py --overwrite
+python -X utf8 -B benchmark_selective_benders.py --input example/natural_conflict_peak/input_data.json --large-plan example/natural_conflict_peak/large_plan.csv --total-time-limit 90 --solver-threads 1 --output outputs/selective_natural_conflict_peak_90s.json
 ```
 
 ## 输出
@@ -81,10 +86,11 @@ python -X utf8 -B benchmark_profile_benders.py --input example/many_groups_6v_12
 - `yard_planning/voyage_plan_column_generation.py`：完整航次外层列生成、内层局部模式定价、严格认证和整数恢复；
 - `yard_planning/voyage_resource_benders.py`：航次—排资源 LBBD 主问题、航次子问题与逻辑割；
 - `yard_planning/profile_resource_benders.py`：排资源类型聚合主问题、共享物理资源池、快速足迹解聚、全局精确反聚合子问题及条件逻辑割；
+- `yard_planning/selective_resource_benders.py`：选择性整数资源状态与排数主问题、持久化联合精确排级 recourse、物理容量证书与单调 IIS 后备割、条件最优性割、冲突定向可行修复及受限排级邻域上界改进；
 - `yard_planning/logic_benders.py`：LBBD 的稳定公共导入入口；
 - `yard_planning/direct_milp.py`：M0 紧凑排位置模型；
 - `yard_planning/gurobi_backend.py`：统一 Gurobi 接口；
 - `adapters/planning_input.py`：业务输入清洗与模型数据构造；
 - `yard_planning/output_validator.py`：独立于求解模型的结果复核。
 
-数学模型与算法边界见 [MODEL_SCOPE.md](MODEL_SCOPE.md)，多样化算例生成规则见 [example/diverse_voyages_3x/README.md](example/diverse_voyages_3x/README.md)，当前对照结果见 [example/diverse_voyages_3x/benchmark_120s.md](example/diverse_voyages_3x/benchmark_120s.md)。
+数学模型与算法边界见 [MODEL_SCOPE.md](MODEL_SCOPE.md)，多样化算例生成规则见 [example/diverse_voyages_3x/README.md](example/diverse_voyages_3x/README.md)，自然高峰冲突算例见 [example/natural_conflict_peak/README.md](example/natural_conflict_peak/README.md)，当前对照结果见 [example/diverse_voyages_3x/benchmark_120s.md](example/diverse_voyages_3x/benchmark_120s.md)。

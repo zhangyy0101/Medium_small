@@ -19,6 +19,9 @@ from yard_planning.logic_benders import (
 from yard_planning.profile_resource_benders import (
     ProfileResourceBendersPlanner,
 )
+from yard_planning.selective_resource_benders import (
+    SelectiveResourceBendersPlanner,
+)
 from yard_planning.planner import (
     ColumnGenerationConfig,
     write_selected_locations,
@@ -45,12 +48,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-name", default=None)
     parser.add_argument(
         "--solver",
-        choices=("cg", "direct", "lbbd", "lbbd_profile"),
+        choices=(
+            "cg",
+            "direct",
+            "lbbd",
+            "lbbd_profile",
+            "lbbd_selective",
+        ),
         default="cg",
         help=(
             "cg runs column generation; direct runs M0; lbbd runs the "
             "capacity- and conflict-strengthened logic-based Benders solver; "
-            "lbbd_profile runs the separate row-profile aggregation variant."
+            "lbbd_profile runs the separate row-profile aggregation variant; "
+            "lbbd_selective runs selective resource-state LBBD with exact "
+            "row recourse, logic cuts, conflict repair, and row-neighbourhood "
+            "upper-bound improvement."
         ),
     )
     parser.add_argument("--voyages", nargs="+", default=None, help="Optional voyage subset; default is every voyage in the large plan.")
@@ -123,12 +135,12 @@ def main() -> None:
     stage_start = perf_counter()
     if args.solver == "direct":
         planner = DirectMilpPlanner(inputs.problem, config)
-    elif args.solver in {"lbbd", "lbbd_profile"}:
-        planner_class = (
-            ProfileResourceBendersPlanner
-            if args.solver == "lbbd_profile"
-            else LogicBendersPlanner
-        )
+    elif args.solver in {"lbbd", "lbbd_profile", "lbbd_selective"}:
+        planner_class = {
+            "lbbd": LogicBendersPlanner,
+            "lbbd_profile": ProfileResourceBendersPlanner,
+            "lbbd_selective": SelectiveResourceBendersPlanner,
+        }[args.solver]
         planner = planner_class(
             inputs.problem,
             config,

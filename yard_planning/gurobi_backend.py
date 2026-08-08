@@ -58,6 +58,9 @@ class GurobiModel:
     def setMinimize(self) -> None:
         self._model.ModelSense = self._gp.GRB.MINIMIZE
 
+    def setMaximize(self) -> None:
+        self._model.ModelSense = self._gp.GRB.MAXIMIZE
+
     def setParam(self, name: str, value: object) -> None:
         self._model.setParam(name, value)
 

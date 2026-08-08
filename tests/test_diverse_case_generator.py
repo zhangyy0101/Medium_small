@@ -13,6 +13,9 @@ from example.generate_diverse_voyages_case import (
     build_case,
 )
 from example.generate_many_groups_case import build_case as build_many_groups_case
+from example.generate_natural_conflict_case import (
+    build_case as build_natural_conflict_case,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -106,6 +109,53 @@ class ManyGroupsCaseGeneratorTests(unittest.TestCase):
                 profile["expanded_size_totals"],
             )
             self.assertEqual(demand, profile["expanded_size_totals"])
+
+
+class NaturalConflictCaseGeneratorTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.adapter, cls.large_plan, cls.manifest = (
+            build_natural_conflict_case(
+                ROOT / "example" / "input_data.json",
+                ROOT / "example" / "large_plan.csv",
+                volume_scale=1.4,
+                forty_five_share=0.005,
+                voyage_copies=3,
+            )
+        )
+
+    def test_peak_case_is_diversified_and_contains_edge_demand(self) -> None:
+        self.assertEqual(6, self.manifest["detailed_export_voyage_count"])
+        self.assertEqual(3137, self.manifest["declared_export_container_rows"])
+        self.assertEqual(81, self.manifest["total_export_group_count"])
+        self.assertGreater(self.manifest["export_size_totals"]["45"], 0)
+        ratios = {
+            profile["target_to_source_ratio"]
+            for profile in self.manifest["voyage_profiles"].values()
+        }
+        self.assertGreater(len(ratios), 1)
+
+    def test_peak_plan_uses_new_qty_and_preserves_planned_identity(self) -> None:
+        voyage_column = "voy_id"
+        normalized = self.large_plan[voyage_column].map(normalize_voyage_id)
+        for voyage in self.manifest["detailed_export_voyages"]:
+            rows = self.large_plan.loc[normalized.eq(voyage)]
+            self.assertFalse(rows.empty)
+            self.assertTrue(
+                rows["planned_qty"].eq(
+                    rows["snapshot_qty"].fillna(0) + rows["new_qty"]
+                ).all()
+            )
+            documents = self.adapter.vessel_containers[voyage]["doc_cntrs"]
+            demand = documents["IYC_CSZ_CSIZECD"].map(
+                lambda value: "40"
+                if normalize_container_size(value) == "45"
+                else normalize_container_size(value)
+            ).value_counts()
+            planned = rows.groupby(rows["size"].map(lambda value: str(int(float(value)))))[
+                "new_qty"
+            ].sum()
+            self.assertEqual(demand.to_dict(), planned.astype(int).to_dict())
 
 
 if __name__ == "__main__":

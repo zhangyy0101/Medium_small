@@ -19,6 +19,9 @@ from yard_planning.logic_benders import (
 from yard_planning.profile_resource_benders import (
     ProfileResourceBendersPlanner,
 )
+from yard_planning.selective_resource_benders import (
+    SelectiveResourceBendersPlanner,
+)
 from yard_planning.planner import (
     ColumnGenerationConfig,
     YardPlanningBase,
@@ -554,6 +557,205 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             "profile_lbbd_aggregate_optimality_cut_count",
             profile.diagnostics,
         )
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_selective_resource_benders_matches_m0_on_small_case(
+        self,
+    ) -> None:
+        config = ColumnGenerationConfig(
+            total_time_limit=20.0,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        direct = DirectMilpPlanner(make_small_problem(), config).solve()
+        selective = SelectiveResourceBendersPlanner(
+            make_small_problem(),
+            config,
+            LogicBendersConfig(
+                max_iterations=10,
+                master_time_limit=3.0,
+                voyage_time_limit=3.0,
+            ),
+        ).solve()
+        self.assertTrue(
+            selective.diagnostics["independent_solution_validation"][
+                "passed"
+            ]
+        )
+        self.assertAlmostEqual(
+            direct.diagnostics["final_business_objective"],
+            selective.diagnostics["final_business_objective"],
+            places=9,
+        )
+        self.assertEqual(
+            selective.diagnostics["algorithm"],
+            "selective_resource_state_lbbd_gurobi",
+        )
+        stats = selective.diagnostics["selective_lbbd_master"]
+        self.assertEqual(
+            stats["selected_profile_state_integer_count"]
+            + stats["relaxed_profile_state_count"],
+            stats["profile_owner_integer_count"],
+        )
+        self.assertEqual(
+            stats["integer_row_count_count"]
+            + stats["relaxed_row_count_count"],
+            stats["operational_bay_row_count_count"],
+        )
+        self.assertIn("tightened_area_activation_count", stats)
+        self.assertGreaterEqual(stats["tightened_area_activation_count"], 0)
+        self.assertGreater(stats["area_cardinality_cover_count"], 0)
+        self.assertEqual(
+            stats["area_cardinality_cover_count"],
+            selective.diagnostics["planned_group_count"],
+        )
+        self.assertTrue(
+            selective.diagnostics["selective_lbbd_master_start"][
+                "formal_row_count_integrality_restored"
+            ]
+        )
+        self.assertNotIn("primal_support_state_integer_count", stats)
+
+    def test_selective_recourse_fixes_quantities_not_profile_states(
+        self,
+    ) -> None:
+        planner = SelectiveResourceBendersPlanner.__new__(
+            SelectiveResourceBendersPlanner
+        )
+        self.assertEqual(planner._global_fixed_profile_states(), ())
+        self.assertEqual(planner._logic_cut_profile_states(), ())
+
+    def test_selective_large_iis_skips_auxiliary_capacity_mip(self) -> None:
+        planner = SelectiveResourceBendersPlanner.__new__(
+            SelectiveResourceBendersPlanner
+        )
+        planner._resource_capacity_cache = {}
+        core = tuple((f"G{index}", "A|01") for index in range(65))
+        result = planner._certify_core_resource_capacity(core, 1.0)
+        self.assertFalse(result["certified"])
+        self.assertEqual(result["status"], "skipped_large_IIS_core")
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_selective_monotone_iis_cut_is_deduplicated(self) -> None:
+        planner = SelectiveResourceBendersPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(verbose=False),
+        )
+        planner._prepare_decomposition()
+        planner._prepare_profiles()
+        master, variables, _stats = planner._build_profile_master()
+        try:
+            keys = tuple(sorted(variables["quantity"]))[:2]
+            quantities = {key: 1 for key in keys}
+            signatures = set()
+            added, binary_count = (
+                planner._add_monotone_iis_feasibility_cut(
+                    master,
+                    variables,
+                    quantities,
+                    keys,
+                    1,
+                    signatures,
+                )
+            )
+            self.assertTrue(added)
+            self.assertEqual(binary_count, len(keys))
+            duplicate, duplicate_binary_count = (
+                planner._add_monotone_iis_feasibility_cut(
+                    master,
+                    variables,
+                    quantities,
+                    keys,
+                    2,
+                    signatures,
+                )
+            )
+            self.assertFalse(duplicate)
+            self.assertEqual(duplicate_binary_count, 0)
+        finally:
+            planner._free_gurobi_model(master)
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_selective_conflict_repair_relocates_an_infeasible_point(
+        self,
+    ) -> None:
+        planner = SelectiveResourceBendersPlanner(
+            make_two_voyage_problem(),
+            ColumnGenerationConfig(
+                total_time_limit=10.0,
+                mip_gap=0.0,
+                solver_threads=1,
+                verbose=False,
+            ),
+        )
+        planner._prepare_decomposition()
+        planner._prepare_profiles()
+        quantities = {
+            ("G1", "A|01"): 2,
+            ("G2", "A|01"): 2,
+        }
+        repair = planner._solve_conflict_directed_repair(
+            quantities,
+            tuple(quantities),
+            5.0,
+        )
+        self.assertTrue(repair["feasible"])
+        self.assertEqual(repair["relocated_boxes"], 2)
+        self.assertTrue(repair["validation"]["passed"])
+        used_bays = {
+            planner._columns[index].bay_key
+            for index, value in repair["selected"].items()
+            if value > 0
+        }
+        self.assertEqual(used_bays, {"A|01", "A|03"})
+        improvement = planner._solve_exact_restricted_primal(
+            repair["selected"],
+            repair["imports"],
+            tuple(quantities),
+            5.0,
+        )
+        self.assertTrue(improvement["feasible"])
+        self.assertEqual(improvement["optimized_group_count"], 1)
+        self.assertLess(
+            improvement["candidate_row_location_count"],
+            len(planner._columns),
+        )
+        self.assertLessEqual(
+            improvement["objective"], repair["objective"] + 1e-9
+        )
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_selective_resource_capacity_certificate_is_valid(self) -> None:
+        planner = SelectiveResourceBendersPlanner(
+            make_two_voyage_problem(),
+            ColumnGenerationConfig(
+                solver_threads=1,
+                verbose=False,
+            ),
+        )
+        planner._prepare_decomposition()
+        planner._prepare_profiles()
+        core = (("G1", "A|01"), ("G2", "A|01"))
+        certificate = planner._certify_core_resource_capacity(core, 3.0)
+        self.assertTrue(certificate["certified"])
+        self.assertEqual(certificate["capacity_upper_bound"], 2)
+        master, variables, _stats = planner._build_profile_master()
+        try:
+            cut = planner._add_certified_feasibility_cut(
+                master,
+                variables,
+                {key: 2 for key in core},
+                core,
+                1,
+                set(),
+            )
+            self.assertTrue(cut["added"])
+            self.assertEqual(cut["kind"], "IIS_physical_resource_capacity")
+            self.assertEqual(cut["binary_count"], 0)
+            self.assertEqual(cut["capacity_upper_bound"], 2)
+        finally:
+            planner._free_gurobi_model(master)
 
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
     def test_profile_global_oracle_exactly_disaggregates_master_point(

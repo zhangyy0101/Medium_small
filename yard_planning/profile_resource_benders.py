@@ -937,6 +937,8 @@ class ProfileResourceBendersPlanner(VoyageResourceBendersPlanner):
                 )
             )
 
+        area_assignment_upper: dict[tuple, int] = {}
+        tightened_area_activation_count = 0
         for key, use in area_use.items():
             operational_key, area_no = key
             q_keys = [
@@ -950,8 +952,21 @@ class ProfileResourceBendersPlanner(VoyageResourceBendersPlanner):
                 self.group_demand[group_id]
                 for group_id in self._operational_groups[operational_key]
             )
+            assignment_upper = min(
+                int(demand),
+                sum(int(self._quantity_upper[q_key]) for q_key in q_keys),
+            )
+            if assignment_upper <= 0:
+                raise ValueError(
+                    "profile LBBD operational group has an unusable area: "
+                    f"operational_key={operational_key}, area={area_no}"
+                )
+            area_assignment_upper[key] = assignment_upper
+            tightened_area_activation_count += int(
+                assignment_upper < int(demand)
+            )
             constraints["area_use_upper"][key] = model.addConstr(
-                assigned <= int(demand) * use,
+                assigned <= assignment_upper * use,
                 name=(
                     f"profile_area_upper_"
                     f"{self._key_name((*operational_key, area_no))}"
@@ -963,6 +978,43 @@ class ProfileResourceBendersPlanner(VoyageResourceBendersPlanner):
                     f"profile_area_lower_"
                     f"{self._key_name((*operational_key, area_no))}"
                 ),
+            )
+
+        for operational_key, group_ids in sorted(
+            self._operational_groups.items()
+        ):
+            keys = sorted(
+                key for key in area_use if key[0] == operational_key
+            )
+            demand = sum(self.group_demand[group_id] for group_id in group_ids)
+            cumulative_capacity = 0
+            minimum_area_count = 0
+            for key in sorted(
+                keys,
+                key=lambda candidate: (
+                    -area_assignment_upper[candidate],
+                    repr(candidate),
+                ),
+            ):
+                cumulative_capacity += area_assignment_upper[key]
+                minimum_area_count += 1
+                if cumulative_capacity >= demand:
+                    break
+            if cumulative_capacity < demand:
+                raise ValueError(
+                    "profile LBBD aggregate area capacity is insufficient: "
+                    f"operational_key={operational_key}, demand={demand}, "
+                    f"upper={cumulative_capacity}"
+                )
+            constraints["area_cardinality_cover"][operational_key] = (
+                model.addConstr(
+                    quicksum(area_use[key] for key in keys)
+                    >= minimum_area_count,
+                    name=(
+                        f"profile_area_cardinality_"
+                        f"{self._key_name(operational_key)}"
+                    ),
+                )
             )
 
         for voyage_id in self._voyages:
@@ -1039,6 +1091,12 @@ class ProfileResourceBendersPlanner(VoyageResourceBendersPlanner):
             "row_capacity_envelope_count": len(constraints["row_cover"]),
             "row_conflict_clique_count": clique_count,
             "row_conflict_hall_capacity_count": clique_capacity_count,
+            "tightened_area_activation_count": (
+                tightened_area_activation_count
+            ),
+            "area_cardinality_cover_count": len(
+                constraints["area_cardinality_cover"]
+            ),
         }
         return model, variables, stats
 
@@ -1113,6 +1171,14 @@ class ProfileResourceBendersPlanner(VoyageResourceBendersPlanner):
                 in self._owner_keys_by_template[template_id]
             )
         )
+
+    def _global_fixed_profile_states(self) -> tuple[ProfileState, ...]:
+        """Profile counts fixed by the exact joint recourse oracle."""
+        return self._profile_states
+
+    def _logic_cut_profile_states(self) -> tuple[ProfileState, ...]:
+        """Integer profile states that define a conditional logic cut."""
+        return self._profile_states
 
     def _solve_footprint_matching(
         self,
@@ -1601,7 +1667,7 @@ class ProfileResourceBendersPlanner(VoyageResourceBendersPlanner):
             )
 
         profile_balance = {}
-        for state in self._profile_states:
+        for state in self._global_fixed_profile_states():
             options = self._owner_options_for_state(state)
             profile_balance[state] = model.addConstr(
                 quicksum(owner[owner_key] for owner_key in options) == 0.0,
@@ -1824,6 +1890,11 @@ class ProfileResourceBendersPlanner(VoyageResourceBendersPlanner):
             return result
         if status == "infeasible":
             try:
+                self._set_gurobi_param(
+                    subproblem.model,
+                    "TimeLimit",
+                    min(2.0, max(0.1, float(time_limit))),
+                )
                 subproblem.model._model.computeIIS()
                 result["conflict_quantity_keys"] = tuple(
                     sorted(
@@ -1884,7 +1955,7 @@ class ProfileResourceBendersPlanner(VoyageResourceBendersPlanner):
             sorted(
                 core_profile_states
                 if core_profile_states
-                else self._profile_states
+                else self._logic_cut_profile_states()
             )
         )
         signature = (
@@ -2068,7 +2139,9 @@ class ProfileResourceBendersPlanner(VoyageResourceBendersPlanner):
             for variable in variables:
                 model.setVarObjective(variable, 0.0)
             model.update()
-            feasibility_allowance = min(15.0, 0.55 * allowance, allowance)
+            feasibility_allowance = self._master_feasibility_slice(
+                allowance
+            )
             self._set_gurobi_param(
                 model, "TimeLimit", max(0.01, feasibility_allowance)
             )
@@ -2099,6 +2172,10 @@ class ProfileResourceBendersPlanner(VoyageResourceBendersPlanner):
                 model, "SolutionLimit", 2_000_000_000
             )
             result["seconds"] = round(perf_counter() - started, 3)
+
+    @staticmethod
+    def _master_feasibility_slice(allowance: float) -> float:
+        return min(15.0, 0.55 * allowance, allowance)
 
     def _base_profile_diagnostics(self) -> dict:
         diagnostics = super()._base_diagnostics()
