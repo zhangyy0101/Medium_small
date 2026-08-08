@@ -53,6 +53,8 @@ def _selective_summary(diagnostics: dict) -> dict:
         "selective_lbbd_best_master_round",
         "selective_lbbd_feasibility_cut_count",
         "selective_lbbd_optimality_cut_count",
+        "selective_lbbd_local_optimality_cut_count",
+        "selective_lbbd_global_optimality_cut_count",
         "selective_lbbd_cut_binary_count",
         "selective_lbbd_bound_tightening_cut_count",
         "selective_lbbd_oracle_build_seconds",
@@ -66,11 +68,15 @@ def _selective_summary(diagnostics: dict) -> dict:
         "selective_lbbd_restricted_primal_success_count",
         "selective_lbbd_restricted_primal_seconds",
         "selective_lbbd_restricted_primal_solve_limit",
+        "selective_lbbd_voyage_bound_solve_count",
+        "selective_lbbd_voyage_bound_cache_hits",
+        "selective_lbbd_voyage_bound_seconds",
         "selective_lbbd_preparation_seconds",
         "selective_lbbd_master_build_seconds",
         "selective_lbbd_master_start",
         "selective_lbbd_primal_start",
         "selective_lbbd_total_solve_seconds",
+        "selective_lbbd_time_budget_policy",
     ):
         if diagnostics.get(key) is not None:
             summary[key] = diagnostics[key]
@@ -82,6 +88,9 @@ def _selective_summary(diagnostics: dict) -> dict:
     )
     summary["selective_lbbd_oracle_records"] = diagnostics.get(
         "selective_lbbd_oracle_records", []
+    )
+    summary["selective_lbbd_voyage_bound_records"] = diagnostics.get(
+        "selective_lbbd_voyage_bound_records", []
     )
     summary["selective_lbbd_repair_records"] = diagnostics.get(
         "selective_lbbd_repair_records", []
@@ -108,11 +117,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--total-time-limit", type=float, default=120.0)
     parser.add_argument("--solver-threads", type=int, default=1)
     parser.add_argument("--max-cut-rounds", type=int, default=40)
-    parser.add_argument(
-        "--master-feasibility-time-limit", type=float, default=30.0
-    )
-    parser.add_argument("--master-time-limit", type=float, default=20.0)
-    parser.add_argument("--recourse-time-limit", type=float, default=8.0)
     parser.add_argument("--compare-direct", action="store_true")
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
@@ -145,11 +149,6 @@ def main() -> None:
         config,
         LogicBendersConfig(
             max_iterations=args.max_cut_rounds,
-            master_feasibility_time_limit=(
-                args.master_feasibility_time_limit
-            ),
-            master_time_limit=args.master_time_limit,
-            voyage_time_limit=args.recourse_time_limit,
         ),
     ).solve()
     results = {

@@ -626,6 +626,43 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         self.assertEqual(planner._global_fixed_profile_states(), ())
         self.assertEqual(planner._logic_cut_profile_states(), ())
 
+    def test_selective_time_budget_scales_with_common_deadline(self) -> None:
+        small = SelectiveResourceBendersPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(total_time_limit=60.0, verbose=False),
+        )
+        large = SelectiveResourceBendersPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(total_time_limit=180.0, verbose=False),
+        )
+        self.assertAlmostEqual(
+            large._master_feasibility_slice(100.0),
+            3.0 * small._master_feasibility_slice(100.0),
+        )
+        self.assertAlmostEqual(
+            large._oracle_allowance(100.0),
+            3.0 * small._oracle_allowance(100.0),
+        )
+        self.assertAlmostEqual(
+            large._time_share("primal_polish"),
+            3.0 * small._time_share("primal_polish"),
+        )
+        self.assertAlmostEqual(
+            large._master_round_allowance(1, 100.0),
+            3.0 * small._master_round_allowance(1, 100.0),
+        )
+
+    def test_selective_iis_fallback_limit_scales_sublinearly(self) -> None:
+        planner = SelectiveResourceBendersPlanner.__new__(
+            SelectiveResourceBendersPlanner
+        )
+        planner._quantity_upper = range(10_000)
+        self.assertEqual(planner._monotone_iis_support_limit(), 300)
+        planner._quantity_upper = range(1)
+        self.assertEqual(planner._monotone_iis_support_limit(), 64)
+        planner._quantity_upper = range(1_000_000)
+        self.assertEqual(planner._monotone_iis_support_limit(), 512)
+
     def test_selective_large_iis_skips_auxiliary_capacity_mip(self) -> None:
         planner = SelectiveResourceBendersPlanner.__new__(
             SelectiveResourceBendersPlanner
@@ -740,6 +777,7 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         certificate = planner._certify_core_resource_capacity(core, 3.0)
         self.assertTrue(certificate["certified"])
         self.assertEqual(certificate["capacity_upper_bound"], 2)
+        self.assertGreater(certificate["typed_route_count"], 0)
         master, variables, _stats = planner._build_profile_master()
         try:
             cut = planner._add_certified_feasibility_cut(
@@ -756,6 +794,83 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             self.assertEqual(cut["capacity_upper_bound"], 2)
         finally:
             planner._free_gurobi_model(master)
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_selective_voyage_optimality_cut_has_local_support(self) -> None:
+        planner = SelectiveResourceBendersPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(
+                solver_threads=1,
+                verbose=False,
+            ),
+        )
+        planner._prepare_decomposition()
+        planner._prepare_profiles()
+        quantities = {
+            ("G1", "A|01"): 1,
+            ("G1", "A|03"): 2,
+            ("G2", "B|01"): 2,
+        }
+        bound = planner._solve_voyage_recourse_bound(
+            "V1", quantities, 3.0
+        )
+        self.assertTrue(bound["feasible"])
+        self.assertTrue(bound["optimal"])
+        master, variables, _stats = planner._build_profile_master()
+        try:
+            added, binary_count, support_count = (
+                planner._add_voyage_optimality_cut(
+                    master,
+                    variables,
+                    "V1",
+                    quantities,
+                    float(bound["bound"]),
+                    1,
+                    set(),
+                )
+            )
+            self.assertTrue(added)
+            self.assertEqual(support_count, len(quantities))
+            self.assertEqual(binary_count, support_count)
+            self.assertLess(
+                support_count,
+                len(variables["quantity"]),
+            )
+        finally:
+            planner._free_gurobi_model(master)
+            for subproblem in planner._voyage_subproblems.values():
+                planner._free_gurobi_model(subproblem.model)
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_selective_sparse_oracle_exactly_fixes_positive_support(
+        self,
+    ) -> None:
+        planner = SelectiveResourceBendersPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(
+                total_time_limit=20.0,
+                solver_threads=1,
+                verbose=False,
+            ),
+        )
+        planner._prepare_decomposition()
+        planner._prepare_profiles()
+        quantities = {
+            ("G1", "A|01"): 1,
+            ("G1", "A|03"): 2,
+            ("G2", "B|01"): 2,
+        }
+        result = planner._solve_exact_recourse(quantities, 5.0)
+        self.assertTrue(result["feasible"])
+        self.assertTrue(result["optimal"])
+        planner._validate_exact_quantities(
+            quantities, result["selected"]
+        )
+        self.assertEqual(result["support_quantity_count"], 3)
+        self.assertLess(
+            result["support_row_location_count"], len(planner._columns)
+        )
+        self.assertIsNone(planner._global_profile_subproblem)
 
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
     def test_profile_global_oracle_exactly_disaggregates_master_point(

@@ -141,17 +141,23 @@ def main() -> None:
             "lbbd_profile": ProfileResourceBendersPlanner,
             "lbbd_selective": SelectiveResourceBendersPlanner,
         }[args.solver]
-        planner = planner_class(
-            inputs.problem,
-            config,
-            LogicBendersConfig(
+        if args.solver == "lbbd_selective":
+            benders_config = LogicBendersConfig(
+                max_iterations=args.lbbd_max_iterations
+            )
+        else:
+            benders_config = LogicBendersConfig(
                 max_iterations=args.lbbd_max_iterations,
                 master_feasibility_time_limit=(
                     args.lbbd_master_feasibility_time_limit
                 ),
                 master_time_limit=args.lbbd_master_time_limit,
                 voyage_time_limit=args.lbbd_voyage_time_limit,
-            ),
+            )
+        planner = planner_class(
+            inputs.problem,
+            config,
+            benders_config,
         )
     else:
         planner = VoyagePlanColumnGenerationPlanner(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections import Counter, defaultdict
+from itertools import combinations
 from time import perf_counter
 
 from .profile_resource_benders import (
@@ -24,6 +25,23 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
     profile solver's matching and per-voyage verification chain.
     """
 
+    # Fractions of the single wall-clock limit.  These are scale-free phase
+    # envelopes, not reservations: unused time immediately returns to the
+    # common pool and every solve is also capped by the time still available.
+    _TIME_SHARES = {
+        "initial_feasibility": 0.22,
+        "formal_master_reserve": 0.35,
+        "oracle": 0.06,
+        "initial_repair": 0.13,
+        "incumbent_repair": 0.08,
+        "initial_master": 0.18,
+        "later_master": 0.20,
+        "local_bounds": 0.04,
+        "primal_polish": 0.08,
+        "capacity_separation": 0.015,
+        "safety_margin": 0.01,
+    }
+
     def __init__(self, problem, config=None, benders_config=None) -> None:
         super().__init__(problem, config, benders_config)
         self._selected_profile_states: tuple[ProfileState, ...] = ()
@@ -32,6 +50,8 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
         self._selective_oracle_solve_count = 0
         self._selective_oracle_cache_hits = 0
         self._selective_oracle_seconds = 0.0
+        self._selective_oracle_build_seconds = 0.0
+        self._selective_oracle_variable_count = 0
         self._conflict_repair_solve_count = 0
         self._conflict_repair_success_count = 0
         self._conflict_repair_seconds = 0.0
@@ -43,6 +63,23 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
         self._resource_capacity_cache: dict[tuple[QuantityKey, ...], dict] = {}
         self._resource_capacity_solve_count = 0
         self._resource_capacity_seconds = 0.0
+        self._voyage_bound_cache: dict[tuple, dict] = {}
+        self._voyage_bound_solve_count = 0
+        self._voyage_bound_cache_hits = 0
+        self._voyage_bound_seconds = 0.0
+
+    def _total_time_limit(self) -> float:
+        total = float(self.config.total_time_limit)
+        if total <= 0.0:
+            total = max(2.0, 2.0 * float(self.config.mip_time_limit))
+        return total
+
+    def _time_share(self, phase: str) -> float:
+        return self._TIME_SHARES[phase] * self._total_time_limit()
+
+    def _solve_threshold(self) -> float:
+        """Small scale-aware guard against launching unusable solver calls."""
+        return max(0.05, 0.002 * self._total_time_limit())
 
     def _prepare_profiles(self) -> None:
         super()._prepare_profiles()
@@ -246,9 +283,17 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
         self._selective_master_variables = variables
         return model, variables, stats
 
-    @staticmethod
-    def _master_feasibility_slice(allowance: float) -> float:
-        return min(13.0, 0.45 * allowance, allowance)
+    def _master_feasibility_slice(self, allowance: float) -> float:
+        """Scale the feasibility cap with the common wall-clock budget.
+
+        ``SolutionLimit=1`` still stops immediately after a skeleton is
+        found; the proportional cap only gives harder instances additional
+        search without identifying an instance class in the algorithm.
+        """
+        return min(
+            float(allowance),
+            self._time_share("initial_feasibility"),
+        )
 
     def _initialize_master_incumbent(self, model, deadline: float) -> dict:
         """Probe a coarse row relaxation, then restore the formal master.
@@ -266,10 +311,14 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
         original_types = tuple(variable.VType for variable in row_variables)
         for variable in row_variables:
             variable.VType = "C"
+        self._try_set_gurobi_param(model, "Heuristics", 1.0)
+        self._try_set_gurobi_param(model, "PumpPasses", 20)
         model.update()
         try:
             result = super()._initialize_master_incumbent(model, deadline)
         finally:
+            self._try_set_gurobi_param(model, "Heuristics", 0.5)
+            self._try_set_gurobi_param(model, "PumpPasses", -1)
             for variable, variable_type in zip(
                 row_variables, original_types
             ):
@@ -297,6 +346,15 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
         time_limit: float,
         selected_hint: Counter[int] | None = None,
     ) -> dict:
+        """Solve the exact joint row oracle only on the positive support.
+
+        Every omitted group-bay key is fixed to zero by the queried master
+        point, so removing its row-placement variables is an exact model
+        reduction.  Rebuilding this sparse model is substantially more
+        stable than constructing one all-candidate oracle before any solve.
+        """
+        from gurobipy import quicksum
+
         key = self._selective_assignment_key(quantities)
         cached = self._selective_oracle_cache.get(key)
         if cached is not None:
@@ -306,19 +364,155 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
             result["cached"] = True
             return result
         started = perf_counter()
-        result = super()._solve_global_profile_subproblem(
-            quantities,
-            {},
-            time_limit,
-            selected_hint,
+        positive_keys = tuple(
+            sorted(
+                quantity_key
+                for quantity_key, value in quantities.items()
+                if int(value) > 0
+            )
         )
-        result["total_seconds"] = perf_counter() - started
-        self._selective_oracle_solve_count += 1
-        self._selective_oracle_seconds += float(result["seconds"])
-        result["cached"] = False
-        if result["optimal"] or result["status"] == "infeasible":
-            self._selective_oracle_cache[key] = dict(result)
-        return result
+        global_indices = tuple(
+            sorted(
+                {
+                    index
+                    for quantity_key in positive_keys
+                    for index in self._candidate_indices_by_group_bay.get(
+                        quantity_key, ()
+                    )
+                }
+            )
+        )
+        result = {
+            "status": "not_solved",
+            "feasible": False,
+            "optimal": False,
+            "seconds": 0.0,
+            "selected": Counter(),
+            "objective": math.inf,
+            "bound": -math.inf,
+            "conflict_quantity_keys": (),
+            "conflict_profile_states": (),
+            "variable_count": 0,
+            "support_quantity_count": len(positive_keys),
+            "support_row_location_count": len(global_indices),
+            "cached": False,
+        }
+        if not global_indices:
+            result["status"] = "empty_positive_support"
+            result["total_seconds"] = perf_counter() - started
+            return result
+
+        row_locations = [self._columns[index] for index in global_indices]
+        model, variables, model_stats = self.build_compact_row_milp(
+            row_locations, GurobiModel, quicksum
+        )
+        self._selective_oracle_variable_count = max(
+            self._selective_oracle_variable_count,
+            int(model_stats["model_variable_count"]),
+        )
+        result["variable_count"] = int(
+            model_stats["model_variable_count"]
+        )
+        result["model"] = model_stats
+        try:
+            local_by_quantity: defaultdict[QuantityKey, list[int]] = (
+                defaultdict(list)
+            )
+            for local_index, global_index in enumerate(global_indices):
+                column = self._columns[global_index]
+                local_by_quantity[
+                    (column.group_id, column.bay_key)
+                ].append(local_index)
+            quantity_balance = {
+                quantity_key: model.addConstr(
+                    quicksum(
+                        variables["column"][local_index]
+                        for local_index
+                        in local_by_quantity[quantity_key]
+                    )
+                    == int(quantities[quantity_key]),
+                    name=(
+                        f"sparse_oracle_quantity_{quantity_key[0]}_"
+                        f"{self._key_name((quantity_key[1],))}"
+                    ),
+                )
+                for quantity_key in positive_keys
+            }
+            model.update()
+            row_penalty = self._row_activation_penalty()
+            for variable in model.getVars():
+                model.setVarObjective(
+                    variable,
+                    row_penalty
+                    if variable.VarName.startswith("use_group_row_")
+                    else 0.0,
+                )
+            hint = selected_hint or Counter()
+            for local_index, global_index in enumerate(global_indices):
+                variables["column"][local_index].Start = float(
+                    hint.get(global_index, 0)
+                )
+            model.update()
+            build_seconds = perf_counter() - started
+            self._selective_oracle_build_seconds += build_seconds
+            result["build_seconds"] = round(build_seconds, 4)
+            self._set_gurobi_param(model, "MIPGap", 0.0)
+            self._set_gurobi_param(model, "DualReductions", 0)
+            solve_allowance = float(time_limit) - (
+                perf_counter() - started
+            )
+            if solve_allowance <= self._solve_threshold():
+                result["status"] = "time_limit_during_build"
+                return result
+            self._set_gurobi_param(model, "TimeLimit", solve_allowance)
+            solve_started = perf_counter()
+            model.optimize()
+            result["seconds"] = perf_counter() - solve_started
+            result["status"] = self._gurobi_status_name(model)
+            result["feasible"] = self._gurobi_solution_count(model) > 0
+            result["optimal"] = result["status"] == "optimal"
+            result["bound"] = self._gurobi_dual_bound(model)
+            if result["feasible"]:
+                local_selected = self.selected_compact_row_values(
+                    model, variables
+                )
+                result["selected"] = Counter(
+                    {
+                        global_indices[local_index]: int(value)
+                        for local_index, value in local_selected.items()
+                        if int(value) > 0
+                    }
+                )
+                result["objective"] = self._gurobi_objective_value(model)
+                return result
+            if result["status"] == "infeasible":
+                iis_allowance = float(time_limit) - (
+                    perf_counter() - started
+                )
+                if iis_allowance > self._solve_threshold():
+                    try:
+                        self._set_gurobi_param(
+                            model, "TimeLimit", iis_allowance
+                        )
+                        model._model.computeIIS()
+                        result["conflict_quantity_keys"] = tuple(
+                            sorted(
+                                quantity_key
+                                for quantity_key, constraint
+                                in quantity_balance.items()
+                                if bool(constraint.IISConstr)
+                            )
+                        )
+                    except Exception:
+                        pass
+            return result
+        finally:
+            result["total_seconds"] = perf_counter() - started
+            self._selective_oracle_solve_count += 1
+            self._selective_oracle_seconds += float(result["seconds"])
+            if result["optimal"] or result["status"] == "infeasible":
+                self._selective_oracle_cache[key] = dict(result)
+            self._free_gurobi_model(model)
 
     def _validate_exact_quantities(
         self,
@@ -395,12 +589,34 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
         signatures.add(signature)
         return True, len(decreases)
 
+    def _monotone_iis_support_limit(self) -> int:
+        """Scale the fallback logic-cut support with the master dimension.
+
+        A fixed 64-key threshold discarded useful medium conflict sets in
+        larger instances.  The square-root rule admits those sets without
+        allowing a single IIS to add an unbounded number of binaries.
+        """
+        quantity_state_count = max(
+            1,
+            len(getattr(self, "_quantity_upper", {})),
+        )
+        return min(
+            512,
+            max(64, int(math.ceil(3.0 * math.sqrt(quantity_state_count)))),
+        )
+
     def _certify_core_resource_capacity(
         self,
         conflict_keys: tuple[QuantityKey, ...],
         time_limit: float,
     ) -> dict:
-        """Upper-bound an IIS core by exact physical-footprint packing."""
+        """Upper-bound a typed IIS core by exact footprint-flow packing.
+
+        The auxiliary MIP routes each quantity key only to compatible row
+        owners, caps every key by its valid master upper bound, and enforces
+        physical-footprint exclusivity.  Its maximization bound is therefore
+        a valid upper bound on the total master quantity carried by the core.
+        """
         from gurobipy import quicksum
 
         core = tuple(sorted(set(conflict_keys)))
@@ -418,6 +634,7 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                 "cached": False,
             }
         owner_capacity = {}
+        route_capacity = {}
         for key in core:
             for index in self._candidate_indices_by_group_bay.get(key, ()):
                 owner_key = self._owner_key_by_candidate[index]
@@ -425,15 +642,21 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                     owner_capacity.get(owner_key, 0),
                     int(self._candidate_capacity[index]),
                 )
+                route = (key, owner_key)
+                route_capacity[route] = max(
+                    route_capacity.get(route, 0),
+                    int(self._candidate_capacity[index]),
+                )
         result = {
             "status": "empty",
             "certified": False,
             "capacity_upper_bound": None,
             "owner_count": len(owner_capacity),
+            "typed_route_count": len(route_capacity),
             "seconds": 0.0,
             "cached": False,
         }
-        if not owner_capacity:
+        if not owner_capacity or not route_capacity:
             return result
         model = GurobiModel("selective_IIS_resource_capacity")
         self._configure_gurobi_output(model)
@@ -446,7 +669,6 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
         owner = {
             owner_key: model.addVar(
                 vtype="B",
-                obj=float(capacity),
                 name=(
                     f"core_owner_{owner_key[0]}_"
                     f"{self._key_name((owner_key[1],))}"
@@ -454,6 +676,46 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
             )
             for owner_key, capacity in sorted(owner_capacity.items())
         }
+        flow = {
+            route: model.addVar(
+                lb=0.0,
+                ub=float(
+                    min(
+                        int(capacity),
+                        int(self._quantity_upper[route[0]]),
+                    )
+                ),
+                vtype="I",
+                obj=1.0,
+                name=(
+                    f"core_flow_{route[0][0]}_"
+                    f"{self._key_name((route[0][1], str(route[1][0]), route[1][1]))}"
+                ),
+            )
+            for route, capacity in sorted(route_capacity.items())
+        }
+        routes_by_owner: defaultdict[object, list] = defaultdict(list)
+        routes_by_quantity: defaultdict[QuantityKey, list] = defaultdict(list)
+        for route, variable in flow.items():
+            routes_by_owner[route[1]].append(variable)
+            routes_by_quantity[route[0]].append(variable)
+        for owner_key, variable in owner.items():
+            model.addConstr(
+                quicksum(routes_by_owner[owner_key])
+                <= int(owner_capacity[owner_key]) * variable,
+                name=(
+                    f"core_owner_capacity_{owner_key[0]}_"
+                    f"{self._key_name((owner_key[1],))}"
+                ),
+            )
+        for key, routes in sorted(routes_by_quantity.items()):
+            model.addConstr(
+                quicksum(routes) <= int(self._quantity_upper[key]),
+                name=(
+                    f"core_quantity_upper_{key[0]}_"
+                    f"{self._key_name((key[1],))}"
+                ),
+            )
         owners_by_slot: defaultdict[object, list] = defaultdict(list)
         for owner_key, variable in owner.items():
             for slot in self._templates[owner_key[0]].slots:
@@ -486,6 +748,43 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
             self._resource_capacity_cache[core] = dict(result)
         return result
 
+    def _conflict_capacity_subsets(
+        self,
+        core: tuple[QuantityKey, ...],
+    ) -> tuple[tuple[QuantityKey, ...], ...]:
+        """Return a small deterministic Hall-separation family for an IIS."""
+        keys = tuple(sorted(set(core)))
+        subsets = {keys} if len(keys) <= 64 else set()
+        if 2 <= len(keys) <= 5:
+            for size in range(2, len(keys)):
+                subsets.update(combinations(keys, size))
+
+        structured: defaultdict[tuple, set[QuantityKey]] = defaultdict(set)
+        for key in keys:
+            group = self.groups_by_id[key[0]]
+            row_class = self._row_mix_key_for_group(group)
+            labels = (
+                ("bay", key[1]),
+                ("bay_class", key[1], row_class),
+                ("voyage", group.voyage_id),
+                ("row_class", row_class),
+                ("voyage_class", group.voyage_id, row_class),
+                ("size_class", group.size, row_class),
+            )
+            for label in labels:
+                structured[label].add(key)
+        subsets.update(
+            tuple(sorted(values))
+            for values in structured.values()
+            if 2 <= len(values) <= 64
+        )
+        return tuple(
+            sorted(
+                subsets,
+                key=lambda subset: (-len(subset), repr(subset)),
+            )
+        )
+
     def _add_certified_feasibility_cut(
         self,
         master,
@@ -505,18 +804,47 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                 if int(quantities.get(key, 0)) > 0
             )
         )
-        capacity = self._certify_core_resource_capacity(core, 1.5)
+        started = perf_counter()
+        candidate_cores = self._conflict_capacity_subsets(core)
+        separation_budget = self._time_share("capacity_separation")
+        candidate_budget = separation_budget / max(
+            1,
+            min(3, len(candidate_cores)),
+        )
+        capacity = {
+            "status": "not_attempted",
+            "certified": False,
+            "capacity_upper_bound": None,
+        }
+        cut_core = core
+        best_violation = 0
+        for candidate_core in candidate_cores:
+            remaining = separation_budget - (perf_counter() - started)
+            if remaining <= self._solve_threshold():
+                break
+            candidate = self._certify_core_resource_capacity(
+                candidate_core,
+                min(candidate_budget, remaining),
+            )
+            candidate_upper = candidate.get("capacity_upper_bound")
+            if candidate_upper is None:
+                continue
+            candidate_total = sum(
+                int(quantities[key]) for key in candidate_core
+            )
+            violation = candidate_total - int(candidate_upper)
+            if violation > best_violation:
+                best_violation = violation
+                capacity = candidate
+                cut_core = candidate_core
+            elif candidate_core == core and not capacity.get("certified"):
+                capacity = candidate
         upper = capacity.get("capacity_upper_bound")
-        incumbent_total = sum(int(quantities[key]) for key in core)
-        signature = ("resource_capacity", core, upper)
-        if (
-            core
-            and upper is not None
-            and incumbent_total > int(upper)
-            and signature not in signatures
-        ):
+        incumbent_total = sum(int(quantities[key]) for key in cut_core)
+        signature = ("typed_resource_capacity", cut_core, upper)
+        if best_violation > 0 and signature not in signatures:
             master.addConstr(
-                quicksum(variables["quantity"][key] for key in core)
+                quicksum(variables["quantity"][key] for key in cut_core)
                 <= int(upper),
                 name=f"selective_resource_capacity_{cut_index}",
             )
@@ -528,6 +856,21 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                 "kind": "IIS_physical_resource_capacity",
                 "capacity_upper_bound": int(upper),
                 "incumbent_core_quantity": incumbent_total,
+                "capacity_core": cut_core,
+                "capacity_certificate": capacity,
+            }
+        monotone_support_limit = self._monotone_iis_support_limit()
+        if len(core) > monotone_support_limit:
+            return {
+                "added": False,
+                "binary_count": 0,
+                "kind": "large_IIS_without_compact_certificate",
+                "monotone_support_limit": monotone_support_limit,
+                "capacity_upper_bound": upper,
+                "incumbent_core_quantity": sum(
+                    int(quantities[key]) for key in core
+                ),
+                "capacity_core": core,
                 "capacity_certificate": capacity,
             }
         added, binary_count = self._add_monotone_iis_feasibility_cut(
@@ -542,10 +885,143 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
             "added": added,
             "binary_count": binary_count,
             "kind": "monotone_IIS_capacity_feasibility",
+            "monotone_support_limit": monotone_support_limit,
             "capacity_upper_bound": upper,
-            "incumbent_core_quantity": incumbent_total,
+            "incumbent_core_quantity": sum(
+                int(quantities[key]) for key in core
+            ),
+            "capacity_core": core,
             "capacity_certificate": capacity,
         }
+
+    def _selected_row_cost_by_voyage(
+        self,
+        selected: Counter[int],
+    ) -> dict[str, float]:
+        used_rows: defaultdict[str, set[tuple]] = defaultdict(set)
+        for index, value in selected.items():
+            if int(value) <= 0:
+                continue
+            column = self._columns[index]
+            used_rows[column.voyage_id].add(
+                (
+                    column.group_key,
+                    column.bay_key,
+                    self._anchor_row(column),
+                )
+            )
+        penalty = self._row_activation_penalty()
+        return {
+            voyage_id: penalty * len(rows)
+            for voyage_id, rows in used_rows.items()
+        }
+
+    def _solve_voyage_recourse_bound(
+        self,
+        voyage_id: str,
+        quantities: dict[QuantityKey, int],
+        time_limit: float,
+        selected_hint: Counter[int] | None = None,
+    ) -> dict:
+        voyage_quantities = {
+            key: int(value)
+            for key, value in quantities.items()
+            if self.groups_by_id[key[0]].voyage_id == voyage_id
+        }
+        cache_key = (voyage_id, tuple(sorted(voyage_quantities.items())))
+        cached = self._voyage_bound_cache.get(cache_key)
+        if cached is not None:
+            self._voyage_bound_cache_hits += 1
+            return {**cached, "cached": True, "seconds": 0.0}
+        active_owners = {
+            owner_key
+            for owner_key in self._owner_key_by_candidate.values()
+            if self._templates[owner_key[0]].voyage_id == voyage_id
+        }
+        hint = selected_hint or Counter()
+        routing_hint = {
+            index: float(value)
+            for index, value in hint.items()
+            if int(value) > 0
+            and self._columns[index].voyage_id == voyage_id
+        }
+        result = self._solve_voyage_subproblem(
+            voyage_id,
+            voyage_quantities,
+            active_owners,
+            routing_hint,
+            time_limit,
+        )
+        self._voyage_bound_solve_count += 1
+        self._voyage_bound_seconds += float(result["seconds"])
+        result["cached"] = False
+        if result["optimal"] or result["status"] == "infeasible":
+            self._voyage_bound_cache[cache_key] = dict(result)
+        return result
+
+    def _add_voyage_optimality_cut(
+        self,
+        master,
+        variables: dict,
+        voyage_id: str,
+        quantities: dict[QuantityKey, int],
+        lower_bound: float,
+        cut_index: int,
+        signatures: set[tuple],
+    ) -> tuple[bool, int, int]:
+        """Condition a valid standalone-voyage bound on its quantity vector."""
+        from gurobipy import quicksum
+
+        keys = tuple(
+            sorted(
+                key
+                for key, value in quantities.items()
+                if int(value) > 0
+                and self.groups_by_id[key[0]].voyage_id == voyage_id
+            )
+        )
+        signature = (
+            "voyage_optimality",
+            voyage_id,
+            tuple((key, int(quantities[key])) for key in keys),
+            round(float(lower_bound), 10),
+        )
+        if not keys or signature in signatures:
+            return False, 0, len(keys)
+        changes = []
+        for position, key in enumerate(keys):
+            incumbent = int(quantities[key])
+            upper = int(self._quantity_upper[key])
+            decrease = master.addVar(
+                vtype="B",
+                name=(
+                    f"voyage_opt_{cut_index}_{voyage_id}_down_{position}"
+                ),
+            )
+            master.addConstr(
+                variables["quantity"][key]
+                >= incumbent - upper * decrease,
+                name=(
+                    f"voyage_opt_{cut_index}_{voyage_id}_lb_{position}"
+                ),
+            )
+            master.addConstr(
+                variables["quantity"][key]
+                <= incumbent - 1 + upper * (1 - decrease),
+                name=(
+                    f"voyage_opt_{cut_index}_{voyage_id}_ub_{position}"
+                ),
+            )
+            changes.append(decrease)
+        master.addConstr(
+            variables["theta"][voyage_id]
+            >= max(0.0, float(lower_bound))
+            * (1 - quicksum(changes)),
+            name=f"voyage_optimality_{cut_index}_{voyage_id}",
+        )
+        master.update()
+        signatures.add(signature)
+        return True, len(changes), len(keys)
 
     def _conflict_repair_candidate_indices(
         self,
@@ -638,6 +1114,7 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
         time_limit: float,
         selected_hint: Counter[int] | None = None,
         import_hint: Counter[tuple[str, str, str]] | None = None,
+        secure_first_feasible: bool = False,
     ) -> dict:
         """Repair an infeasible master point in a restricted exact-row MIP.
 
@@ -754,7 +1231,31 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
             self._try_set_gurobi_param(model, "PumpPasses", 10)
             self._try_set_gurobi_param(model, "RINS", 10)
             self._set_gurobi_param(model, "MIPGap", 0.0)
+            if secure_first_feasible:
+                self._set_gurobi_param(model, "SolutionLimit", 1)
+            solve_started = perf_counter()
             model.optimize()
+            feasibility_seconds = perf_counter() - solve_started
+            improvement_seconds = 0.0
+            if (
+                secure_first_feasible
+                and self._gurobi_solution_count(model) > 0
+            ):
+                remaining_solve_time = (
+                    float(time_limit) - (perf_counter() - started)
+                )
+                if remaining_solve_time > self._solve_threshold():
+                    self._set_gurobi_param(
+                        model, "SolutionLimit", 2_000_000_000
+                    )
+                    self._set_gurobi_param(
+                        model, "TimeLimit", remaining_solve_time
+                    )
+                    improvement_started = perf_counter()
+                    model.optimize()
+                    improvement_seconds = (
+                        perf_counter() - improvement_started
+                    )
             result["status"] = self._gurobi_status_name(model)
             if self._gurobi_solution_count(model) <= 0:
                 return result
@@ -801,6 +1302,15 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                     "quantity_l1_change": int(l1_change),
                     "relocated_boxes": int(l1_change // 2),
                     "validation": validation,
+                    "secure_first_feasible": bool(
+                        secure_first_feasible
+                    ),
+                    "feasibility_search_seconds": round(
+                        feasibility_seconds, 4
+                    ),
+                    "same_model_improvement_seconds": round(
+                        improvement_seconds, 4
+                    ),
                 }
             )
             self._conflict_repair_success_count += 1
@@ -993,42 +1503,47 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
         after_feasibility_cut: bool = False,
     ) -> float:
         """Use bounded master slices so cuts, oracle, and repair can alternate."""
-        reserve = max(
-            4.0,
-            min(
-                15.0,
-                2.0 * float(self.benders_config.voyage_time_limit),
-                0.35 * remaining,
-            ),
+        future_work = max(
+            self._time_share("primal_polish"),
+            2.0 * self._time_share("oracle"),
         )
-        if after_feasibility_cut:
-            fraction = 0.65
-        elif int(master_round) == 1:
+        reserve = min(0.35 * remaining, future_work)
+        if int(master_round) == 1:
+            # The first incumbent is a cut-discovery point.  A shorter slice
+            # leaves enough time for at least one cut/reoptimize cycle and
+            # independent upper-bound improvement under the shared deadline.
+            fraction = 0.45
+        elif after_feasibility_cut:
             fraction = 0.65
         else:
             fraction = 0.55
+        phase = (
+            "initial_master"
+            if int(master_round) == 1
+            else "later_master"
+        )
         return max(
             0.01,
             min(
-                float(self.benders_config.master_time_limit),
+                self._time_share(phase),
                 fraction * remaining,
                 max(0.01, remaining - reserve),
             ),
         )
 
     def _oracle_allowance(self, remaining: float) -> float:
+        """Allocate oracle time from scale and live remaining time.
+
+        The allocation is proportional to the common experiment budget and
+        cannot consume more than half of what remains.  It therefore scales
+        without a case-specific per-oracle number of seconds.
+        """
         return max(
             0.01,
             min(
                 remaining,
-                max(
-                    2.0,
-                    min(
-                        6.0,
-                        float(self.benders_config.voyage_time_limit),
-                        0.50 * remaining,
-                    ),
-                ),
+                0.50 * remaining,
+                self._time_share("oracle"),
             ),
         )
 
@@ -1106,11 +1621,11 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
     def solve(self):
         """Run one independent master-oracle-cut loop."""
         started = perf_counter()
-        total_limit = float(self.config.total_time_limit)
-        if total_limit <= 0.0:
-            total_limit = max(2.0, 2.0 * float(self.config.mip_time_limit))
+        total_limit = self._total_time_limit()
         deadline = started + total_limit
-        formal_master_reserve = max(8.0, 0.35 * total_limit)
+        formal_master_reserve = self._time_share(
+            "formal_master_reserve"
+        )
 
         self._prepare_decomposition()
         self._prepare_profiles()
@@ -1151,6 +1666,9 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
         oracle_records: list[dict] = []
         repair_records: list[dict] = []
         restricted_primal_records: list[dict] = []
+        voyage_bound_records: list[dict] = []
+        local_optimality_cut_count = 0
+        global_optimality_cut_count = 0
         restricted_primal_limit = min(
             3, max(1, int(math.ceil(len(self.groups) / 30)))
         )
@@ -1218,27 +1736,52 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
             import_hint: Counter[tuple[str, str, str]],
         ) -> dict | None:
             remaining = deadline - perf_counter()
-            repair_deadline = (
-                min(deadline, deadline - formal_master_reserve)
-                if round_index == 0
-                else deadline
-            )
+            repair_deadline = deadline
+            if round_index == 0 and best_selected is not None:
+                repair_deadline = min(
+                    deadline, deadline - formal_master_reserve
+                )
             available = repair_deadline - perf_counter()
+            threshold = self._solve_threshold()
             if (
-                remaining <= 0.5
-                or available <= 0.5
+                remaining <= threshold
+                or available <= threshold
                 or len(repair_records) >= 4
             ):
                 return None
-            allowance = (
-                min(15.0, available)
-                if best_selected is None
-                else min(10.0, available, max(2.0, 0.25 * available))
+            observed_repair_build = max(
+                (
+                    float(record.get("build_seconds", 0.0))
+                    for record in repair_records
+                ),
+                default=0.0,
             )
+            allowance = (
+                min(self._time_share("initial_repair"), available)
+                if best_selected is None
+                else min(
+                    self._time_share("incumbent_repair"),
+                    available,
+                    0.50 * available,
+                )
+            )
+            if allowance <= observed_repair_build + threshold:
+                return None
             phase_deadline = perf_counter() + allowance
+            secure_first_feasible = best_selected is None
+            solve_window = max(
+                4.0 * threshold,
+                0.015 * total_limit,
+            )
+            repair_fraction = (
+                0.45 if secure_first_feasible else 0.55
+            )
             repair_allowance = min(
                 allowance,
-                max(3.0, 0.45 * allowance),
+                max(
+                    repair_fraction * allowance,
+                    observed_repair_build + solve_window,
+                ),
             )
             repair = self._solve_conflict_directed_repair(
                 quantities,
@@ -1246,6 +1789,7 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                 repair_allowance,
                 best_selected,
                 best_import or import_hint,
+                secure_first_feasible=secure_first_feasible,
             )
             record = {
                 key: value
@@ -1260,12 +1804,39 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                     "feasibility_repair_allowance": round(
                         repair_allowance, 4
                     ),
+                    "observed_repair_build_seconds": round(
+                        observed_repair_build, 4
+                    ),
+                    "target_repair_solve_window": round(
+                        solve_window, 4
+                    ),
                     "improved_incumbent": False,
                 }
             )
             if repair["feasible"]:
                 polish_allowance = phase_deadline - perf_counter()
-                if polish_allowance > 1.0:
+                observed_polish_build = max(
+                    [
+                        float(item.get("build_seconds", 0.0))
+                        for item in restricted_primal_records
+                    ]
+                    + [
+                        float(
+                            item.get(
+                                "restricted_primal_improvement", {}
+                            ).get("build_seconds", 0.0)
+                        )
+                        for item in repair_records
+                    ],
+                    default=0.0,
+                )
+                record["remaining_polish_allowance"] = round(
+                    max(0.0, polish_allowance), 4
+                )
+                record["observed_polish_build_seconds"] = round(
+                    observed_polish_build, 4
+                )
+                if polish_allowance > observed_polish_build + threshold:
                     self._restricted_primal_solve_count += 1
                     polish_started = perf_counter()
                     polish = self._solve_exact_restricted_primal(
@@ -1311,13 +1882,26 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
             source: str,
             conflict_keys: tuple[QuantityKey, ...],
             allowance: float,
+            allow_terminal_extra: bool = False,
         ) -> dict | None:
+            observed_build_time = max(
+                (
+                    float(record.get("build_seconds", 0.0))
+                    for record in restricted_primal_records
+                ),
+                default=0.0,
+            )
             if (
-                allowance <= 1.0
+                allowance <= self._solve_threshold()
+                or allowance
+                <= observed_build_time + self._solve_threshold()
                 or best_selected is None
                 or best_import is None
-                or self._restricted_primal_solve_count
-                >= restricted_primal_limit
+                or (
+                    not allow_terminal_extra
+                    and self._restricted_primal_solve_count
+                    >= restricted_primal_limit
+                )
             ):
                 return None
             self._restricted_primal_solve_count += 1
@@ -1365,14 +1949,7 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                     primal_start_record["attempted"] = True
                     warm_recourse = self._solve_exact_recourse(
                         quantities,
-                        min(
-                            10.0,
-                            max(
-                                self._oracle_allowance(remaining),
-                                8.0,
-                            ),
-                            remaining,
-                        ),
+                        self._oracle_allowance(remaining),
                     )
                     record_oracle(0, warm_recourse)
                     primal_start_record.update(
@@ -1438,12 +2015,18 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                                     "capacity_upper_bound": cut_info[
                                         "capacity_upper_bound"
                                     ],
+                                    "capacity_core": cut_info[
+                                        "capacity_core"
+                                    ],
                                     "incumbent_core_quantity": cut_info[
                                         "incumbent_core_quantity"
                                     ],
                                     "capacity_certificate": cut_info[
                                         "capacity_certificate"
                                     ],
+                                    "monotone_support_limit": cut_info.get(
+                                        "monotone_support_limit"
+                                    ),
                                 }
                             )
                             pending_cut_records.append(
@@ -1455,6 +2038,32 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                             "initial_infeasible_skeleton",
                             quantities,
                             conflict_keys,
+                            Counter(imports),
+                        )
+                        if repair and repair["feasible"]:
+                            primal_start_record["verified"] = True
+                            primal_start_record["repaired"] = True
+                            primal_start_record["objective"] = repair[
+                                "objective"
+                            ]
+                    else:
+                        # A timed oracle supplies no infeasibility proof, so
+                        # it must not generate a cut.  It can still seed the
+                        # independent exact repair with the positive support;
+                        # only a fully validated repair is accepted as an
+                        # incumbent and MIP Start.
+                        support_keys = tuple(
+                            sorted(
+                                key
+                                for key, value in quantities.items()
+                                if int(value) > 0
+                            )
+                        )
+                        repair = run_repair(
+                            0,
+                            "initial_uncertified_skeleton",
+                            quantities,
+                            support_keys,
                             Counter(imports),
                         )
                         if repair and repair["feasible"]:
@@ -1601,7 +2210,118 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
 
                 recourse_bound = float(recourse["bound"])
                 new_cut_details = []
-                cut_guidance_keys: list[QuantityKey] = []
+                local_cut_added = False
+                if recourse["feasible"]:
+                    row_cost_by_voyage = (
+                        self._selected_row_cost_by_voyage(selected)
+                    )
+                    voyage_candidates = sorted(
+                        (
+                            (
+                                float(row_cost_by_voyage.get(voyage_id, 0.0))
+                                - float(theta.get(voyage_id, 0.0)),
+                                voyage_id,
+                            )
+                            for voyage_id in self._voyages
+                            if float(row_cost_by_voyage.get(voyage_id, 0.0))
+                            > float(theta.get(voyage_id, 0.0)) + 1e-7
+                        ),
+                        key=lambda item: (-item[0], item[1]),
+                    )[:3]
+                    local_budget = min(
+                        self._time_share("local_bounds"),
+                        max(
+                            0.0,
+                            deadline
+                            - perf_counter()
+                            - self._time_share("safety_margin"),
+                        ),
+                    )
+                    for position, (estimated_gap, voyage_id) in enumerate(
+                        voyage_candidates
+                    ):
+                        remaining_candidates = (
+                            len(voyage_candidates) - position
+                        )
+                        allowance = local_budget / max(
+                            1, remaining_candidates
+                        )
+                        if allowance <= self._solve_threshold():
+                            break
+                        bound_result = self._solve_voyage_recourse_bound(
+                            voyage_id,
+                            quantities,
+                            allowance,
+                            selected,
+                        )
+                        local_budget = max(
+                            0.0,
+                            local_budget - float(bound_result["seconds"]),
+                        )
+                        voyage_bound = float(bound_result["bound"])
+                        bound_record = {
+                            "master_round": master_round,
+                            "voyage_id": voyage_id,
+                            "status": bound_result["status"],
+                            "optimal": bool(bound_result["optimal"]),
+                            "feasible": bool(bound_result["feasible"]),
+                            "cached": bool(bound_result.get("cached", False)),
+                            "seconds": round(
+                                float(bound_result["seconds"]), 4
+                            ),
+                            "estimated_component_gap": estimated_gap,
+                            "theta_before": float(theta[voyage_id]),
+                            "lower_bound": (
+                                voyage_bound
+                                if math.isfinite(voyage_bound)
+                                else None
+                            ),
+                            "cut_added": False,
+                        }
+                        if (
+                            math.isfinite(voyage_bound)
+                            and voyage_bound
+                            > float(theta[voyage_id]) + 1e-7
+                        ):
+                            added, binary_count, support_count = (
+                                self._add_voyage_optimality_cut(
+                                    master,
+                                    variables,
+                                    voyage_id,
+                                    quantities,
+                                    voyage_bound,
+                                    optimality_cut_count + 1,
+                                    cut_signatures,
+                                )
+                            )
+                            bound_record["support_quantity_count"] = (
+                                support_count
+                            )
+                            if added:
+                                optimality_cut_count += 1
+                                local_optimality_cut_count += 1
+                                local_cut_added = True
+                                bound_record["cut_added"] = True
+                                new_cut_details.append(
+                                    {
+                                        "kind": (
+                                            "voyage_quantity_recourse_"
+                                            "optimality"
+                                        ),
+                                        "binary_count": binary_count,
+                                        "support_quantity_count": (
+                                            support_count
+                                        ),
+                                        "theta_before": float(
+                                            theta[voyage_id]
+                                        ),
+                                        "recourse_lower_bound": (
+                                            voyage_bound
+                                        ),
+                                        "component_id": voyage_id,
+                                    }
+                                )
+                        voyage_bound_records.append(bound_record)
                 if recourse["status"] == "infeasible":
                     cut_info = self._add_certified_feasibility_cut(
                         master,
@@ -1628,16 +2348,23 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                                 "capacity_upper_bound": cut_info[
                                     "capacity_upper_bound"
                                 ],
+                                "capacity_core": cut_info[
+                                    "capacity_core"
+                                ],
                                 "incumbent_core_quantity": cut_info[
                                     "incumbent_core_quantity"
                                 ],
                                 "capacity_certificate": cut_info[
                                     "capacity_certificate"
                                 ],
+                                "monotone_support_limit": cut_info.get(
+                                    "monotone_support_limit"
+                                ),
                             }
                         )
                 elif (
                     recourse["feasible"]
+                    and not local_cut_added
                     and math.isfinite(recourse_bound)
                     and recourse_bound > theta_total + 1e-7
                 ):
@@ -1653,11 +2380,7 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                     )
                     if added:
                         optimality_cut_count += 1
-                        cut_guidance_keys.extend(
-                            key
-                            for key, value in quantities.items()
-                            if int(value) > 0
-                        )
+                        global_optimality_cut_count += 1
                         new_cut_details.append(
                             {
                                 "kind": "quantity_recourse_optimality",
@@ -1703,19 +2426,36 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                     run_upper_bound_neighbourhood(
                         master_round,
                         "post_oracle_upper_bound_polish",
-                        tuple(sorted(set(cut_guidance_keys))),
+                        (),
                         min(
-                            10.0,
-                            max(0.0, remaining_for_polish - 1.0),
+                            self._time_share("primal_polish"),
+                            max(
+                                0.0,
+                                remaining_for_polish
+                                - self._time_share("safety_margin"),
+                            ),
                         ),
                     )
                 repair = None
-                if recourse["status"] == "infeasible":
+                if not recourse["feasible"]:
+                    repair_keys = tuple(
+                        recourse["conflict_quantity_keys"]
+                    ) or tuple(
+                        sorted(
+                            key
+                            for key, value in quantities.items()
+                            if int(value) > 0
+                        )
+                    )
                     repair = run_repair(
                         master_round,
-                        "oracle_IIS_conflict",
+                        (
+                            "oracle_IIS_conflict"
+                            if recourse["status"] == "infeasible"
+                            else "oracle_uncertified_point"
+                        ),
                         quantities,
-                        tuple(recourse["conflict_quantity_keys"]),
+                        repair_keys,
                         Counter(imports),
                     )
                     if repair and repair["feasible"]:
@@ -1770,6 +2510,25 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
             else:
                 termination_reason = "iteration_limit"
 
+            terminal_remaining = deadline - perf_counter()
+            if (
+                not converged
+                and best_selected is not None
+                and best_import is not None
+                and terminal_remaining > self._solve_threshold()
+            ):
+                run_upper_bound_neighbourhood(
+                    max(1, len(master_rounds)),
+                    "terminal_remaining_time_polish",
+                    (),
+                    max(
+                        0.0,
+                        terminal_remaining
+                        - self._time_share("safety_margin"),
+                    ),
+                    allow_terminal_extra=True,
+                )
+
             if best_selected is None or best_import is None:
                 raise RuntimeError(
                     "selective LBBD did not find a complete row allocation; "
@@ -1816,12 +2575,30 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                 "selective_lbbd_optimality_cut_count": (
                     optimality_cut_count
                 ),
+                "selective_lbbd_local_optimality_cut_count": (
+                    local_optimality_cut_count
+                ),
+                "selective_lbbd_global_optimality_cut_count": (
+                    global_optimality_cut_count
+                ),
                 "selective_lbbd_cut_binary_count": cut_binary_count,
                 "selective_lbbd_cut_records": cut_records,
                 "selective_lbbd_bound_tightening_cut_count": (
                     tightened_cut_count
                 ),
                 "selective_lbbd_oracle_records": oracle_records,
+                "selective_lbbd_voyage_bound_records": (
+                    voyage_bound_records
+                ),
+                "selective_lbbd_voyage_bound_solve_count": (
+                    self._voyage_bound_solve_count
+                ),
+                "selective_lbbd_voyage_bound_cache_hits": (
+                    self._voyage_bound_cache_hits
+                ),
+                "selective_lbbd_voyage_bound_seconds": round(
+                    self._voyage_bound_seconds, 3
+                ),
                 "selective_lbbd_repair_records": repair_records,
                 "selective_lbbd_restricted_primal_records": (
                     restricted_primal_records
@@ -1848,11 +2625,10 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                     restricted_primal_limit
                 ),
                 "selective_lbbd_oracle_build_seconds": round(
-                    self._global_profile_subproblem.build_seconds, 3
-                ) if self._global_profile_subproblem is not None else 0.0,
+                    self._selective_oracle_build_seconds, 3
+                ),
                 "selective_lbbd_oracle_variable_count": (
-                    self._global_profile_subproblem.variable_count
-                    if self._global_profile_subproblem is not None else 0
+                    self._selective_oracle_variable_count
                 ),
                 "selective_lbbd_preparation_seconds": round(
                     preparation_seconds, 3
@@ -1865,6 +2641,20 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
                 "selective_lbbd_total_solve_seconds": round(
                     perf_counter() - started, 3
                 ),
+                "selective_lbbd_time_budget_policy": {
+                    "kind": "shared_deadline_proportional_feedback",
+                    "total_time_limit": total_limit,
+                    "phase_share_upper_bounds": dict(self._TIME_SHARES),
+                    "unused_time_reallocated": True,
+                    "terminal_unused_time_goes_to_primal_polish": True,
+                    "sparse_oracle_build_included_in_allowance": True,
+                    "repair_budget_uses_observed_build_time": True,
+                    "first_master_is_cut_discovery_slice": True,
+                    "adaptive_monotone_iis_support_limit": (
+                        self._monotone_iis_support_limit()
+                    ),
+                    "uncertified_timeout_generates_cut": False,
+                },
                 "selective_lbbd_master": master_stats,
             }
             result = self._assemble_result(best_selected, diagnostics)
@@ -1872,10 +2662,8 @@ class SelectiveResourceBendersPlanner(ProfileResourceBendersPlanner):
             return result
         finally:
             self._free_gurobi_model(master)
-            if self._global_profile_subproblem is not None:
-                self._free_gurobi_model(
-                    self._global_profile_subproblem.model
-                )
+            for subproblem in self._voyage_subproblems.values():
+                self._free_gurobi_model(subproblem.model)
 
 
 __all__ = ["SelectiveResourceBendersPlanner"]
