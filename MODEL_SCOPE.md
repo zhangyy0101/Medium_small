@@ -136,3 +136,67 @@ This is an additional experimental algorithm, not an internal mode switch. The `
 The implementation uses a persistent integer pricing MIP for every row track, Phase-I artificial demand, adaptive multi-column solution pools, exact raw reduced-cost checks, and the standard blockwise Lagrangian bound `RMP objective + sum(min(0, block reduced-cost bound))`. Pure-group consolidation configurations are generated before Phase I and are also available to the final binary restricted master. A complete row solution is expanded to the original M0 placement variables and passes the same independent validator.
 
 Development follows an explicit stage gate. Micro instances must match the complete M0 LP and M0 integer optimum; these automated checks pass. The real base instance, however, reaches the same M0 LP value only through a long degenerate tail, while M0 solves its LP directly much faster. Under 120 seconds, neither the natural-conflict nor the 72-group case closes pricing or produces a useful certified row-configuration lower bound, whereas their M0 LP relaxations solve in about 19 seconds. The base restricted master also gives a weaker upper and lower bound than M0 under equal 60-second budgets. Therefore no Branch-and-Price tree or branching component is added. The code is retained only as an isolated, reproducible negative algorithm experiment.
+
+## 13. Hard-state row-template Benders experiment
+
+`yard_planning/template_flow_benders.py` tests a classical rather than logic-based Benders boundary. The master chooses a hard handling class on each mixed-size physical row footprint, an integer capacity and integer stack use assigned to every active template, and the anonymous import reserve. The handling class is induced only by export voyage, flow, and the configured hard bay/row no-mix attributes. Area and row concentration are charged to those handling classes. Export large-plan shares are converted to integer area targets by a deterministic largest-remainder apportionment; import quantities continue to use `new_qty` and retain only area-function, size, and common-capacity restrictions.
+
+Given the master capacities, the persistent recourse LP assigns every declared export box to compatible templates. Existing-group proximity, quantity-weighted berth distance, and export area-guidance deviation are recourse costs. A Phase-I shortage LP provides feasibility cuts when necessary; an optimal recourse dual provides a classical affine lower estimator in the template-capacity variables. The same integer master first obtains one feasible seed, with an upper budget defined as a fraction of post-build remaining time and automatic early termination at its first solution. Root cuts are then generated with continuous template states before the seeded master is integerized again. `TemplateFlowDirectPlanner` is the compact direct reference for exactly this redefined objective and grouping policy. Both methods use one end-to-end solver budget. They are research-only entry points and do not modify M0, CG, or any existing LBBD path.
+
+The formulation is exact on the automated micro instance: Benders and its compact reference both return `0.132`, the recourse flow is integral, dual optimality cuts are active, and independent row validation passes. On the base instance under an end-to-end 30-second solver budget, Benders obtains `UB=0.14339579`, `LB=0.14073978` (1.852% gap), while the same-model compact reference obtains `UB=0.14271036`, `LB=0.14214814` (0.394% gap). On the 72-group instance at 120 seconds, every group is already a distinct hard handling class, so 55,418 row arcs induce 55,418 templates and no dimensional compression. Benders finds the better incumbent (`UB=0.21430037` versus `0.21820084`) but has a much weaker bound (`LB=0.16397563` versus `0.18943692`), hence a 23.48% gap versus 13.18% for the compact reference. Thus the dual cuts are operational and the decomposition can aid upper-bound search, but it does not improve certified solution quality when fine groups coincide with hard storage states. The implementation is retained as a clean, reproducible structural test rather than promoted as the paper algorithm.
+
+## 14. Dedicated contiguous-zone two-problem experiment
+
+`yard_planning/contiguous_zone_generation.py` tests a model boundary that is
+materially different from M0. Problem 1 chooses one or more contiguous runs on
+an `(export group, area, physical row)` strip. A selected run reserves the
+complete size-compatible capacity of every row footprint in that run. This
+dedicated-capacity convention makes physical row overlap, bay capacity, size
+capacity, stack count, hard no-mix state, group-area activation, export area
+guidance, and anonymous import reservation additive master rows. Concentrated
+storage is represented directly by the number and length of selected zones,
+rather than reconstructed from independent quantity variables.
+
+All nondominated intervals are currently enumerated for reproducible exact
+pricing checks, but the restricted master starts without zone columns. Phase I
+uses an adaptive per-group batch based on the square root of average zone
+count; after all export shortage disappears, pricing returns to a small batch.
+The persistent root master stops only when no zone has reduced cost below
+`-1e-8`, using `1e-9` LP feasibility and optimality tolerances. The integer pool
+contains the generated root columns, a fixed number of lowest reduced-cost
+columns per group, and only the missing columns in an LP-guided greedy support.
+Problem 2 is the unchanged compact row MILP restricted to the union of rows in
+the selected zones. It rechecks exact quantities, row and bay hard constraints,
+45-ft edge footprints, anonymous import capacity, and the original normalized
+business objective; its output passes the common independent validator.
+
+The lower-bound scopes are deliberately separated. A closed generated root is
+a valid global LP lower bound for the complete zone model. The bound of the
+integer restricted zone pool is not global, and the bound of Problem 2 is valid
+only on the selected row support. Neither is reported as an M0 certificate.
+Consequently, the current implementation is a root-exact matheuristic, not an
+integer-exact Branch-and-Price algorithm.
+
+Automated micro tests show equality between generated and complete zone LPs and
+validate the final row solution. On the base instance, the generated root uses
+202 of 14,646 zones and matches the complete zone LP to `2.22e-16`; the full
+two-problem run selects 154 of 7,133 row candidates and finishes its solver core
+in about 33.1 seconds. On the 72-group instance, it closes the root with 9,522
+of 120,038 zones, obtains zone `UB=0.68865777` and global root
+`LB=0.61351660` (10.91%), reduces 55,418 row candidates to 500, and solves the
+restricted row problem to optimality in about 2.36 seconds; the solver core is
+about 91.7 seconds. Under the same nominal 120-second configuration and final
+numerical tolerances, the fully enumerated zone MIP obtains `UB=0.72743614` and
+`LB=0.64242981` (11.69%) with about 129.2 seconds of full model lifecycle time.
+The generated-column method has a 5.33% better incumbent and a 10.91% certified
+gap, although the complete MIP has the stronger lower bound. These results
+support further development of the redefined contiguous-zone model, but they
+do not show dominance over M0: the detailed fill objective is secondary and
+the dedicated-row reservation changes both feasibility and objective meaning.
+
+The experiment is intentionally absent from `run_yard_plan.py`. It neither
+imports nor invokes the existing `cg`, `direct`, or LBBD solvers, and no existing
+solver selects it by instance size. Promoting it to an exact paper algorithm
+would require a Branch-and-Price tree or another valid integer closure method;
+retaining it as a matheuristic would instead require explicit same-model quality
+and runtime experiments.

@@ -25,6 +25,13 @@ from yard_planning.selective_resource_benders import (
 from yard_planning.row_configuration_generation import (
     RowConfigurationGenerationPlanner,
 )
+from yard_planning.template_flow_benders import (
+    TemplateFlowBendersPlanner,
+    TemplateFlowDirectPlanner,
+)
+from yard_planning.contiguous_zone_generation import (
+    ContiguousZoneGenerationPlanner,
+)
 from yard_planning.planner import (
     ColumnGenerationConfig,
     YardPlanningBase,
@@ -665,6 +672,84 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
                 "passed"
             ]
         )
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_template_flow_benders_matches_its_compact_reference(self) -> None:
+        config = ColumnGenerationConfig(
+            total_time_limit=10.0,
+            max_iterations=20,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        benders = TemplateFlowBendersPlanner(
+            make_small_problem(), config
+        ).solve()
+        direct = TemplateFlowDirectPlanner(
+            make_small_problem(), config
+        ).solve()
+        self.assertAlmostEqual(
+            benders.diagnostics["final_business_objective"],
+            direct.diagnostics["final_business_objective"],
+            places=9,
+        )
+        self.assertGreaterEqual(
+            benders.diagnostics["template_flow_optimality_cut_count"], 1
+        )
+        self.assertLessEqual(
+            benders.diagnostics["template_flow_best_max_fractionality"],
+            1e-5,
+        )
+        self.assertTrue(
+            benders.diagnostics["independent_solution_validation"]["passed"]
+        )
+
+    def test_template_flow_area_apportionment_is_integral(self) -> None:
+        planner = TemplateFlowBendersPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(verbose=False),
+        )
+        planner._prepare_templates()
+        targets = {
+            key: value
+            for key, value in planner._template_area_targets.items()
+            if key[0] == "V1" and key[1] == "OF" and key[3] == "20"
+        }
+        self.assertEqual(5, sum(targets.values()))
+        self.assertTrue(all(isinstance(value, int) for value in targets.values()))
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_contiguous_zone_root_matches_complete_zone_lp(self) -> None:
+        planner = ContiguousZoneGenerationPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(
+                total_time_limit=10.0,
+                mip_gap=0.0,
+                solver_threads=1,
+                verbose=False,
+            ),
+        )
+        result = planner.analyze_root(compare_complete_lp=True)
+        self.assertTrue(result["closed"])
+        self.assertEqual(result["complete_zone_lp"]["status"], "optimal")
+        self.assertAlmostEqual(result["root_complete_lp_difference"], 0.0, places=9)
+        self.assertLess(result["active_zone_count"], result["zone_count"])
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_contiguous_zone_exact_fill_is_independently_valid(self) -> None:
+        result = ContiguousZoneGenerationPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(
+                total_time_limit=10.0,
+                mip_gap=0.0,
+                solver_threads=1,
+                verbose=False,
+            ),
+        ).solve()
+        self.assertTrue(
+            result.diagnostics["independent_solution_validation"]["passed"]
+        )
+        self.assertGreater(result.diagnostics["zone_candidate_reduction"], 0.0)
 
     def test_selective_recourse_fixes_quantities_not_profile_states(
         self,

@@ -69,6 +69,8 @@ python -X utf8 -B benchmark_selective_benders.py --input example/many_groups_6v_
 python -X utf8 -B example/generate_natural_conflict_case.py --overwrite
 python -X utf8 -B benchmark_selective_benders.py --input example/natural_conflict_peak/input_data.json --large-plan example/natural_conflict_peak/large_plan.csv --total-time-limit 90 --solver-threads 1 --output outputs/selective_natural_conflict_peak_90s.json
 python -X utf8 -B benchmark_row_configurations.py --root-only --compare-m0-lp --input example/many_groups_6v_12g/input_data.json --large-plan example/many_groups_6v_12g/large_plan.csv --total-time-limit 120 --solver-threads 1
+python -X utf8 -B benchmark_template_flow_benders.py --total-time-limit 30 --solver-threads 1 --compare-template-direct --output outputs/template_flow_base_30s.json
+python -X utf8 -B benchmark_template_flow_benders.py --input example/many_groups_6v_12g/input_data.json --large-plan example/many_groups_6v_12g/large_plan.csv --total-time-limit 120 --solver-threads 1 --compare-template-direct
 ```
 
 `benchmark_row_configurations.py` is an isolated research prototype for
@@ -77,6 +79,38 @@ pricing, a Lagrangian lower bound, integer-friendly group consolidation, and
 the restricted configuration MIP. The Branch-and-Price tree is deliberately
 not implemented because the root-LP and restricted-MIP stage gates were not
 met; the prototype does not alter any production solver entry point.
+
+`benchmark_template_flow_benders.py` is a second isolated experiment.  Its
+master selects hard no-mix row templates, integer capacity on each selected
+template, the associated integer stack use, and anonymous import capacity.
+Its persistent recourse LP assigns declared export quantities and produces
+classical feasibility/optimality cuts.  Before root separation, the same
+integer master is allowed to find one feasible template seed using a fixed
+fraction of the post-build remaining budget; `SolutionLimit=1` makes this
+stage stop immediately on easy instances.  The
+large-plan shares are apportioned to integral declared-box area targets so
+that an integer template capacity yields an integral transportation flow.
+`--compare-template-direct` solves the same redefined model compactly; this is
+the scientifically valid direct reference, while `--compare-direct` retains
+the original M0 comparison.  Neither solver is registered in `run_yard_plan`.
+
+`benchmark_contiguous_zones.py` is an independent two-problem experiment. It
+first generates dedicated contiguous storage zones for each export group by
+exact root LP column generation, solves an integer zone-support master on a
+dual-ranked column pool, and then solves the original detailed row model only
+on rows exposed by the selected zones. A small LP-guided feasibility column
+augmentation supplies an integer MIP start; it does not replace pricing or
+serve as a backup solver. The selected row model is independently validated.
+This experiment deliberately changes the paper model: a selected zone reserves
+the full compatible capacity of its physical rows, so its objective and
+feasible set are not those of M0. It is not registered in `run_yard_plan` and
+does not modify any existing solver entry point.
+
+```bash
+python -X utf8 -B benchmark_contiguous_zones.py --root-only --compare-complete-zone-lp --total-time-limit 60 --solver-threads 1
+python -X utf8 -B benchmark_contiguous_zones.py --input example/many_groups_6v_12g/input_data.json --large-plan example/many_groups_6v_12g/large_plan.csv --total-time-limit 120 --solver-threads 1
+python -X utf8 -B benchmark_contiguous_zones.py --complete-zone-mip-only --input example/many_groups_6v_12g/input_data.json --large-plan example/many_groups_6v_12g/large_plan.csv --total-time-limit 120 --solver-threads 1
+```
 
 ## 输出
 
@@ -96,6 +130,8 @@ met; the prototype does not alter any production solver entry point.
 - `yard_planning/profile_resource_benders.py`：排资源类型聚合主问题、共享物理资源池、快速足迹解聚、全局精确反聚合子问题及条件逻辑割；
 - `yard_planning/selective_resource_benders.py`：冲突超图初始化、IIS 驱动单向状态提升、选择性整数资源状态与排数主问题、联合精确排级 recourse、物理容量证书与单调 IIS 后备割、条件最优性割，以及独立的冲突修复与受限排级邻域上界改进；
 - `yard_planning/row_configuration_generation.py`：独立的物理排轨道配置列生成实验，包括精确定价、Lagrangian 根节点下界、集中配置初始列和整数受限主问题；
+- `yard_planning/template_flow_benders.py`：独立的硬属性排模板—整数容量主问题、连续箱量流子问题、Phase-I/对偶 Benders 割及同模型紧凑直接对照；
+- `yard_planning/contiguous_zone_generation.py`：独立的连续区段根节点列生成、整数区段支持选择和受限排级精确填充实验；
 - `yard_planning/logic_benders.py`：LBBD 的稳定公共导入入口；
 - `yard_planning/direct_milp.py`：M0 紧凑排位置模型；
 - `yard_planning/gurobi_backend.py`：统一 Gurobi 接口；
