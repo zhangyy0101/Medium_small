@@ -96,11 +96,15 @@ the original M0 comparison.  Neither solver is registered in `run_yard_plan`.
 
 `benchmark_contiguous_zones.py` is an independent two-problem experiment. It
 first generates dedicated contiguous storage zones for each export group by
-exact root LP column generation, solves an integer zone-support master on a
-dual-ranked column pool, and then solves the original detailed row model only
-on rows exposed by the selected zones. A small LP-guided feasibility column
-augmentation supplies an integer MIP start; it does not replace pricing or
-serve as a backup solver. The selected row model is independently validated.
+exact on-demand interval pricing. It then solves an integer zone-support
+master, probes an exact Branch-and-Price tree, and returns low-yield branch
+time to the same persistent restricted-MIP search. The certified root solution
+is reused at the tree rather than solved again. Finally, at most the initial
+and post-search supports are filled by the original detailed row model, and
+the support with the better true business objective is retained. A small
+LP-guided feasibility augmentation supplies the initial MIP start; it does not
+replace pricing or serve as a backup solver. Every returned row plan is
+independently validated.
 This experiment deliberately changes the paper model: a selected zone reserves
 the full compatible capacity of its physical rows, so its objective and
 feasible set are not those of M0. It is not registered in `run_yard_plan` and

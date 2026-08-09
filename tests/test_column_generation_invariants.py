@@ -750,6 +750,20 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             result.diagnostics["independent_solution_validation"]["passed"]
         )
         self.assertGreater(result.diagnostics["zone_candidate_reduction"], 0.0)
+        self.assertGreaterEqual(
+            result.diagnostics["zone_model_global_lower_bound"] + 1e-9,
+            result.diagnostics["zone_root"]["root_objective"],
+        )
+        self.assertGreaterEqual(
+            result.diagnostics["zone_model_upper_bound"] + 1e-9,
+            result.diagnostics["zone_model_global_lower_bound"],
+        )
+        self.assertTrue(
+            any(
+                item["status"] != "failed"
+                for item in result.diagnostics["zone_fill_alternatives"]
+            )
+        )
 
     def test_selective_recourse_fixes_quantities_not_profile_states(
         self,

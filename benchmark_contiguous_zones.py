@@ -31,6 +31,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-root-iterations", type=int, default=60)
     parser.add_argument("--columns-per-group", type=int, default=3)
     parser.add_argument("--integer-pool-per-group", type=int, default=100)
+    parser.add_argument("--zone-mip-time-fraction", type=float, default=0.75)
+    parser.add_argument("--branch-price-time-fraction", type=float, default=0.70)
+    parser.add_argument("--branch-probe-time-fraction", type=float, default=0.25)
+    parser.add_argument("--branch-min-gap-closure", type=float, default=0.01)
+    parser.add_argument("--fill-time-fraction", type=float, default=0.05)
+    parser.add_argument("--max-branch-nodes", type=int, default=200)
     parser.add_argument("--root-only", action="store_true")
     parser.add_argument("--complete-zone-mip-only", action="store_true")
     parser.add_argument("--compare-complete-zone-lp", action="store_true")
@@ -66,6 +72,12 @@ def main() -> None:
         max_root_iterations=args.max_root_iterations,
         columns_per_group_per_round=args.columns_per_group,
         integer_pool_columns_per_group=args.integer_pool_per_group,
+        zone_mip_time_fraction=args.zone_mip_time_fraction,
+        branch_price_time_fraction=args.branch_price_time_fraction,
+        branch_probe_time_fraction=args.branch_probe_time_fraction,
+        branch_min_gap_closure=args.branch_min_gap_closure,
+        fill_time_fraction=args.fill_time_fraction,
+        max_branch_nodes=args.max_branch_nodes,
     )
     planner = ContiguousZoneGenerationPlanner(
         inputs.problem,
@@ -91,7 +103,8 @@ def main() -> None:
         output["contiguous_zone_diagnostics"] = {
             key: value
             for key, value in result.diagnostics.items()
-            if key.startswith("zone_") or key in {"total_seconds"}
+            if key.startswith("zone_")
+            or key in {"independent_solution_validation", "total_seconds"}
         }
         if args.compare_direct:
             direct = DirectMilpPlanner(inputs.problem, common).solve()
