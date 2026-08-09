@@ -100,10 +100,12 @@ dedicated contiguous row zones. Exact prefix/RMQ top-K pricing avoids scanning
 all intervals; adaptive batches accelerate degenerate rounds. Capacity-cover
 and zone-support inequalities strengthen the root relaxation. An integer
 restricted master uses a square-root adaptive enrichment pool. Its proportional
-Fix-and-Optimize stage chooses at most 18 groups with the largest incumbent
-contributions to the unified objective. It fixes all other group decisions,
-opens every legal zone in the neighborhood, and feeds improving zones back to
-the integer master. A group-area zone-count activation bound strengthens the
+Fix-and-Optimize stage greedily covers a target share of attributable incumbent
+objective while limiting reopened candidate zones to a fraction of the full
+zone set. The defaults are 60% objective mass and 35% candidate-zone share. It
+fixes all other group decisions, opens every legal zone in the adaptive
+neighborhood, and feeds improving zones back to the integer master.
+A group-area zone-count activation bound strengthens the
 exact root certificate and is removed before primal integer search because the
 ablation shows that retaining it slows incumbent discovery. The selected
 group-bay export flows and anonymous import reservation are then fixed in a

@@ -210,13 +210,17 @@ per group.
 
 The integer upper-bound phase keeps the persistent restricted zone master and
 adds one objective-guided Fix-and-Optimize neighborhood. A per-group incumbent
-score attributes the unified zone objective to the incumbent groups, and the
-18 largest contributors are reopened (or all groups when fewer than 18 exist).
-All decisions outside the neighborhood are fixed; inside it, every
-legal contiguous zone is opened in an exact local MIP. Any
-improving local
-solution is a globally feasible incumbent, and its previously absent zones are
-returned to the persistent integer master.
+score attributes the group-separable portion of the unified objective to the
+incumbent groups. Groups are ranked by this contribution and greedily selected
+until they cover 60% of attributable objective, subject to a candidate-zone
+budget equal to 35% of the complete zone set. At least the highest-contribution
+group is retained even when it alone exceeds that budget. These two controls
+are dimensionless, so neighborhood size adapts to both objective concentration
+and instance size rather than using a fixed group count. All decisions outside
+the neighborhood are fixed; inside it, every legal contiguous zone is opened
+in an exact local MIP. Any improving local solution is a globally feasible
+incumbent, and its previously absent zones are returned to the persistent
+integer master.
 The local/master time split is a dimensionless fraction of the remaining
 budget, with no instance-name or fixed-second switch. The former Branch-and-
 Price probe is no longer part of the solve path because repeated benchmarks
@@ -248,30 +252,35 @@ generated-versus-complete zone-LP equality, objective reconstruction, exact
 flow realization, bound ordering, and final output validation. On the base
 instance, under the unified objective and proof-only area bound, exact pricing
 closes at `LB=0.1450871517`. Under the full 60-second algorithm budget the
-restricted integer master obtains `UB=0.1518776067`; reopening all nine groups
-improves it to `UB=0.1517428013`. The certified gap is 4.39%, the secondary
-row-realization score is `0.19907179`, and the algorithm core uses about 57.7
-seconds. The same-model complete MIP gives `UB=0.1515627477` and
+restricted integer master obtains `UB=0.1519676997`. The adaptive neighborhood
+selects three of nine groups, covers 64.79% of attributable objective with
+27.46% of candidate zones, and improves the incumbent to `UB=0.1518251117`.
+The certified gap is 4.44%, and the algorithm core uses about 57.8 seconds. The
+same-model complete MIP gives `UB=0.1515627477` and
 `LB=0.1507413501` (0.54% gap), so it remains preferable at this scale.
 
 On the 72-group instance, 55,418 atomic row locations induce 120,038 possible
 zones. Under a 120-second, one-thread solver budget, exact root pricing closes
 at `LB=0.1792403938` with 14,055 active zones. Adaptive integer enrichment adds
-2,952 zones, and the persistent restricted MIP obtains an initial
-`UB=0.1906908063`. The 18-group objective neighborhood improves the incumbent
-to `UB=0.1879968916`, a 1.41% upper-bound reduction; the certified complete-zone
-gap is 4.66%. Exact recourse assigns all 2,241 export boxes, preserves all 624
-import-reserved boxes, and has secondary row-realization score `0.24722919`;
-the algorithm core uses about 117.6 seconds.
+2,952 zones. In the controlled adaptive-versus-fixed comparison, the restricted
+MIP obtains `UB=0.1993817657`; the adaptive neighborhood selects 23 groups,
+covers 60.06% of attributable objective with 33.98% of candidate zones, and
+improves the incumbent to `UB=0.1918854490`, a 3.76% upper-bound reduction. The
+certified complete-zone gap is 6.59%. Under the same machine state and budget,
+the committed fixed-18 baseline improves a nearly identical initial incumbent
+from `0.1993729577` to `0.1934814039` (2.96%), with a 7.36% final gap. Exact
+recourse assigns all 2,241 export boxes and preserves all 624 import-reserved
+boxes; the adaptive algorithm core uses about 118.0 seconds.
 
 The same-model complete MIP gives `UB=0.2073750105`, `LB=0.1797169064`, and a
 13.34% gap on the 72-group case. Thus the generated algorithm is slightly
 weaker in its lower bound but markedly stronger in its incumbent and final
 certificate at scale. M0 remains a different-model structural reference. The
 observed upper-bound improvement is attributed only to the objective
-neighborhood; the tested resource-conflict score was removed after its ablation
-failed to improve the incumbent. The exact global lower bound remains the
-closed proof-root bound.
+neighborhood. The tested resource-conflict score was removed after its ablation
+failed to improve the incumbent, and the fixed group-count rule was replaced
+only after the controlled comparison above. The exact global lower bound
+remains the closed proof-root bound.
 
 The experiment remains absent from `run_yard_plan.py`. It neither imports nor
 invokes the existing `cg`, `direct`, or LBBD solvers, and no existing solver

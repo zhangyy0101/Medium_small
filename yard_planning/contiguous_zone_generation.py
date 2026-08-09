@@ -78,7 +78,8 @@ class ContiguousZoneConfig:
     root_time_fraction: float = 0.50
     zone_mip_time_fraction: float = 0.75
     fix_optimize_local_fraction: float = 0.85
-    fix_optimize_group_count: int = 18
+    fix_optimize_objective_mass: float = 0.60
+    fix_optimize_zone_fraction: float = 0.35
     fix_optimize_policy: str = "objective"
     fill_time_fraction: float = 0.05
     shortage_penalty: float = 1_000.0
@@ -111,8 +112,14 @@ class ContiguousZoneConfig:
             raise ValueError(
                 "fix_optimize_local_fraction must lie strictly between 0 and 1"
             )
-        if int(self.fix_optimize_group_count) <= 0:
-            raise ValueError("fix_optimize_group_count must be positive")
+        if not 0.0 < float(self.fix_optimize_objective_mass) <= 1.0:
+            raise ValueError(
+                "fix_optimize_objective_mass must lie in (0, 1]"
+            )
+        if not 0.0 < float(self.fix_optimize_zone_fraction) <= 1.0:
+            raise ValueError(
+                "fix_optimize_zone_fraction must lie in (0, 1]"
+            )
         if self.fix_optimize_policy not in {
             "disabled",
             "objective",
@@ -2187,8 +2194,8 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         self,
         selected_zone_indices: set[int],
         export_flow: dict[tuple[str, str], int],
-    ) -> set[str]:
-        """Choose the largest contributors to the unified objective."""
+    ) -> tuple[set[str], dict[str, object]]:
+        """Choose a scale-free objective-mass neighborhood under a zone budget."""
 
         zones_by_group: defaultdict[str, list[int]] = defaultdict(list)
         for zone_index in selected_zone_indices:
@@ -2232,7 +2239,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                         * flow_by_group_quota[(group_id, quota_key)]
                         / denominator
                     )
-        score = {}
+        contribution_by_group = {}
         for group in self.groups:
             group_id = group.group_id
             zone_cost = sum(
@@ -2249,17 +2256,101 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 + area_cost
                 + guidance_cost[group_id],
             )
-            density = contribution / max(1, int(group.demand))
-            score[group_id] = contribution + density
-        count = min(
-            len(score),
-            int(self.zone_config.fix_optimize_group_count),
+            contribution_by_group[group_id] = float(contribution)
+
+        candidate_count_by_group = {
+            group.group_id: int(
+                self._possible_zone_count_by_group[group.group_id]
+            )
+            for group in self.groups
+        }
+        total_contribution = float(sum(contribution_by_group.values()))
+        target_contribution = (
+            float(self.zone_config.fix_optimize_objective_mass)
+            * total_contribution
+        )
+        candidate_budget = max(
+            1,
+            int(
+                math.ceil(
+                    float(self.zone_config.fix_optimize_zone_fraction)
+                    * max(1, int(self._possible_zone_count))
+                )
+            ),
         )
         objective_ranked = sorted(
-            score,
-            key=lambda group_id: (-score[group_id], group_id),
+            contribution_by_group,
+            key=lambda group_id: (
+                -contribution_by_group[group_id],
+                candidate_count_by_group[group_id],
+                group_id,
+            ),
         )
-        return set(objective_ranked[:count])
+        selected: list[str] = []
+        skipped_by_budget: list[str] = []
+        selected_candidate_count = 0
+        selected_contribution = 0.0
+        for group_id in objective_ranked:
+            candidate_count = candidate_count_by_group[group_id]
+            if (
+                selected
+                and selected_candidate_count + candidate_count
+                > candidate_budget
+            ):
+                skipped_by_budget.append(group_id)
+                continue
+            selected.append(group_id)
+            selected_candidate_count += candidate_count
+            selected_contribution += contribution_by_group[group_id]
+            if (
+                total_contribution <= 1e-12
+                or selected_contribution + 1e-12 >= target_contribution
+            ):
+                break
+        if not selected and objective_ranked:
+            group_id = objective_ranked[0]
+            selected.append(group_id)
+            selected_candidate_count = candidate_count_by_group[group_id]
+            selected_contribution = contribution_by_group[group_id]
+        achieved_mass = (
+            selected_contribution / total_contribution
+            if total_contribution > 1e-12
+            else 1.0
+        )
+        target_met = (
+            total_contribution <= 1e-12
+            or selected_contribution + 1e-12 >= target_contribution
+        )
+        return set(selected), {
+            "policy": "objective_mass_under_candidate_zone_fraction",
+            "objective_mass_target": float(
+                self.zone_config.fix_optimize_objective_mass
+            ),
+            "objective_mass_achieved": float(achieved_mass),
+            "objective_mass_target_met": target_met,
+            "binding_condition": (
+                "objective_mass_target"
+                if target_met
+                else "candidate_zone_budget"
+            ),
+            "attributable_objective_total": total_contribution,
+            "selected_attributable_objective": selected_contribution,
+            "candidate_zone_fraction_limit": float(
+                self.zone_config.fix_optimize_zone_fraction
+            ),
+            "candidate_zone_budget": candidate_budget,
+            "selected_candidate_zone_count": selected_candidate_count,
+            "selected_candidate_zone_fraction": (
+                selected_candidate_count / max(1, self._possible_zone_count)
+            ),
+            "candidate_budget_exceeded_by_first_group": (
+                len(selected) == 1
+                and selected_candidate_count > candidate_budget
+            ),
+            "selected_group_count": len(selected),
+            "selected_groups": list(selected),
+            "skipped_by_candidate_budget_count": len(skipped_by_budget),
+        }
 
     def _solve_objective_fix_optimize_subproblem(
         self,
@@ -2278,8 +2369,10 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         remaining = deadline - perf_counter()
         if remaining <= 1e-6:
             return set(), {}, {}, {"status": "time_limit_before_fix_optimize"}
-        neighborhood = self._objective_fix_optimize_neighborhood(
-            selected_zone_indices, export_flow
+        neighborhood, neighborhood_selection = (
+            self._objective_fix_optimize_neighborhood(
+                selected_zone_indices, export_flow
+            )
         )
         materialized_before = len(self._zones)
         for group_id in sorted(neighborhood):
@@ -2347,6 +2440,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                     "has_solution": False,
                     "neighborhood": sorted(neighborhood),
                     "neighborhood_group_count": len(neighborhood),
+                    "neighborhood_selection": neighborhood_selection,
                     "active_zone_count": len(active_zone_indices),
                     "materialized_zone_count": len(self._zones)
                     - materialized_before,
@@ -2363,6 +2457,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                     "has_solution": False,
                     "neighborhood": sorted(neighborhood),
                     "neighborhood_group_count": len(neighborhood),
+                    "neighborhood_selection": neighborhood_selection,
                     "active_zone_count": len(active_zone_indices),
                 }
             selected = {
@@ -2395,6 +2490,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 / max(abs(objective), 1e-12),
                 "neighborhood": sorted(neighborhood),
                 "neighborhood_group_count": len(neighborhood),
+                "neighborhood_selection": neighborhood_selection,
                 "active_zone_count": len(active_zone_indices),
                 "materialized_zone_count": len(self._zones) - materialized_before,
                 "selected_zone_count": len(selected),
@@ -3109,8 +3205,11 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 "fix_optimize_local_remaining_fraction": float(
                     self.zone_config.fix_optimize_local_fraction
                 ),
-                "fix_optimize_group_cap": int(
-                    self.zone_config.fix_optimize_group_count
+                "fix_optimize_objective_mass": float(
+                    self.zone_config.fix_optimize_objective_mass
+                ),
+                "fix_optimize_candidate_zone_fraction": float(
+                    self.zone_config.fix_optimize_zone_fraction
                 ),
                 "fix_optimize_group_policy": (
                     self.zone_config.fix_optimize_policy

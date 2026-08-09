@@ -33,7 +33,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--integer-pool-per-group", type=int, default=100)
     parser.add_argument("--zone-mip-time-fraction", type=float, default=0.75)
     parser.add_argument("--fix-optimize-local-fraction", type=float, default=0.85)
-    parser.add_argument("--fix-optimize-groups", type=int, default=18)
+    parser.add_argument("--fix-optimize-objective-mass", type=float, default=0.60)
+    parser.add_argument("--fix-optimize-zone-fraction", type=float, default=0.35)
     parser.add_argument(
         "--fix-optimize-policy",
         choices=("disabled", "objective"),
@@ -84,7 +85,8 @@ def main() -> None:
         integer_pool_columns_per_group=args.integer_pool_per_group,
         zone_mip_time_fraction=args.zone_mip_time_fraction,
         fix_optimize_local_fraction=args.fix_optimize_local_fraction,
-        fix_optimize_group_count=args.fix_optimize_groups,
+        fix_optimize_objective_mass=args.fix_optimize_objective_mass,
+        fix_optimize_zone_fraction=args.fix_optimize_zone_fraction,
         fix_optimize_policy=args.fix_optimize_policy,
         fill_time_fraction=args.fill_time_fraction,
     )

@@ -915,6 +915,25 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         self.assertGreater(
             fix_optimize["local"]["neighborhood_group_count"], 0
         )
+        selection = fix_optimize["local"]["neighborhood_selection"]
+        self.assertEqual(
+            selection["policy"],
+            "objective_mass_under_candidate_zone_fraction",
+        )
+        self.assertEqual(
+            selection["selected_group_count"],
+            fix_optimize["local"]["neighborhood_group_count"],
+        )
+        self.assertIn(
+            selection["binding_condition"],
+            {"objective_mass_target", "candidate_zone_budget"},
+        )
+        self.assertLessEqual(selection["objective_mass_achieved"], 1.0 + 1e-9)
+        self.assertTrue(
+            selection["selected_candidate_zone_count"]
+            <= selection["candidate_zone_budget"]
+            or selection["candidate_budget_exceeded_by_first_group"]
+        )
         self.assertGreater(
             result.diagnostics[
                 "zone_root_proof_only_area_activation_cut_count"
@@ -931,6 +950,20 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
                 "fix_optimize_group_policy"
             ],
             "objective",
+        )
+        self.assertAlmostEqual(
+            result.diagnostics["zone_time_policy"][
+                "fix_optimize_objective_mass"
+            ],
+            0.60,
+            places=12,
+        )
+        self.assertAlmostEqual(
+            result.diagnostics["zone_time_policy"][
+                "fix_optimize_candidate_zone_fraction"
+            ],
+            0.35,
+            places=12,
         )
 
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
