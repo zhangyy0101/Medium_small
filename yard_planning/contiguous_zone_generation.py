@@ -1,16 +1,15 @@
-"""Independent contiguous-zone generation and Fix-and-Optimize experiment.
+"""Contiguous-zone generation and objective-guided Fix-and-Optimize.
 
-The experiment deliberately changes the concentration representation.  A
-hard export group reserves one or more contiguous runs of compatible physical
+The model represents concentration through dedicated contiguous zones. A hard
+export group reserves one or more contiguous runs of compatible physical
 row footprints and sends its actual declared quantity through those runs.
 Selected footprints reserve their complete compatible capacity, which makes
 physical conflicts additive and gives a genuine column-generation structure.
 The final compact row MILP realizes the certified group-bay flows and the same
 anonymous import reservation without changing the primary zone decisions.
 
-Nothing in this module is registered as a production solver.  It is an
-isolated stage gate for the redefined model boundary, an exact priced root,
-and objective-guided primal improvement.
+The solver combines an exactly priced root, a restricted integer master,
+objective-guided primal improvement, and certified row-level recourse.
 """
 
 from __future__ import annotations
@@ -69,7 +68,7 @@ class _RangeMinimumTree:
 
 @dataclass(frozen=True)
 class ContiguousZoneConfig:
-    """Dimensionless controls for the isolated root-stage experiment."""
+    """Dimensionless controls for the contiguous-zone algorithm."""
 
     max_root_iterations: int = 60
     reduced_cost_tolerance: float = 1e-8
@@ -84,7 +83,7 @@ class ContiguousZoneConfig:
     fill_time_fraction: float = 0.05
     shortage_penalty: float = 1_000.0
     # Unified zone-model business weights.  They are deliberately independent
-    # of the legacy compact-row objective: the zone model is the optimization
+    # of the compact-row reference objective: the zone model is the optimization
     # model, while row filling is an exact feasibility recourse.
     area_dispersion_weight: float = 0.25
     zone_dispersion_weight: float = 0.22

@@ -2,319 +2,83 @@
 
 ## 1. Planning boundary
 
-Detailed row-allocation demand consists only of declared export containers that have not yet entered the yard. Every such container must be allocated. Export forecasts are excluded from demand and capacity reservation.
+Detailed decisions cover only declared export containers that have not entered the yard. Every declared export box must be allocated; export forecasts and unallocated-demand variables are excluded.
 
-Import voyages are represented by anonymous capacity reservations. Only `new_qty` is future demand; `planned_qty` already includes in-yard boxes and is not incremental. Import reservations obey area-function compatibility, bay-size compatibility, and shared physical capacity. They do not inherit export voyage, discharge-port, height, or other no-mix constraints and do not receive detailed row assignments.
+Import voyages are represented by anonymous capacity reservations. Only large-plan `new_qty` is incremental import demand. `planned_qty` already includes in-yard boxes and is never read as new demand. Import reservation obeys area-function compatibility, bay-size compatibility, and shared physical capacity, but it does not inherit export voyage, discharge-port, height, or other detailed no-mix rules.
 
-Large-plan size is restricted to `20` and `40`; `40` covers physical 40/45-ft containers. `ALL`, blank, `45`, and unknown values are rejected.
+Large-plan size must be `20` or `40`; `40` denotes the physical 40/45-ft category. `ALL`, blank, `45`, and unknown values are rejected. Detailed 45-ft export demand may use only available edge large bays, subject to all ordinary footprint, size, row, and no-mix constraints. This restriction does not block feasible non-45-ft demand from edge positions.
 
-## 2. Common mathematical model
+## 2. Contiguous-zone formulation
 
-The compact M0 formulation uses integer export quantities at row locations, binary operational-group area and row activations, anonymous integer import reservations at bays, and binary auxiliaries for configured no-mix states.
+For each export group, area, and physical row, compatible atomic row footprints are ordered by bay number. A zone is a contiguous interval of those footprints. Selecting a zone dedicates every resource in the interval to that group and reserves the interval's full size-compatible capacity. Integer group-to-bay flow uses the reserved capacity and sums exactly to declared group demand.
 
-Both M0 and the paper algorithm enforce:
+The explicit capacity-protection rule is
 
-- complete allocation of declared export demand;
-- shared physical bay and row capacity;
-- size-specific bay and row capacity;
-- paired large-bay footprints for 40/45-ft containers;
-- stack availability and stack-height conversion;
+`zone capacity <= group demand + largest atomic-row capacity on the strip`.
+
+It excludes excessive unused reservation and bounds the implicit interval family. It is a model constraint, not a dominance claim.
+
+The master coordinates:
+
+- exact export demand flow;
+- full physical-footprint reservation and overlap;
+- bay physical and size capacity;
+- stack resources;
 - area-function eligibility;
-- configured bay-level and row-level no-mix attributes;
-- mandatory row separation by export voyage and discharge port;
-- mandatory height compatibility within a row;
-- 45-ft containers restricted to available edge large bays.
+- hard bay/row no-mix states;
+- voyage, discharge-port, and height separation for exports;
+- 40/45-ft paired footprints and 45-ft edge eligibility;
+- anonymous import capacity and export/import large-plan guidance.
 
-The 45-ft rule does not prohibit non-45-ft containers from other feasible edge positions. Import reservations share physical and size capacity with exports but receive no detailed no-mix constraints.
+An active group-area pair must have a selected zone, and actual area flow is bounded by the sum of selected-zone capacities clipped at group demand. A proof-only group-area zone-count inequality strengthens the root certificate; it is removed before primal integer search because it is valid for the root proof purpose but empirically delays incumbent discovery in the primal phase.
 
-## 3. Objective
+## 3. Unified objective
 
-The objective is a directly normalized weighted sum:
+All optimization, pricing, certification, upper bounds, and lower bounds use one normalized objective:
 
-| Component | Weight | Natural normalization |
+| Component | Weight | Natural scale |
 |---|---:|---|
-| operational-group area dispersion | 0.290 | maximum reachable group-area activations |
-| operational-group row dispersion | 0.240 | maximum reachable group-row activations |
-| distance from existing same-group boxes | 0.070 | reachable anchored demand and normalized bay-order distance |
-| export/import large-plan deviation | 0.270 | guided export and reserved import quantities |
-| berth-area travel distance | 0.130 | assigned export quantity and voyage-specific distance range |
+| extra group areas | 0.25 | reachable group-area activations |
+| extra disconnected zones | 0.22 | natural interval expansion by group |
+| existing-group proximity | 0.08 | reachable anchored quantity and normalized bay distance |
+| export/import large-plan L1 deviation | 0.22 | guided export and reserved import quantity |
+| unused reserved zone capacity | 0.13 | total declared export demand |
+| quantity-weighted berth distance | 0.10 | assigned quantity and voyage-specific distance range |
 
-All required berth-area distances must exist. Missing distance data is an input error.
+The unavoidable first area and first zone of each positive-demand group are removed from the two dispersion terms. All required berth-area distances must exist; missing data is an input error.
 
-## 4. Outer complete-voyage decomposition
+Exact row filling has no primary-objective term. It is a feasibility recourse with a separately reported secondary row-quality diagnostic, so it cannot change the zone-model bound or gap.
 
-The paper algorithm applies Dantzig-Wolfe decomposition by export voyage. One outer column is a complete integer row allocation for all groups of one voyage across all feasible yard areas. It contains the corresponding shared-resource and no-mix coefficients and its exact normalized business cost.
+## 4. Exact root pricing
 
-The outer restricted master selects exactly one complete plan per voyage. Export demand is already satisfied inside every column. The master coordinates shared bay/row resources, cross-voyage no-mix states, export large-plan deviation, and anonymous import reservation. Thus the number of convexity blocks grows with the number of voyages, not with voyage-area pairs.
+The restricted LP starts from a feasible zone subset. Dual prices decompose by group and ordered strip. Prefix sums convert each interval's reduced cost into a range-minimum query; a deterministic RMQ heap returns the exact top-k intervals without explicitly materializing every legal zone.
 
-Initial complete plans are obtained from single-voyage feasibility MIPs. Phase-I artificials relax only global coupling constraints and import balance. They are fixed to zero before activating the business objective and can never enter the final solution.
+Pricing uses adaptive per-group batches but terminates only after an exhaustive exact pass proves that no excluded legal interval has reduced cost below tolerance. At termination, the restricted-master objective equals the complete zone-LP optimum and is a valid global lower bound for the integer zone model. The restricted integer-master bound is never reported as global.
 
-## 5. Nested voyage pricing
+Automated micro-instance tests compare the generated root directly with full zone enumeration and independently compare RMQ pricing with exhaustive interval reduced costs.
 
-For a fixed outer dual vector, each voyage is priced independently. Its inner master selects one integer local pattern for every feasible area and enforces all group demands of that voyage. A local pattern may be zero or may assign partial group quantities to row locations in one area.
+## 5. Primal search and recourse
 
-Each area-pattern pricer is an integer MIP containing exact local physical, size, footprint, stack, bay/row no-mix, group-area activation, and group-row activation constraints. Full sweeps use raw inner duals, and time is allocated by the square root of candidate-row count. Up to three local patterns are returned per solve.
+The root support is enriched by a dimension-aware integer pool and solved as a restricted integer master. The incumbent is then improved through one objective-guided Fix-and-Optimize neighborhood. Groups are sorted by their attributable incumbent objective; selection stops after reaching the target objective mass or the candidate-zone budget. Defaults are 60% objective mass and 35% of all candidate zones. All decisions outside the chosen groups are fixed, while every legal zone for the selected groups is made available.
 
-Local MIP bounds yield a valid lower-bound correction for the inner voyage relaxation. That bound, less the outer voyage-convexity dual, is a valid bound on complete-voyage reduced cost. A negative integer inner-master solution supplies a new complete outer column.
+The resulting group-bay export flows and anonymous import reservation are fixed in an exact row-level recourse MIP. A constructive capacity certificate and the solver solution must agree on all fixed flows. The final output is accepted only after independent validation of demand, footprint, capacity, size, area-function, 45-ft edge, stack, and no-mix constraints. Any recourse or validation failure is a hard error; there is no greedy or M0 fallback chain.
 
-Because the inner local-pattern relaxation may have an integrality gap, it is not by itself an exact pricing certificate. When it cannot certify nonnegative reduced cost, or when its integer improvement is weak relative to its bound, the persistent complete-voyage row MIP performs strict certification. A timed certification may still contribute its finite Gurobi bound, but exact outer closure is declared only when every voyage is certified under the same outer dual vector.
+## 6. Bounds and comparison policy
 
-Every complete plan found by strict certification is split back into its area patterns, so information flows in both directions between the two pricing levels.
+The reported certificate is
 
-## 6. Bounds and convergence
+- `LB`: the closed exact-pricing root objective;
+- `UB`: the independently reconstructed objective of the validated integer zone solution;
+- `gap = (UB - LB) / |UB|`.
 
-For each complete outer sweep, the restricted-master objective plus the sum of negative valid voyage-pricing bounds is a valid lower bound for the complete-voyage Dantzig-Wolfe relaxation. If a sweep is interrupted, the algorithm retains the best bound from an earlier complete finite sweep. A skipped voyage or nonfinite pricing bound cannot form a certificate.
+`analyze_complete_zone_mip()` solves the fully materialized version of the same zone model and is the valid small-scale direct comparison. `DirectMilpPlanner` allocates directly at row locations and is retained because the zone algorithm inherits its shared row model for recourse. As a standalone M0 it has a different concentration representation and feasible set; cross-model objective subtraction is therefore deliberately disabled.
 
-The implementation uses no stabilization, branch-and-price, isomorphic reuse, case-specific area selection, runtime solver switch, greedy backup, or alternative incumbent chain.
+## 7. Reproducible stage-gate results
 
-## 7. Integer recovery
+With one Gurobi thread and a common solver budget:
 
-After root column generation, one restricted compact row MILP is solved. Its support contains row locations exposed by LP-active complete-voyage plans, the eight most recent plans per voyage, and the minimum additional locations required to give every export group sufficient raw support capacity.
+- Base instance, 60 s: `LB=0.1450871517`, adaptive-neighborhood `UB=0.1518251117`, gap 4.44%. The neighborhood selects 3 of 9 groups and exposes 27.46% of candidate zones while covering 64.79% of attributable objective.
+- 72-group instance, 120 s: `LB=0.1792403938`, initial restricted-MIP `UB=0.1993817657`, final `UB=0.1918854490`, gap 6.59%. The neighborhood selects 23 groups and improves the incumbent by 3.76%. Exact recourse realizes all 2,241 export boxes and 624 import-reserved boxes.
+- Same-model complete zone MIP on the 72-group instance, 120 s: `UB=0.2073750105`, `LB=0.1797169064`, gap 13.34%.
 
-This MILP enforces the complete original model and is solved once with zero requested MIP gap within its allowance. It supplies only a feasible primal upper bound. Its restricted-model bound is never used as a complete-model lower bound; the reported global gap always uses the valid column-generation lower bound.
-
-## 8. M0 baseline and regression checks
-
-M0 is the complete compact row-location MILP. It creates all feasible row locations and uses the same hard constraints, import representation, normalization, and weights. It has no decomposition, pricing, Phase I, or alternate solution chain.
-
-Small-instance tests require M0 and the paper algorithm to return the same objective and independently valid row output. Additional tests verify strict root closure on a complete-column case and cross-voyage row separation.
-
-## 9. Alternative strengthened logic-based Benders solver
-
-The optional `lbbd` solver is isolated from both complete-voyage column generation and M0. Its master contains integer group-to-bay quantities, anonymous integer import reservations, binary voyage-row-footprint ownership states indexed by the declared row no-mix class, and continuous routing flow from group-bay quantities to compatible row footprints. A footprint may activate at most one row class, and overlapping footprints across voyages and sizes share the same physical-row packing constraints.
-
-The master also carries operational-group row counts and area activations, so all five normalized business objectives are represented before decomposition. Every area-activation link uses the minimum of operational-group demand and the area's candidate quantity upper bound, rather than total demand as a generic Big-M. A cardinality cover further requires enough active areas for their combined valid upper bounds to carry the operational-group demand. Exact bay physical/size capacity, stack capacity, configured bay no-mix states, large-plan guidance, import guidance, row-capacity envelopes, and maximal conflict-clique/Hall inequalities strengthen the relaxation. Routing remains continuous; consequently the master is not a duplicate of M0 and its bound remains a valid lower bound for the common model.
-
-The extended formulation removes unused-resource symmetry with four canonical links: every active row-class owner carries at least one routed box; an operational row count cannot exceed either its assigned boxes or its compatible active owners; and the number of owners in one voyage-bay-row-class cannot exceed the compatible operational row counts. These links do not add a business rule or alter the projected feasible set.
-
-For each export voyage, one persistent integer subproblem fixes the master group-bay quantities and active row-class footprints, then performs the exact row allocation under physical/size footprint constraints and row no-mix rules. The current master routing flow is supplied as a MIP start. The union of all voyage solutions is globally feasible because physical footprint ownership is already coordinated in the master; no global compact repair is used.
-
-An infeasible voyage subproblem first attempts a globally valid Hall-capacity cut on its IIS demand core. If aggregate capacity is not the cause, a monotone conditional logic cut requires either a reduced core allocation or a newly activated compatible row-class footprint. A solved voyage subproblem can analogously add a conditional lower-bound cut when its exact row-dispersion cost exceeds the master theta value. Repeated exact voyage assignments are cached.
-
-Initialization uses the same resource master in two phases: a short zero-objective solve obtains a feasible skeleton, after which the original normalized objective is restored and the remaining initialization budget polishes that incumbent. This is not an alternative model or fallback chain. The first formal master solve then keeps one continuous search tree for all time not reserved for exact voyage validation. A 20-second reoptimization slice is used only after a newly generated cut changes the master.
-
-This implementation is an experimental alternative and does not modify the `cg` or `direct` execution paths. It shares preprocessing, objective coefficients, and independent output validation with the other solvers, but it never invokes either solver internally.
-
-## 10. Row-profile resource aggregation variant
-
-The separate `lbbd_profile` solver replaces concrete voyage-row-class ownership binaries with integer counts of exchangeable row profiles. A safe profile preserves its anchor bay, every bay in the 20/40/45-ft physical footprint, per-slot physical and size capacity, candidate group compatibility, height, and row no-mix class. Only the concrete row labels are removed. The same aggregation is applied to continuous group-profile routing edges.
-
-Profiles remain voyage-specific for routing and objective accounting. Profiles whose complete sets of concrete physical footprints are identical share one static physical-pool capacity. In addition, connected sets of partially overlapping footprint pools receive Hall-style packing bounds: the total number of activated profile states cannot exceed the maximum number of mutually disjoint physical footprints in that pool. Aggregate bay-row counts provide further necessary packing constraints. All these constraints are relaxations of concrete physical placement and therefore preserve a valid master lower bound.
-
-For each profile/no-mix state, the sum of its routing flows is bounded by the physical row capacity times its integer profile count. This prevents several compatible group flows from independently reusing the same aggregate row capacity. The weaker profile-wide capacity envelope is not used.
-
-For a fixed profile-count incumbent, a global binary footprint-matching problem selects concrete templates across all voyages and row classes. It enforces one state per concrete template and at most one selected footprint on every physical row slot. A proven-infeasible matching extracts an IIS profile-state core; a separate maximum set-packing solve first attempts a stronger valid upper bound for that core. If that short packing solve does not yield a violated bound, an exact conditional matching-feasibility cut still excludes the certified infeasible aggregate state. A feasible matching supplies concrete row owners to the same exact voyage subproblems used by `lbbd`.
-
-Failure of the voyage solves under one feasible footprint matching is not treated as proof that the aggregate point is infeasible. In that case, an exact global recourse MIP jointly chooses all concrete footprints and row allocations while fixing only the master group-bay quantities and profile-state counts. The same oracle is called when a feasible fast disaggregation has row cost above the master theta estimate. Exact infeasibility yields an IIS-core conditional aggregate feasibility cut. A finite recourse lower bound above theta yields a conditional optimality cut on the sum of voyage theta variables. These cuts are active only at the certified aggregate integer assignment (or its IIS core) and become inactive after a relevant quantity/profile-state change, so they cannot remove a different feasible aggregate plan. IIS-core quantity changes are encoded in both directions; full-assignment cuts exploit fixed group demand to omit redundant zero-valued quantity terms.
-
-The master is reoptimized after every generated packing, feasibility, or optimality cut. Without a wall-clock or iteration limit, the finite aggregate integer state space and exact conditional cuts give the standard finite LBBD closure argument. Under a time limit, the reported master bound remains a valid lower bound and convergence is reported only when the master is optimal, every aggregate incumbent has exact feasible recourse, and no violated cut remains. The global oracle is built lazily; when the fast disaggregation attains the valid theta lower estimate, that equality itself certifies exact recourse and the larger oracle is skipped.
-
-Initialization solves only a zero-objective aggregate feasibility skeleton. It immediately performs global footprint matching and all exact voyage row subproblems. If this disaggregation succeeds, the resulting complete row allocation is mapped back to every principal master variable and supplied as the formal master MIP start. There is no separate aggregate-objective polishing phase and no M0 repair.
-
-The profile solver is deliberately isolated from `lbbd`, M0, and column generation. It has its own benchmark entry point and can be removed or revised without changing any established solver path. It is currently an experimental compression variant, not the default paper algorithm.
-
-## 11. Selective resource-state decomposition variant
-
-The separate `lbbd_selective` solver keeps integer group-bay quantities, tightened area-activation links, area cardinality covers, and all other hard aggregate constraints of `lbbd_profile`, but imposes integrality on only a selected subset of profile/no-mix states and operational row counts. Profile selection starts from a sublinear, voyage-balanced scarcity and business-relevance budget. Shared physical-footprint pools and partially overlapping pools define a conflict hypergraph; a deterministic greedy cover contributes at most the square root of the hyperedge count as protected conflict seeds, so conflict information cannot replace a large fraction of the proven structural core. A second sublinear, voyage-balanced budget relaxes high-pressure row-count variables; all remaining row counts stay integer. Every relaxation enlarges the strict profile master feasible region, so its objective bound remains a valid lower bound for the complete row model.
-
-The implementation has one independent master-oracle-cut loop. Before formal optimization, all row-count variables are relaxed only long enough to obtain a zero-objective quantity probe; their formal variable types are then restored. For each queried quantity point, the joint exact row-recourse MIP is built only on positive group-bay support. Every omitted group-bay quantity is fixed to zero at that point, so deleting its placement variables is an exact reduction rather than heuristic filtering. Model construction and optimization are both charged to the oracle's live allowance. A separate restricted exact-row model repairs an infeasible point by allowing its active bays plus a small deterministic set of alternatives. Before any incumbent exists, the repair first stops at the first complete solution and then uses the same model and remaining phase time to improve it. The repaired plan is further improved by a voyage-balanced row-level neighbourhood whose group selection is deliberately independent of cut support. Repair and neighbourhood bounds never enter the global proof; only independently validated incumbents are mapped to the formal master as MIP Starts.
-
-The exact oracle fixes only the complete integer group-bay quantity vector; profile counts are strengthening variables and are never treated as first-stage decisions. The oracle jointly chooses all concrete footprints, resource states, and integer row placements. Returned quantities are independently reconstructed before acceptance, so no solution is reported unless every demand, physical capacity, size, footprint, 45-ft edge-bay, row no-mix, area-function, and import-reservation constraint has a concrete feasible realization.
-
-If exact recourse proves a formal master incumbent infeasible, the IIS is mapped back to compatible profile states and operational row-count variables. A scale-bounded batch is changed irreversibly from continuous to integer, ranked by IIS quantity, conflict incidence, and the original structural score. The master is then reoptimized. Only when the IIS contains no still-relaxed compatible state does separation fall through to a certified feasibility cut. The relaxed initialization probe is not a formal master incumbent and therefore cannot trigger promotion; it may only produce a valid cut and an independent repair attempt. Because every state is promoted at most once and the underlying state set is finite, adaptive refinement is finite. Each promoted master remains a relaxation of the complete row model, and every previously reported lower bound remains valid after tightening.
-
-Two valid cut classes are separated explicitly. The exact row model is componentwise downward-closed in its fixed nonnegative quantity requirements. IIS separation searches compact physical subsets defined by bay, bay and row class, voyage, size, and related resource labels. A typed footprint-flow packing certificate routes every quantity only to compatible owners and maximizes its attainable capacity. If the certified bound is below the incumbent quantity, the master receives a stronger linear capacity inequality without new binary variables. A compact IIS without such a certificate receives the monotone fallback cut; an unseparated large IIS is never expanded into thousands of auxiliary binaries. For feasible recourse, exact per-voyage lower bounds generate local quantity-conditional optimality cuts on substantially smaller supports. These cuts affect only the proof master; conflict repair and row-neighbourhood selection remain an independent upper-bound path.
-
-All selective phases share one wall-clock deadline. Dimensionless phase envelopes scale with the total time limit and are intersected with the current remaining time; unused time returns to the common pool, while an early end of the decomposition loop gives the remaining budget to a final primal neighbourhood. No base-case, many-group, or conflict-case timing branch exists. A timeout without an infeasibility certificate never generates a cut.
-
-This is an additional experimental algorithm, not an internal mode switch. The `lbbd_profile`, `lbbd`, `cg`, and `direct` entry points are unchanged, and the selective implementation never calls any of them as a fallback or repair solver.
-
-## 12. Physical-row configuration generation experiment
-
-`benchmark_row_configurations.py` evaluates a separate Dantzig--Wolfe decomposition without changing any established solver. A block is one physical row track `(area, row_no)`. Each generated configuration is an integer allocation on the complete track and enforces row physical capacity, size capacity, 20/40/45-ft footprint overlap, and declared row and bay no-mix compatibility locally. Group demand, bay-wide capacity and size limits, stack resources, anonymous import reservation, area guidance, bay attributes, and the normalized business objective remain linking rows in the restricted master. Consequently, complete exact pricing would be an exact reformulation of M0 rather than a heuristic relaxation.
-
-The implementation uses a persistent integer pricing MIP for every row track, Phase-I artificial demand, adaptive multi-column solution pools, exact raw reduced-cost checks, and the standard blockwise Lagrangian bound `RMP objective + sum(min(0, block reduced-cost bound))`. Pure-group consolidation configurations are generated before Phase I and are also available to the final binary restricted master. A complete row solution is expanded to the original M0 placement variables and passes the same independent validator.
-
-Development follows an explicit stage gate. Micro instances must match the complete M0 LP and M0 integer optimum; these automated checks pass. The real base instance, however, reaches the same M0 LP value only through a long degenerate tail, while M0 solves its LP directly much faster. Under 120 seconds, neither the natural-conflict nor the 72-group case closes pricing or produces a useful certified row-configuration lower bound, whereas their M0 LP relaxations solve in about 19 seconds. The base restricted master also gives a weaker upper and lower bound than M0 under equal 60-second budgets. Therefore no Branch-and-Price tree or branching component is added. The code is retained only as an isolated, reproducible negative algorithm experiment.
-
-## 13. Hard-state row-template Benders experiment
-
-`yard_planning/template_flow_benders.py` tests a classical rather than logic-based Benders boundary. The master chooses a hard handling class on each mixed-size physical row footprint, an integer capacity and integer stack use assigned to every active template, and the anonymous import reserve. The handling class is induced only by export voyage, flow, and the configured hard bay/row no-mix attributes. Area and row concentration are charged to those handling classes. Export large-plan shares are converted to integer area targets by a deterministic largest-remainder apportionment; import quantities continue to use `new_qty` and retain only area-function, size, and common-capacity restrictions.
-
-Given the master capacities, the persistent recourse LP assigns every declared export box to compatible templates. Existing-group proximity, quantity-weighted berth distance, and export area-guidance deviation are recourse costs. A Phase-I shortage LP provides feasibility cuts when necessary; an optimal recourse dual provides a classical affine lower estimator in the template-capacity variables. The same integer master first obtains one feasible seed, with an upper budget defined as a fraction of post-build remaining time and automatic early termination at its first solution. Root cuts are then generated with continuous template states before the seeded master is integerized again. `TemplateFlowDirectPlanner` is the compact direct reference for exactly this redefined objective and grouping policy. Both methods use one end-to-end solver budget. They are research-only entry points and do not modify M0, CG, or any existing LBBD path.
-
-The formulation is exact on the automated micro instance: Benders and its compact reference both return `0.132`, the recourse flow is integral, dual optimality cuts are active, and independent row validation passes. On the base instance under an end-to-end 30-second solver budget, Benders obtains `UB=0.14339579`, `LB=0.14073978` (1.852% gap), while the same-model compact reference obtains `UB=0.14271036`, `LB=0.14214814` (0.394% gap). On the 72-group instance at 120 seconds, every group is already a distinct hard handling class, so 55,418 row arcs induce 55,418 templates and no dimensional compression. Benders finds the better incumbent (`UB=0.21430037` versus `0.21820084`) but has a much weaker bound (`LB=0.16397563` versus `0.18943692`), hence a 23.48% gap versus 13.18% for the compact reference. Thus the dual cuts are operational and the decomposition can aid upper-bound search, but it does not improve certified solution quality when fine groups coincide with hard storage states. The implementation is retained as a clean, reproducible structural test rather than promoted as the paper algorithm.
-
-## 14. Dedicated contiguous-zone two-problem experiment
-
-`yard_planning/contiguous_zone_generation.py` tests a model boundary that is
-materially different from M0. Problem 1 chooses contiguous runs on an
-`(export group, area, physical row)` strip and sends integer group-to-bay
-quantities through the selected runs. Group flow sums exactly to declared
-demand. A selected run reserves the complete size-compatible capacity of each
-physical row footprint in that run, while an explicit unused-capacity term
-charges the difference between reserved capacity and actual export flow. This
-dedicated convention makes physical overlap, bay and size capacity, stack
-count, hard no-mix state, and anonymous import reservation additive master
-rows. Existing-group proximity, berth distance, area activation, and export
-large-plan deviation are all evaluated on actual assigned quantities rather
-than on full zone capacity. Concentrated storage is represented by the number
-of selected contiguous zones, so this objective and feasible set are not M0.
-
-Problem 1 has one normalized weighted objective at this same decision level:
-extra group areas (0.25), extra disconnected contiguous zones (0.22),
-quantity-weighted proximity to existing same-class stock (0.08), export plus
-import large-plan L1 deviation (0.22), unused reserved zone capacity (0.13),
-and quantity-weighted berth distance (0.10). The six weights sum to one. Area
-and zone dispersion subtract the unavoidable first activation of every
-positive-demand group; the other terms use natural instance scales. Thus the
-priced root, integer incumbent, objective certificate, reported business
-objective, and gap all refer to exactly the same function.
-
-Two integer-hull inequalities strengthen every group-area pair. An active area
-must be supported by a selected zone, and its actual flow cannot exceed the sum
-of `min(zone capacity, group demand)` over selected zones. The latter clips an
-oversized interval's fractional capacity contribution without changing any
-integer solution. Individual group-bay flow-capacity links remain in the model;
-the aggregate cover is a strengthening, not a substitute.
-A third, proof-only dominance bound limits selected zones in a group-area pair
-by the number of its atomic row candidates times the area state. It preserves
-an optimum because every selected zone consumes at least one distinct atomic
-row and a positive-cost zone with no supporting area flow can be removed. This
-bound materially strengthens the exact root but is removed after root closure:
-controlled ablation shows that retaining it in the time-limited integer search
-slows incumbent discovery. The certified root bound remains valid, while every
-primal candidate is independently reconstructed under the complete model.
-
-Problem 1 includes an explicit zone-capacity protection rule. On each strip,
-a selected interval may reserve at most the group demand plus the largest
-atomic-row capacity on that strip. Thus indivisible row reservation may leave
-up to one maximum atomic row of slack, but a very long, lightly used bridge
-cannot be chosen solely to avoid an additional zone activation. The unused-
-capacity term still differentiates intervals within this hard operational
-limit. Intervals beyond the limit are excluded by the mathematical model; they
-are not claimed to be dominated preprocessing.
-
-Candidate intervals satisfying this rule are counted but not materialized. For
-a fixed start row,
-reduced cost is a prefix sum on each side of the group-demand capacity
-breakpoint. Static range-minimum trees identify the best end row in both
-regimes, and heap range splitting returns the exact top-K intervals without
-scanning every end point. The first available interval for each group also
-certifies its minimum reduced cost. Root pricing therefore closes only when no
-nonactive interval is below `-1e-8`; complete materialization is confined to
-the explicit full-LP/full-MIP references. Phase I and degenerate business
-rounds use adaptive batches. The integer enrichment pool is capped by
-the square root of average interval count rather than a fixed number of columns
-per group.
-
-The integer upper-bound phase keeps the persistent restricted zone master and
-adds one objective-guided Fix-and-Optimize neighborhood. A per-group incumbent
-score attributes the group-separable portion of the unified objective to the
-incumbent groups. Groups are ranked by this contribution and greedily selected
-until they cover 60% of attributable objective, subject to a candidate-zone
-budget equal to 35% of the complete zone set. At least the highest-contribution
-group is retained even when it alone exceeds that budget. These two controls
-are dimensionless, so neighborhood size adapts to both objective concentration
-and instance size rather than using a fixed group count. All decisions outside
-the neighborhood are fixed; inside it, every legal contiguous zone is opened
-in an exact local MIP. Any improving local solution is a globally feasible
-incumbent, and its previously absent zones are returned to the persistent
-integer master.
-The local/master time split is a dimensionless fraction of the remaining
-budget, with no instance-name or fixed-second switch. The former Branch-and-
-Price probe is no longer part of the solve path because repeated benchmarks
-showed no observable bound improvement.
-
-Problem 2 is an exact row-level recourse model on the single primary support.
-Both the integer group-bay export flows and the anonymous import reservation
-from Problem 1 are fixed; recourse cannot silently change either decision.
-Before optimization, a constructive assignment fills every group-bay flow
-within its selected atomic rows. Because selected zones have disjoint dedicated
-physical footprints, this is also an explicit feasibility certificate. The row
-MILP then applies every original detailed constraint, including 45-ft edge-bay
-eligibility, and its output passes the common independent validator. Its legacy
-row-level score is retained only as a secondary realization-quality diagnostic;
-it is not part of Problem 1 or its gap. A separate objective certificate
-reconstructs the complete Problem-1 objective from the
-selected zones, actual flows, area states, guidance deviations, and import
-reservation; a negative discrepancy from the solver incumbent is an error.
-
-The lower-bound scopes remain separated. The closed generated root is a valid
-lower bound for the complete zone model. The Gurobi bounds of the restricted
-integer pool and the fixed-neighborhood MIP are not global, and the row-
-recourse bound is valid only after fixing the selected support and flows. None
-is reported as an M0 certificate. Fix-and-Optimize changes only the incumbent;
-it cannot weaken or overstate the exact priced-root certificate.
-
-The automated suite contains an independent exhaustive-pricing comparison,
-generated-versus-complete zone-LP equality, objective reconstruction, exact
-flow realization, bound ordering, and final output validation. On the base
-instance, under the unified objective and proof-only area bound, exact pricing
-closes at `LB=0.1450871517`. Under the full 60-second algorithm budget the
-restricted integer master obtains `UB=0.1519676997`. The adaptive neighborhood
-selects three of nine groups, covers 64.79% of attributable objective with
-27.46% of candidate zones, and improves the incumbent to `UB=0.1518251117`.
-The certified gap is 4.44%, and the algorithm core uses about 57.8 seconds. The
-same-model complete MIP gives `UB=0.1515627477` and
-`LB=0.1507413501` (0.54% gap), so it remains preferable at this scale.
-
-On the 72-group instance, 55,418 atomic row locations induce 120,038 possible
-zones. Under a 120-second, one-thread solver budget, exact root pricing closes
-at `LB=0.1792403938` with 14,055 active zones. Adaptive integer enrichment adds
-2,952 zones. In the controlled adaptive-versus-fixed comparison, the restricted
-MIP obtains `UB=0.1993817657`; the adaptive neighborhood selects 23 groups,
-covers 60.06% of attributable objective with 33.98% of candidate zones, and
-improves the incumbent to `UB=0.1918854490`, a 3.76% upper-bound reduction. The
-certified complete-zone gap is 6.59%. Under the same machine state and budget,
-the committed fixed-18 baseline improves a nearly identical initial incumbent
-from `0.1993729577` to `0.1934814039` (2.96%), with a 7.36% final gap. Exact
-recourse assigns all 2,241 export boxes and preserves all 624 import-reserved
-boxes; the adaptive algorithm core uses about 118.0 seconds.
-
-The same-model complete MIP gives `UB=0.2073750105`, `LB=0.1797169064`, and a
-13.34% gap on the 72-group case. Thus the generated algorithm is slightly
-weaker in its lower bound but markedly stronger in its incumbent and final
-certificate at scale. M0 remains a different-model structural reference. The
-observed upper-bound improvement is attributed only to the objective
-neighborhood. The tested resource-conflict score was removed after its ablation
-failed to improve the incumbent, and the fixed group-count rule was replaced
-only after the controlled comparison above. The exact global lower bound
-remains the closed proof-root bound.
-
-The experiment remains absent from `run_yard_plan.py`. It neither imports nor
-invokes the existing `cg`, `direct`, or LBBD solvers, and no existing solver
-selects it by instance size.
-
-### Complete-group contiguous-zone pattern stage gate
-
-`yard_planning/group_zone_pattern_generation.py` is a separate structural
-experiment on the same redefined contiguous-zone model. One Dantzig--Wolfe
-column is a complete integer plan for one export group: it selects every
-dedicated zone needed by the group and routes its full declared quantity to
-anchor bays. The master selects exactly one pattern per group and coordinates
-physical rows, bay/size/stack capacities, hard bay states, large-plan
-deviation, and anonymous import reservation. Its persistent integer pricing
-MIP drops locally redundant hard-attribute states and keeps the bounded
-single-commodity flow continuous because its extreme points are integral.
-
-Root generation first uses exact multi-column pricing, then switches to a
-threshold oracle that either exhibits a negative-reduced-cost pattern or
-proves none exists. If the complete root cannot close, the reported lower
-bound is the restricted-master dual value corrected by the valid lower bound
-of every pricing MIP; it is never replaced by the restricted integer-master
-bound. A deterministic globally disjoint pattern seed avoids artificial
-Phase-I tails. The integer pattern pool is then strengthened by a
-conflict-aware Fix-and-Optimize step: a dimensionless square-root-sized set of
-high-cost groups sharing candidate areas and sizes is jointly reoptimized on
-the complete zone model, and the resulting group patterns are returned to the
-integer master. Selected group-bay flows and import reservation are finally
-fixed in the existing exact row-recourse formulation and independently
-validated.
-
-The automated micro instance matches the fully enumerated zone MIP under the
-unified objective. The former base and 72-group numbers used the superseded
-objective and have therefore been removed rather than presented as comparable
-evidence. The experiment remains an isolated, reproducible redesign rather
-than the current paper algorithm. It is not registered in `run_yard_plan.py`
-and does not modify any existing solver path.
+These measurements establish correctness and a scale-stage algorithmic advantage over the same-model complete MIP. They are development evidence, not a substitute for the final paper experiment design, multi-seed robustness analysis, or formal complexity discussion.

@@ -6,10 +6,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from adapters.input_adapter_gd import InputAdapterGd
+from adapters.input_adapter_gd import InputAdapterGd, normalize_voyage_id
 from adapters.planning_input import load_planning_inputs
-from benchmark_profile_benders import _summary
-from run_yard_plan import DEFAULT_INPUT, DEFAULT_LARGE_PLAN, resolve_voyages
 from yard_planning.contiguous_zone_generation import (
     ContiguousZoneConfig,
     ContiguousZoneGenerationPlanner,
@@ -18,9 +16,67 @@ from yard_planning.direct_milp import DirectMilpPlanner
 from yard_planning.planner import ColumnGenerationConfig, write_json
 
 
+ROOT = Path(__file__).resolve().parent
+DEFAULT_INPUT = ROOT / "example" / "input_data.json"
+DEFAULT_LARGE_PLAN = ROOT / "example" / "large_plan.csv"
+
+
+def resolve_voyages(
+    large_plan: pd.DataFrame,
+    requested: list[str] | None,
+) -> list[str]:
+    if requested:
+        values = requested
+    else:
+        voyage_column = next(
+            (
+                name
+                for name in ("voy_id", "voyage_id", "VOY_ID")
+                if name in large_plan.columns
+            ),
+            None,
+        )
+        if voyage_column is None:
+            raise SystemExit("large plan must contain voy_id or voyage_id")
+        values = large_plan[voyage_column].dropna().tolist()
+    voyages = sorted(
+        {
+            normalized
+            for value in values
+            if (normalized := normalize_voyage_id(value))
+        }
+    )
+    if not voyages:
+        raise SystemExit("no voyages found in the large plan")
+    return voyages
+
+
+def summarize(diagnostics: dict) -> dict:
+    keys = (
+        "algorithm",
+        "model_scope",
+        "planned_group_count",
+        "planned_box_count",
+        "candidate_row_location_count",
+        "zone_model_upper_bound",
+        "zone_model_global_lower_bound",
+        "zone_model_absolute_gap",
+        "zone_model_relative_gap",
+        "zone_model_lower_bound_source",
+        "zone_selected_candidate_count",
+        "zone_candidate_reduction",
+        "total_seconds",
+    )
+    return {
+        key: diagnostics[key]
+        for key in keys
+        if diagnostics.get(key) is not None
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Benchmark the isolated contiguous storage-zone stage gate."
+        description="Solve and benchmark the contiguous storage-zone model."
     )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--large-plan", type=Path, default=DEFAULT_LARGE_PLAN)
@@ -49,7 +105,7 @@ def parse_args() -> argparse.Namespace:
         "--compare-row-m0",
         action="store_true",
         help=(
-            "Run the legacy row-level M0 only as a different-model "
+            "Run row-level M0 only as a different-model "
             "structural reference; objectives are not subtracted."
         ),
     )
@@ -110,7 +166,7 @@ def main() -> None:
         output = {"complete_zone_mip": planner.analyze_complete_zone_mip()}
     else:
         result = planner.solve()
-        output = {"contiguous_zone": _summary(result.diagnostics)}
+        output = {"contiguous_zone": summarize(result.diagnostics)}
         output["contiguous_zone_diagnostics"] = {
             key: value
             for key, value in result.diagnostics.items()
@@ -119,7 +175,7 @@ def main() -> None:
         }
         if args.compare_row_m0:
             direct = DirectMilpPlanner(inputs.problem, common).solve()
-            output["row_m0_different_model_reference"] = _summary(
+            output["row_m0_different_model_reference"] = summarize(
                 direct.diagnostics
             )
             output["cross_model_objective_difference_reported"] = False
