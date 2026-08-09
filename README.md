@@ -94,17 +94,20 @@ that an integer template capacity yields an integral transportation flow.
 the scientifically valid direct reference, while `--compare-direct` retains
 the original M0 comparison.  Neither solver is registered in `run_yard_plan`.
 
-`benchmark_contiguous_zones.py` is an independent two-problem experiment. It
-first generates dedicated contiguous storage zones for each export group by
-exact on-demand interval pricing. It then solves an integer zone-support
-master, probes an exact Branch-and-Price tree, and returns low-yield branch
-time to the same persistent restricted-MIP search. The certified root solution
-is reused at the tree rather than solved again. Finally, at most the initial
-and post-search supports are filled by the original detailed row model, and
-the support with the better true business objective is retained. A small
-LP-guided feasibility augmentation supplies the initial MIP start; it does not
-replace pricing or serve as a backup solver. Every returned row plan is
-independently validated.
+`benchmark_contiguous_zones.py` is an independent two-level experiment. Its
+primary master sends the actual declared quantity of each export group through
+dedicated contiguous row zones. Exact prefix/RMQ top-K pricing avoids scanning
+all intervals; adaptive batches accelerate degenerate rounds. Capacity-cover
+and zone-support inequalities strengthen the root relaxation. An integer
+restricted master uses a square-root adaptive enrichment pool. Its proportional
+Branch-and-Price probe shares generated columns and returns time immediately
+when its first node cannot close; rebuilt child LPs inherit the parent
+primal/dual start. The selected
+group-bay export flows and anonymous import reservation are then fixed in a
+compact row recourse model. A constructive capacity certificate proves that
+the chosen disjoint zones can realize every export flow, and the solver also
+reconstructs the primary objective independently before validating the final
+row plan.
 This experiment deliberately changes the paper model: a selected zone reserves
 the full compatible capacity of its physical rows, so its objective and
 feasible set are not those of M0. It is not registered in `run_yard_plan` and

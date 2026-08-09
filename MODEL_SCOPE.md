@@ -148,87 +148,95 @@ The formulation is exact on the automated micro instance: Benders and its compac
 ## 14. Dedicated contiguous-zone two-problem experiment
 
 `yard_planning/contiguous_zone_generation.py` tests a model boundary that is
-materially different from M0. Problem 1 chooses one or more contiguous runs on
-an `(export group, area, physical row)` strip. A selected run reserves the
-complete size-compatible capacity of every row footprint in that run. This
-dedicated-capacity convention makes physical row overlap, bay capacity, size
-capacity, stack count, hard no-mix state, group-area activation, export area
-guidance, and anonymous import reservation additive master rows. Concentrated
-storage is represented directly by the number and length of selected zones,
-rather than reconstructed from independent quantity variables.
+materially different from M0. Problem 1 chooses contiguous runs on an
+`(export group, area, physical row)` strip and sends integer group-to-bay
+quantities through the selected runs. Group flow sums exactly to declared
+demand. A selected run reserves the complete size-compatible capacity of each
+physical row footprint in that run, while an explicit unused-capacity term
+charges the difference between reserved capacity and actual export flow. This
+dedicated convention makes physical overlap, bay and size capacity, stack
+count, hard no-mix state, and anonymous import reservation additive master
+rows. Existing-group proximity, berth distance, area activation, and export
+large-plan deviation are all evaluated on actual assigned quantities rather
+than on full zone capacity. Concentrated storage is represented by the number
+of selected contiguous zones, so this objective and feasible set are not M0.
 
-The interval set is represented by ordered atomic placements and contiguous
-strip runs; candidate intervals are counted but not materialized. Exact pricing
-scans those runs on demand using cached atomic capacity, conflict, attribute,
-and objective coefficients. Phase I uses an adaptive per-group batch based on
-the square root of average interval count; after all export shortage disappears,
-pricing returns to a small batch. The persistent root master stops only when no
-interval has reduced cost below `-1e-8`, using `1e-9` LP feasibility and
-optimality tolerances. Complete interval materialization is confined to the
-explicit full-LP/full-MIP reference modes.
+Two integer-hull inequalities strengthen every group-area pair. An active area
+must be supported by a selected zone, and its actual flow cannot exceed the sum
+of `min(zone capacity, group demand)` over selected zones. The latter clips an
+oversized interval's fractional capacity contribution without changing any
+integer solution. Individual group-bay flow-capacity links remain in the model;
+the aggregate cover is a strengthening, not a substitute.
 
-The area and hard-attribute state formulations contain both capacity links and
-aggregate presence links. Thus a state fixed to one by a branch must be used by
-at least one selected interval, while a state fixed to zero excludes every
-corresponding interval. These reverse links remove redundant activated states
-without changing the integer projection. The custom best-bound
-Branch-and-Price tree branches successively on area states, hard-attribute
-states, interval variables, and integer import reserve. Every processed node
-is rebuilt over the global generated pool and closed by the same exact interval
-oracle; forbidden interval branches are also enforced in pricing. Artificial
-branch slacks preserve Phase-I feasibility and a node is declared infeasible
-only after pricing closes with positive artificial use.
+Candidate intervals are counted but not materialized. For a fixed start row,
+reduced cost is a prefix sum on each side of the group-demand capacity
+breakpoint. Static range-minimum trees identify the best end row in both
+regimes, and heap range splitting returns the exact top-K intervals without
+scanning every end point. The first available interval for each group also
+certifies its minimum reduced cost. Root pricing therefore closes only when no
+nonactive interval is below `-1e-8`; complete materialization is confined to
+the explicit full-LP/full-MIP references. Phase I and degenerate business
+rounds use adaptive batches, while the integer enrichment pool is capped by
+the square root of average interval count rather than a fixed number of columns
+per group.
 
-The certified root solution supplies the first branch directly, avoiding a
-degenerate root re-solve after pool enrichment. After both children of this
-first split have been closed, tree progress is assessed by dimensionless
-quantities: fraction of the Branch-and-Price envelope consumed and fraction of
-the incumbent-root gap closed. If at least 25% of the envelope has been used
-while less than 1% of that gap has closed, the exact tree is suspended with its
-open-node bound intact. Unused time returns to the same persistent restricted
-integer master without modifying its variables or restarting its search tree.
-These thresholds are exposed by the benchmark rather than selected by instance
-name or size.
+The custom best-bound Branch-and-Price probe branches on area states,
+hard-attribute states, interval variables, export flows, and import reserves.
+Forbidden interval branches are enforced in both the node master and pricing.
+The certified root primal/dual LP start is inherited by the first children;
+later children inherit their parent's matching variable and row values even
+though the node model is rebuilt over the shared generated pool. The first
+node is restricted to a dimensionless fraction of the available branch
+envelope. Failure to close it within that probe, or insufficient relative gap
+closure, returns unused time to the same persistent restricted-MIP search.
+There is no instance-name or fixed-second switch.
 
-Problem 2 is the unchanged compact row MILP restricted to rows exposed by a
-zone support. Within a 5% end-budget envelope, it evaluates at most two distinct
-supports: the initial restricted-MIP incumbent and the best support after the
-tree probe and resumed search. The support with the smaller original normalized
-business objective is retained. Each fill rechecks exact quantities, row and
-bay hard constraints, 45-ft edge footprints, anonymous import capacity, and
-all original row rules; the chosen output passes the common independent
-validator.
+Problem 2 is an exact row-level recourse model on the single primary support.
+Both the integer group-bay export flows and the anonymous import reservation
+from Problem 1 are fixed; recourse cannot silently change either decision.
+Before optimization, a constructive assignment fills every group-bay flow
+within its selected atomic rows. Because selected zones have disjoint dedicated
+physical footprints, this is also an explicit feasibility certificate. The row
+MILP then applies every original detailed constraint, including 45-ft edge-bay
+eligibility, and its output passes the common independent validator. A separate
+objective certificate reconstructs the complete Problem-1 objective from the
+selected zones, actual flows, area states, guidance deviations, and import
+reservation; a negative discrepancy from the solver incumbent is an error.
 
 The lower-bound scopes remain separated. A closed generated root and the
-minimum bound of the open Branch-and-Price nodes are valid global lower bounds
-for the complete zone model. The Gurobi bound of the integer restricted pool is
-not global, and a Problem-2 bound is valid only on its selected row support.
-None is reported as an M0 certificate. With finite node, iteration, and time
-limits the tree may stop early; if the queue is exhausted after every node has
-closed, the zone integer model is exact.
+minimum open-node bound are valid for the complete zone model. The Gurobi bound
+of the integer restricted pool is not global, and the row-recourse bound is
+valid only after fixing the selected support and flows. None is reported as an
+M0 certificate. Exhausting a fully priced branch tree would prove the zone
+integer model; the current adaptive probe can stop earlier and retain a valid
+open-node bound.
 
-Automated micro tests show equality between generated and complete zone LPs,
-check bound ordering, and independently validate the final row solution. On
-the base instance, on-demand pricing materializes only 202 of 14,646 intervals
-at the root and matches the complete zone LP to numerical tolerance. On the
-72-group instance under a 120-second solver budget, preparation materializes no
-intervals; strict root pricing closes at `LB=0.61366055` with 9,181 of 120,038
-intervals. The first complete branch split uses 7.73 seconds and closes only
-0.089% of the initial integer gap, so the adaptive rule suspends the tree. The
-persistent restricted MIP obtains `UB=0.67170805`; the retained open-node bound
-is `0.61371208`, giving an 8.63% certified zone-model gap. Two supports reduce
-55,418 row candidates to 494 and 492 respectively; both fill optimally, and the
-selected support has original business objective `0.27021425`. The algorithm
-core uses about 118.4 seconds.
+The automated suite contains an independent exhaustive-pricing comparison,
+generated-versus-complete zone-LP equality, objective reconstruction, exact
+flow realization, bound ordering, and final output validation. On the base
+instance the strengthened root matches the 14,646-column complete LP at
+`1.0015367763`; 411 columns are active after 12 rounds, and root plus complete
+LP comparison takes about 5.87 seconds.
 
-This improves the earlier enumerated-pool stage gate (`UB=0.68865777`, root
-gap 10.91%) and demonstrates that on-demand pricing and adaptive time return
-are useful. It does not yet demonstrate that Branch-and-Price itself dominates:
-on the 72-group case its measured bound contribution is small and most primal
-progress comes from the restricted MIP. The dedicated-capacity convention also
-changes both feasibility and objective meaning relative to M0. Same-model
-multi-instance comparisons are therefore still required before presenting this
-as the paper algorithm.
+On the 72-group instance, 55,418 atomic row locations induce 120,038 possible
+zones. Under a 120-second, one-thread solver budget, exact root pricing closes
+at `LB=0.6243476451` with 9,741 active zones. Adaptive integer enrichment adds
+2,952 zones, and the persistent restricted MIP obtains `UB=0.6984712711`, a
+10.61% certified zone-model gap. The branch probe consumes 3.83 seconds and
+adds no bound improvement, so its time is returned. Exact recourse uses 505
+candidate row locations, assigns all 2,241 export boxes, preserves all 624
+import-reserved boxes, and has original row-business value `0.27737591`; the
+algorithm core uses about 117.2 seconds.
+
+The same-model fully enumerated zone MIP performs substantially worse under
+the same 120-second budget: `UB=0.8706292087`, `LB=0.6298336914`, and a 27.66%
+gap. Thus selective exact pricing and the restricted integer pool provide a
+clear same-model computational benefit. M0 remains a different-model reference:
+it obtains original row-business value `0.26001223` with a 10.41% M0 gap on
+this instance. The current evidence therefore supports the zone decomposition
+against its complete-zone baseline, but does not claim dominance over M0's
+different objective. The Branch-and-Price probe itself also remains a weak
+component; most primal progress comes from the persistent restricted MIP.
 
 The experiment remains absent from `run_yard_plan.py`. It neither imports nor
 invokes the existing `cg`, `direct`, or LBBD solvers, and no existing solver

@@ -31,6 +31,55 @@ class GurobiModel:
     def getVars(self):
         return self._model.getVars()
 
+    def captureLpWarmStart(self) -> dict[str, dict[str, float]]:
+        """Capture a name-addressed primal/dual LP start for a rebuilt model."""
+
+        self._model.update()
+        return {
+            "primal": {
+                variable.VarName: float(variable.X)
+                for variable in self._model.getVars()
+            },
+            "dual": {
+                constraint.ConstrName: float(constraint.Pi)
+                for constraint in self._model.getConstrs()
+            },
+        }
+
+    def applyLpWarmStart(
+        self,
+        warm_start: dict[str, dict[str, float]] | None,
+    ) -> dict[str, int]:
+        """Apply matching parent LP values and initialize newly added rows."""
+
+        if not warm_start:
+            return {"matched_primal": 0, "matched_dual": 0}
+        self._model.update()
+        primal = warm_start.get("primal", {})
+        dual = warm_start.get("dual", {})
+        matched_primal = 0
+        matched_dual = 0
+        for variable in self._model.getVars():
+            value = primal.get(variable.VarName)
+            if value is None:
+                value = max(0.0, float(variable.LB))
+            else:
+                matched_primal += 1
+                value = min(float(variable.UB), max(float(variable.LB), value))
+            variable.PStart = float(value)
+        for constraint in self._model.getConstrs():
+            value = dual.get(constraint.ConstrName)
+            if value is None:
+                value = 0.0
+            else:
+                matched_dual += 1
+            constraint.DStart = float(value)
+        self._model.Params.LPWarmStart = 2
+        return {
+            "matched_primal": matched_primal,
+            "matched_dual": matched_dual,
+        }
+
     def getFingerprint(self) -> int:
         """Return Gurobi's structural model fingerprint."""
         self._model.update()

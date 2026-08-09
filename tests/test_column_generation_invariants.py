@@ -735,6 +735,62 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         self.assertAlmostEqual(result["root_complete_lp_difference"], 0.0, places=9)
         self.assertLess(result["active_zone_count"], result["zone_count"])
 
+    def test_contiguous_zone_rmq_pricing_matches_complete_enumeration(self) -> None:
+        planner = ContiguousZoneGenerationPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(verbose=False),
+        )
+        planner._prepare_zones()
+        duals = {}
+        for index, column in enumerate(planner._columns):
+            duals[("flow_capacity", (column.group_id, column.bay_key))] = (
+                -0.031 - 0.000137 * (index + 1)
+            )
+            duals[("area_zone_support", (column.group_id, column.area_no))] = (
+                -0.007 * (index + 1)
+            )
+            duals[("area_flow_cover", (column.group_id, column.area_no))] = -0.011
+        limit = 4
+        priced = planner._price_zone_signatures(
+            duals,
+            per_group_limit=limit,
+            active_zone_indices=set(),
+            improving_only=False,
+        )
+        exhaustive = defaultdict(list)
+        fixed_base = planner.config.row_dispersion_weight / max(
+            1, len(planner.groups)
+        )
+        for strip_key, signature in planner._iter_zone_signatures():
+            group_id, area_no, _row_no = strip_key
+            capacity = sum(planner._atomic_capacity[index] for index in signature)
+            reduced_cost = (
+                fixed_base
+                + duals[("area_zone_support", (group_id, area_no))]
+                + sum(
+                    planner._atomic_zone_reduced_cost(index, duals)
+                    for index in signature
+                )
+                + min(capacity, planner.groups_by_id[group_id].demand)
+                * duals[("area_flow_cover", (group_id, area_no))]
+            )
+            exhaustive[group_id].append(reduced_cost)
+        expected = sorted(
+            value
+            for values in exhaustive.values()
+            for value in sorted(values)[:limit]
+        )
+        actual = sorted(value for value, _strip, _signature in priced["selected"])
+        self.assertEqual(len(expected), len(actual))
+        for expected_value, actual_value in zip(expected, actual):
+            self.assertAlmostEqual(expected_value, actual_value, places=12)
+        self.assertAlmostEqual(
+            min(value for values in exhaustive.values() for value in values),
+            priced["minimum_reduced_cost"],
+            places=12,
+        )
+        self.assertEqual(priced["pricing_method"], "exact_prefix_rmq_top_k")
+
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
     def test_contiguous_zone_exact_fill_is_independently_valid(self) -> None:
         result = ContiguousZoneGenerationPlanner(
@@ -759,10 +815,23 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             result.diagnostics["zone_model_global_lower_bound"],
         )
         self.assertTrue(
-            any(
-                item["status"] != "failed"
-                for item in result.diagnostics["zone_fill_alternatives"]
-            )
+            result.diagnostics["zone_fill"]["recourse_certificate"]["certified"]
+        )
+        self.assertEqual(
+            result.diagnostics["zone_fill"]["flow_realization_mismatch_count"],
+            0,
+        )
+        certificate = result.diagnostics["zone_objective_certificate"]
+        self.assertTrue(certificate["certified"])
+        self.assertAlmostEqual(
+            certificate["objective"],
+            result.diagnostics["zone_model_upper_bound"],
+            places=9,
+        )
+        self.assertAlmostEqual(
+            certificate["absolute_reconstruction_difference"],
+            0.0,
+            places=9,
         )
 
     def test_selective_recourse_fixes_quantities_not_profile_states(
