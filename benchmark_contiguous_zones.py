@@ -35,13 +35,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--branch-price-time-fraction", type=float, default=0.70)
     parser.add_argument("--branch-probe-time-fraction", type=float, default=0.25)
     parser.add_argument("--branch-min-gap-closure", type=float, default=0.01)
+    parser.add_argument("--fix-optimize-local-fraction", type=float, default=0.85)
+    parser.add_argument("--fix-optimize-groups", type=int, default=12)
     parser.add_argument("--fill-time-fraction", type=float, default=0.05)
     parser.add_argument("--max-branch-nodes", type=int, default=200)
     parser.add_argument("--root-only", action="store_true")
     parser.add_argument("--complete-zone-mip-only", action="store_true")
     parser.add_argument("--compare-complete-zone-lp", action="store_true")
     parser.add_argument("--compare-complete-zone-mip", action="store_true")
-    parser.add_argument("--compare-direct", action="store_true")
+    parser.add_argument(
+        "--compare-row-m0",
+        action="store_true",
+        help=(
+            "Run the legacy row-level M0 only as a different-model "
+            "structural reference; objectives are not subtracted."
+        ),
+    )
     parser.add_argument("--output", type=Path, default=None)
     return parser.parse_args()
 
@@ -76,6 +85,8 @@ def main() -> None:
         branch_price_time_fraction=args.branch_price_time_fraction,
         branch_probe_time_fraction=args.branch_probe_time_fraction,
         branch_min_gap_closure=args.branch_min_gap_closure,
+        fix_optimize_local_fraction=args.fix_optimize_local_fraction,
+        fix_optimize_group_count=args.fix_optimize_groups,
         fill_time_fraction=args.fill_time_fraction,
         max_branch_nodes=args.max_branch_nodes,
     )
@@ -106,14 +117,12 @@ def main() -> None:
             if key.startswith("zone_")
             or key in {"independent_solution_validation", "total_seconds"}
         }
-        if args.compare_direct:
+        if args.compare_row_m0:
             direct = DirectMilpPlanner(inputs.problem, common).solve()
-            output["direct"] = _summary(direct.diagnostics)
-            output["objective_difference"] = round(
-                float(result.diagnostics["final_business_objective"])
-                - float(direct.diagnostics["final_business_objective"]),
-                10,
+            output["row_m0_different_model_reference"] = _summary(
+                direct.diagnostics
             )
+            output["cross_model_objective_difference_reported"] = False
     print(json.dumps(output, ensure_ascii=False, indent=2))
     if args.output is not None:
         write_json(args.output.resolve(), output)

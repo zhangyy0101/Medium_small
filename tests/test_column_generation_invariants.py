@@ -32,6 +32,9 @@ from yard_planning.template_flow_benders import (
 from yard_planning.contiguous_zone_generation import (
     ContiguousZoneGenerationPlanner,
 )
+from yard_planning.group_zone_pattern_generation import (
+    GroupZonePatternGenerationPlanner,
+)
 from yard_planning.planner import (
     ColumnGenerationConfig,
     YardPlanningBase,
@@ -758,9 +761,7 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             improving_only=False,
         )
         exhaustive = defaultdict(list)
-        fixed_base = planner.config.row_dispersion_weight / max(
-            1, len(planner.groups)
-        )
+        fixed_base = planner._zone_activation_penalty()
         for strip_key, signature in planner._iter_zone_signatures():
             group_id, area_no, _row_no = strip_key
             capacity = sum(planner._atomic_capacity[index] for index in signature)
@@ -806,9 +807,14 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             result.diagnostics["independent_solution_validation"]["passed"]
         )
         self.assertGreater(result.diagnostics["zone_candidate_reduction"], 0.0)
-        self.assertGreaterEqual(
-            result.diagnostics["zone_model_global_lower_bound"] + 1e-9,
+        self.assertAlmostEqual(
+            result.diagnostics["zone_model_global_lower_bound"],
             result.diagnostics["zone_root"]["root_objective"],
+            places=9,
+        )
+        self.assertEqual(
+            result.diagnostics["zone_model_lower_bound_source"],
+            "closed_exact_zone_pricing_root",
         )
         self.assertGreaterEqual(
             result.diagnostics["zone_model_upper_bound"] + 1e-9,
@@ -829,9 +835,75 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
             places=9,
         )
         self.assertAlmostEqual(
+            result.diagnostics["final_business_objective"],
+            result.diagnostics["zone_model_upper_bound"],
+            places=9,
+        )
+        self.assertIn(
+            "row_recourse_secondary_quality_objective",
+            result.diagnostics,
+        )
+        self.assertAlmostEqual(
+            sum(certificate["weights"].values()), 1.0, places=12
+        )
+        self.assertGreaterEqual(
+            certificate["raw"]["extra_group_areas"], 0.0
+        )
+        self.assertGreaterEqual(
+            certificate["raw"]["extra_contiguous_zones"], 0.0
+        )
+        self.assertAlmostEqual(
             certificate["absolute_reconstruction_difference"],
             0.0,
             places=9,
+        )
+        fix_optimize = result.diagnostics["zone_fix_optimize"]
+        self.assertIn("local", fix_optimize)
+        self.assertLessEqual(
+            fix_optimize["final_objective"],
+            fix_optimize["initial_objective"] + 1e-9,
+        )
+        self.assertGreater(
+            fix_optimize["local"]["neighborhood_group_count"], 0
+        )
+
+    @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
+    def test_complete_group_patterns_match_complete_zone_mip(self) -> None:
+        config = ColumnGenerationConfig(
+            total_time_limit=10.0,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        complete = ContiguousZoneGenerationPlanner(
+            make_small_problem(), config
+        ).analyze_complete_zone_mip()
+        result = GroupZonePatternGenerationPlanner(
+            make_small_problem(), config
+        ).solve()
+        diagnostics = result.diagnostics
+        self.assertEqual(complete["status"], "optimal")
+        self.assertTrue(diagnostics["group_pattern_root"]["closed"])
+        self.assertAlmostEqual(
+            diagnostics["group_pattern_model_global_lower_bound"],
+            complete["bound"],
+            places=9,
+        )
+        self.assertAlmostEqual(
+            diagnostics["group_pattern_model_upper_bound"],
+            complete["objective"],
+            places=9,
+        )
+        self.assertAlmostEqual(
+            diagnostics["group_pattern_model_relative_gap"], 0.0, places=9
+        )
+        certificate = diagnostics["group_pattern_objective_certificate"]
+        self.assertTrue(certificate["certified"])
+        self.assertAlmostEqual(
+            certificate["absolute_reconstruction_difference"], 0.0, places=9
+        )
+        self.assertTrue(
+            diagnostics["independent_solution_validation"]["passed"]
         )
 
     def test_selective_recourse_fixes_quantities_not_profile_states(

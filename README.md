@@ -100,9 +100,11 @@ dedicated contiguous row zones. Exact prefix/RMQ top-K pricing avoids scanning
 all intervals; adaptive batches accelerate degenerate rounds. Capacity-cover
 and zone-support inequalities strengthen the root relaxation. An integer
 restricted master uses a square-root adaptive enrichment pool. Its proportional
-Branch-and-Price probe shares generated columns and returns time immediately
-when its first node cannot close; rebuilt child LPs inherit the parent
-primal/dual start. The selected
+conflict-guided Fix-and-Optimize stage chooses a capped group neighborhood:
+half are the largest contributors to the unified objective and half are their
+strongest physical-row competitors. It fixes all other group decisions, opens
+every legal zone in the neighborhood, and feeds improving zones back to the
+integer master. The selected
 group-bay export flows and anonymous import reservation are then fixed in a
 compact row recourse model. A constructive capacity certificate proves that
 the chosen disjoint zones can realize every export flow, and the solver also
@@ -113,10 +115,32 @@ the full compatible capacity of its physical rows, so its objective and
 feasible set are not those of M0. It is not registered in `run_yard_plan` and
 does not modify any existing solver entry point.
 
+The experiment now uses one unified zone-level objective throughout pricing,
+integer search, certificates, and reporting. Its normalized weights are 0.25
+for extra group areas, 0.22 for extra disconnected zones, 0.08 for proximity
+to existing same-class stock, 0.22 for large-plan L1 deviation, 0.13 for
+unused reserved zone capacity, and 0.10 for quantity-weighted berth distance.
+The unavoidable first area and first zone of every positive-demand group are
+removed from the dispersion terms. Exact row filling is a feasibility
+recourse and secondary quality diagnostic; its legacy row score is not mixed
+into the zone-model upper bound, lower bound, or gap.
+
 ```bash
 python -X utf8 -B benchmark_contiguous_zones.py --root-only --compare-complete-zone-lp --total-time-limit 60 --solver-threads 1
 python -X utf8 -B benchmark_contiguous_zones.py --input example/many_groups_6v_12g/input_data.json --large-plan example/many_groups_6v_12g/large_plan.csv --total-time-limit 120 --solver-threads 1
 python -X utf8 -B benchmark_contiguous_zones.py --complete-zone-mip-only --input example/many_groups_6v_12g/input_data.json --large-plan example/many_groups_6v_12g/large_plan.csv --total-time-limit 120 --solver-threads 1
+```
+
+An additional isolated stage gate generates one complete multi-zone plan per
+export group. Its Dantzig--Wolfe master coordinates whole group patterns,
+anonymous import reservation, and shared physical resources; a conflict-aware
+Fix-and-Optimize neighborhood adds primal patterns before exact row recourse.
+It is deliberately absent from `run_yard_plan.py`, so it does not replace or
+alter M0 or the existing contiguous-zone algorithm.
+
+```bash
+python -X utf8 -B benchmark_group_zone_patterns.py --total-time-limit 60 --solver-threads 1
+python -X utf8 -B benchmark_group_zone_patterns.py --input example/many_groups_6v_12g/input_data.json --large-plan example/many_groups_6v_12g/large_plan.csv --total-time-limit 120 --solver-threads 1
 ```
 
 ## 输出
@@ -139,6 +163,7 @@ python -X utf8 -B benchmark_contiguous_zones.py --complete-zone-mip-only --input
 - `yard_planning/row_configuration_generation.py`：独立的物理排轨道配置列生成实验，包括精确定价、Lagrangian 根节点下界、集中配置初始列和整数受限主问题；
 - `yard_planning/template_flow_benders.py`：独立的硬属性排模板—整数容量主问题、连续箱量流子问题、Phase-I/对偶 Benders 割及同模型紧凑直接对照；
 - `yard_planning/contiguous_zone_generation.py`：独立的连续区段根节点列生成、整数区段支持选择和受限排级精确填充实验；
+- `yard_planning/group_zone_pattern_generation.py`：独立的完整箱组—连续排区模式生成、整数模式主问题、冲突邻域 Fix-and-Optimize 与精确排级回填实验；
 - `yard_planning/logic_benders.py`：LBBD 的稳定公共导入入口；
 - `yard_planning/direct_milp.py`：M0 紧凑排位置模型；
 - `yard_planning/gurobi_backend.py`：统一 Gurobi 接口；

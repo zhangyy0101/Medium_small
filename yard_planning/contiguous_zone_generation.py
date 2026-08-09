@@ -1,4 +1,4 @@
-"""Independent contiguous-zone generation and Branch-and-Price experiment.
+"""Independent contiguous-zone generation and Fix-and-Optimize experiment.
 
 The experiment deliberately changes the concentration representation.  A
 hard export group reserves one or more contiguous runs of compatible physical
@@ -9,8 +9,8 @@ The final compact row MILP realizes the certified group-bay flows and the same
 anonymous import reservation without changing the primary zone decisions.
 
 Nothing in this module is registered as a production solver.  It is an
-isolated stage gate for the redefined model boundary and its exact
-Branch-and-Price closure.
+isolated stage gate for the redefined model boundary, an exact priced root,
+and conflict-guided primal improvement.
 """
 
 from __future__ import annotations
@@ -80,10 +80,20 @@ class ContiguousZoneConfig:
     branch_price_time_fraction: float = 0.70
     branch_probe_time_fraction: float = 0.25
     branch_min_gap_closure: float = 0.01
+    fix_optimize_local_fraction: float = 0.85
+    fix_optimize_group_count: int = 12
     fill_time_fraction: float = 0.05
     max_branch_nodes: int = 200
     shortage_penalty: float = 1_000.0
-    unused_capacity_weight: float = 0.02
+    # Unified zone-model business weights.  They are deliberately independent
+    # of the legacy compact-row objective: the zone model is the optimization
+    # model, while row filling is an exact feasibility recourse.
+    area_dispersion_weight: float = 0.25
+    zone_dispersion_weight: float = 0.22
+    existing_group_proximity_weight: float = 0.08
+    area_guidance_weight: float = 0.22
+    unused_capacity_weight: float = 0.13
+    berth_distance_weight: float = 0.10
 
     def validate(self) -> None:
         if int(self.max_root_iterations) <= 0:
@@ -110,14 +120,39 @@ class ContiguousZoneConfig:
             )
         if not 0.0 <= float(self.branch_min_gap_closure) < 1.0:
             raise ValueError("branch_min_gap_closure must lie in [0, 1)")
+        if not 0.0 < float(self.fix_optimize_local_fraction) < 1.0:
+            raise ValueError(
+                "fix_optimize_local_fraction must lie strictly between 0 and 1"
+            )
+        if int(self.fix_optimize_group_count) <= 0:
+            raise ValueError("fix_optimize_group_count must be positive")
         if not 0.0 < float(self.fill_time_fraction) < 1.0:
             raise ValueError("fill_time_fraction must lie strictly between 0 and 1")
         if int(self.max_branch_nodes) <= 0:
             raise ValueError("max_branch_nodes must be positive")
         if float(self.shortage_penalty) <= 0.0:
             raise ValueError("shortage_penalty must be positive")
-        if float(self.unused_capacity_weight) < 0.0:
-            raise ValueError("unused_capacity_weight cannot be negative")
+        objective_weights = {
+            "area_dispersion": self.area_dispersion_weight,
+            "zone_dispersion": self.zone_dispersion_weight,
+            "existing_group_proximity": self.existing_group_proximity_weight,
+            "area_guidance": self.area_guidance_weight,
+            "unused_capacity": self.unused_capacity_weight,
+            "berth_distance": self.berth_distance_weight,
+        }
+        if any(
+            not math.isfinite(float(value)) or float(value) < 0.0
+            for value in objective_weights.values()
+        ):
+            raise ValueError(
+                "zone business objective weights must be finite and "
+                f"nonnegative: {objective_weights}"
+            )
+        if abs(sum(float(value) for value in objective_weights.values()) - 1.0) > 1e-9:
+            raise ValueError(
+                "zone business objective weights must sum to 1: "
+                f"{objective_weights}"
+            )
 
 
 @dataclass(frozen=True)
@@ -179,6 +214,94 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         self._atomic_capacity: list[int] = []
         self._atomic_attr_keys: list[tuple[tuple[str, str, str, str], ...]] = []
         self._atomic_resources: list[tuple[Resource, ...]] = []
+        self._zone_objective_scales: dict[str, float] = {}
+
+    def _zone_objective_weights(self) -> dict[str, float]:
+        return {
+            "area_dispersion": float(
+                self.zone_config.area_dispersion_weight
+            ),
+            "zone_dispersion": float(
+                self.zone_config.zone_dispersion_weight
+            ),
+            "existing_group_proximity": float(
+                self.zone_config.existing_group_proximity_weight
+            ),
+            "area_guidance": float(
+                self.zone_config.area_guidance_weight
+            ),
+            "unused_capacity": float(
+                self.zone_config.unused_capacity_weight
+            ),
+            "berth_distance": float(
+                self.zone_config.berth_distance_weight
+            ),
+        }
+
+    def _zone_objective_scale(self, key: str) -> float:
+        value = self._zone_objective_scales.get(key)
+        if value is None:
+            raise RuntimeError(
+                f"zone objective normalization is not prepared: {key}"
+            )
+        return max(1.0, float(value))
+
+    def _zone_area_activation_penalty(self) -> float:
+        return (
+            float(self.zone_config.area_dispersion_weight)
+            / self._zone_objective_scale("area_dispersion")
+        )
+
+    def _zone_activation_penalty(self) -> float:
+        return (
+            float(self.zone_config.zone_dispersion_weight)
+            / self._zone_objective_scale("zone_dispersion")
+        )
+
+    def _zone_guidance_penalty(self) -> float:
+        return (
+            float(self.zone_config.area_guidance_weight)
+            / self._zone_objective_scale("area_guidance")
+        )
+
+    def _zone_existing_proximity_unit_cost(
+        self, group_id: str, bay_key: str
+    ) -> float:
+        group = self.groups_by_id[group_id]
+        return (
+            float(self.zone_config.existing_group_proximity_weight)
+            * self._normalized_existing_proximity(group, bay_key)
+            / self._zone_objective_scale("existing_group_proximity")
+        )
+
+    def _zone_berth_distance_unit_cost(
+        self, group_id: str, area_no: str
+    ) -> float:
+        group = self.groups_by_id[group_id]
+        return (
+            float(self.zone_config.berth_distance_weight)
+            * self._normalized_berth_distance(group.voyage_id, area_no)
+            / self._zone_objective_scale("berth_distance")
+        )
+
+    def _zone_flow_unit_cost(self, group_id: str, bay_key: str) -> float:
+        return self._zone_existing_proximity_unit_cost(
+            group_id, bay_key
+        ) + self._zone_berth_distance_unit_cost(
+            group_id, self.bays[bay_key].area_no
+        )
+
+    def _zone_business_objective_specification(self) -> dict[str, object]:
+        return {
+            "type": "normalized_weighted_contiguous_zone_objective",
+            "decision_level": "group_contiguous_zone_and_area_flow",
+            "hard_demand_balance": True,
+            "weights": self._zone_objective_weights(),
+            "scales": dict(self._zone_objective_scales),
+            "row_recourse_role": (
+                "exact_feasibility_and_secondary_quality_only"
+            ),
+        }
 
     @staticmethod
     def _anchor_row(column) -> str:
@@ -262,9 +385,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             raise RuntimeError(
                 f"one zone spans multiple large-plan keys: {sorted(quota_keys)}"
             )
-        zone_penalty = float(self.config.row_dispersion_weight) / max(
-            1, len(self.groups)
-        )
+        zone_penalty = self._zone_activation_penalty()
         return ContiguousZone(
             zone_id=-1,
             group_id=group_id,
@@ -285,9 +406,9 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         )
 
     def _unused_capacity_unit_cost(self) -> float:
-        return float(self.zone_config.unused_capacity_weight) / max(
-            1,
-            sum(group.demand for group in self.groups),
+        return (
+            float(self.zone_config.unused_capacity_weight)
+            / self._zone_objective_scale("unused_capacity")
         )
 
     def _register_zone(
@@ -428,6 +549,31 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         self._possible_zone_count_by_group = possible_zone_count_by_group
         if self._possible_zone_count <= 0 and self.groups:
             raise RuntimeError("contiguous-zone model has no candidate zones")
+        atomic_count_by_group: Counter[str] = Counter(
+            column.group_id for column in self._columns
+        )
+        natural_zone_expansion = sum(
+            max(
+                0,
+                min(
+                    int(group.demand),
+                    int(atomic_count_by_group[group.group_id]),
+                )
+                - 1,
+            )
+            for group in self.groups
+        )
+        total_export_demand = sum(int(group.demand) for group in self.groups)
+        self._zone_objective_scales = {
+            "area_dispersion": self._objective_scale("area_dispersion"),
+            "zone_dispersion": float(max(1, natural_zone_expansion)),
+            "existing_group_proximity": self._objective_scale(
+                "existing_group_proximity"
+            ),
+            "area_guidance": self._objective_scale("area_guidance_l1"),
+            "unused_capacity": float(max(1, total_export_demand)),
+            "berth_distance": self._objective_scale("berth_distance"),
+        }
         return {
             "preparation_seconds": perf_counter() - started,
             "atomic_candidate_count": len(self._columns),
@@ -435,6 +581,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "zone_count": self._possible_zone_count,
             "materialized_zone_count": len(self._zones),
             "dominated_long_zone_count": dominated_long_zone_count,
+            "objective_scales": dict(self._zone_objective_scales),
         }
 
     def _master_index_sets(self) -> dict[str, object]:
@@ -485,6 +632,19 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         model.setMinimize()
         sets = self._master_index_sets()
         zero = model.addVar(lb=0.0, ub=0.0, name="zone_zero")
+        # Every positive-demand group necessarily uses at least one area and
+        # one zone.  Subtract those unavoidable activations so the reported
+        # objective measures *extra* dispersion instead of a constant base.
+        dispersion_baseline = len(self.groups) * (
+            self._zone_area_activation_penalty()
+            + self._zone_activation_penalty()
+        )
+        baseline = model.addVar(
+            lb=1.0,
+            ub=1.0,
+            obj=-float(dispersion_baseline),
+            name="zone_dispersion_baseline",
+        )
         unused_unit_cost = self._unused_capacity_unit_cost()
         shortage = {
             group.group_id: model.addVar(
@@ -499,7 +659,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 lb=0.0,
                 ub=float(self.groups_by_id[key[0]].demand),
                 vtype="C",
-                obj=float(column.intrinsic_cost) - unused_unit_cost,
+                obj=self._zone_flow_unit_cost(*key) - unused_unit_cost,
                 name=f"zone_flow_{self._key_name(key)}",
             )
             for key, column in sorted(sets["flow_columns"].items())
@@ -509,7 +669,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 lb=0.0,
                 ub=1.0,
                 vtype="C",
-                obj=self._area_activation_penalty(),
+                obj=self._zone_area_activation_penalty(),
                 name=f"zone_area_{self._key_name(key)}",
             )
             for key in sets["area_pairs"]
@@ -635,12 +795,12 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             target = self._area_size_target(*key)
             positive = model.addVar(
                 lb=0.0,
-                obj=self._area_guidance_penalty(),
+                obj=self._zone_guidance_penalty(),
                 name=f"zone_guide_pos_{self._key_name(key)}",
             )
             negative = model.addVar(
                 lb=0.0,
-                obj=self._area_guidance_penalty(),
+                obj=self._zone_guidance_penalty(),
                 name=f"zone_guide_neg_{self._key_name(key)}",
             )
             constraints["export_guidance"][key] = model.addConstr(
@@ -653,14 +813,16 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 quicksum(import_by_flow_size.get(key, [])) == int(required),
                 name=f"zone_import_total_{self._key_name(key)}",
             )
-        constraints["import_guidance"] = self._add_import_reference_deviation(
-            quicksum,
-            model,
-            import_by_flow_area_size,
-            objective_mode="full",
+        constraints["import_guidance"] = (
+            self._add_zone_import_reference_deviation(
+                quicksum,
+                model,
+                import_by_flow_area_size,
+            )
         )
         model.update()
         return model, {
+            "baseline": baseline,
             "shortage": shortage,
             "export_flow": export_flow,
             "area_use": area_use,
@@ -670,6 +832,43 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "zone": {},
             "active_zone_indices": set(),
         }
+
+    def _add_zone_import_reference_deviation(
+        self,
+        quicksum,
+        model,
+        import_by_flow_area_size: dict[tuple[str, str, str], list],
+    ) -> dict[tuple[str, str, str], object]:
+        """Use the unified zone-model guidance coefficient for imports."""
+
+        keys = set(self.import_area_size_reference) | set(
+            import_by_flow_area_size
+        )
+        balances = {}
+        for flow, area_no, size in sorted(keys):
+            target = int(
+                self.import_area_size_reference.get(
+                    (flow, area_no, size), 0
+                )
+            )
+            positive = model.addVar(
+                lb=0.0,
+                obj=self._zone_guidance_penalty(),
+                name=f"zone_import_guide_pos_{flow}_{area_no}_{size}",
+            )
+            negative = model.addVar(
+                lb=0.0,
+                obj=self._zone_guidance_penalty(),
+                name=f"zone_import_guide_neg_{flow}_{area_no}_{size}",
+            )
+            actual = quicksum(
+                import_by_flow_area_size.get((flow, area_no, size), [])
+            )
+            balances[(flow, area_no, size)] = model.addConstr(
+                actual - target == positive - negative,
+                name=f"zone_import_guide_{flow}_{area_no}_{size}",
+            )
+        return balances
 
     def _zone_coefficients(
         self, zone: ContiguousZone
@@ -873,10 +1072,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 default=0,
             )
             capacity_limit = demand + maximum_row_capacity
-            fixed_cost = float(self.config.row_dispersion_weight) / max(
-                1,
-                len(self.groups),
-            )
+            fixed_cost = self._zone_activation_penalty()
             fixed_cost += float(
                 duals.get(
                     ("area_zone_support", (group_id, area_no)),
@@ -1428,7 +1624,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                             float(root_values.get(candidate, 0.0))
                             - assigned[candidate],
                         ),
-                        float(column_by_key[candidate].intrinsic_cost),
+                        self._zone_flow_unit_cost(*candidate),
                         candidate,
                     ),
                 )
@@ -2042,6 +2238,458 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "persistent_search_continued": True,
         }
 
+    def _conflict_fix_optimize_neighborhood(
+        self,
+        selected_zone_indices: set[int],
+        export_flow: dict[tuple[str, str], int],
+    ) -> set[str]:
+        """Choose high-contribution groups and their physical competitors."""
+
+        zones_by_group: defaultdict[str, list[int]] = defaultdict(list)
+        for zone_index in selected_zone_indices:
+            zones_by_group[self._zones[zone_index].group_id].append(zone_index)
+        used_areas: defaultdict[str, set[str]] = defaultdict(set)
+        flow_cost: Counter[str] = Counter()
+        export_by_quota: Counter[tuple[str, str, str, str]] = Counter()
+        flow_by_group_quota: Counter[
+            tuple[str, tuple[str, str, str, str]]
+        ] = Counter()
+        for (group_id, bay_key), quantity in export_flow.items():
+            if int(quantity) <= 0:
+                continue
+            used_areas[group_id].add(self.bays[bay_key].area_no)
+            flow_cost[group_id] += (
+                self._zone_flow_unit_cost(group_id, bay_key)
+                - self._unused_capacity_unit_cost()
+            ) * int(quantity)
+            quota_key = self._quota_key(
+                self.groups_by_id[group_id], self.bays[bay_key].area_no
+            )
+            export_by_quota[quota_key] += int(quantity)
+            flow_by_group_quota[(group_id, quota_key)] += int(quantity)
+        guidance_cost: Counter[str] = Counter()
+        for quota_key in self._master_area_guidance_keys:
+            actual = float(export_by_quota.get(quota_key, 0))
+            deviation = abs(actual - float(self._area_size_target(*quota_key)))
+            if deviation <= 1e-12:
+                continue
+            positive_groups = [
+                group.group_id
+                for group in self.groups
+                if flow_by_group_quota.get((group.group_id, quota_key), 0) > 0
+            ]
+            if positive_groups:
+                denominator = max(1.0, actual)
+                for group_id in positive_groups:
+                    guidance_cost[group_id] += (
+                        self._zone_guidance_penalty()
+                        * deviation
+                        * flow_by_group_quota[(group_id, quota_key)]
+                        / denominator
+                    )
+        score = {}
+        for group in self.groups:
+            group_id = group.group_id
+            zone_cost = sum(
+                float(self._zones[index].objective_cost)
+                for index in zones_by_group[group_id]
+            ) - self._zone_activation_penalty()
+            area_cost = self._zone_area_activation_penalty() * max(
+                0, len(used_areas[group_id]) - 1
+            )
+            contribution = max(
+                0.0,
+                zone_cost
+                + flow_cost[group_id]
+                + area_cost
+                + guidance_cost[group_id],
+            )
+            density = contribution / max(1, int(group.demand))
+            score[group_id] = contribution + density
+        count = min(
+            len(score),
+            int(self.zone_config.fix_optimize_group_count),
+        )
+        selected_resources: defaultdict[str, set[Resource]] = defaultdict(set)
+        for zone_index in selected_zone_indices:
+            zone = self._zones[zone_index]
+            selected_resources[zone.group_id].update(zone.resources)
+        candidate_resources: defaultdict[str, set[Resource]] = defaultdict(set)
+        candidate_areas: defaultdict[str, set[str]] = defaultdict(set)
+        for index, column in enumerate(self._columns):
+            candidate_resources[column.group_id].update(
+                self._atomic_resources[index]
+            )
+            candidate_areas[column.group_id].add(column.area_no)
+
+        high_contribution_count = min(count, max(1, count // 2))
+        neighborhood = sorted(
+            score,
+            key=lambda group_id: (-score[group_id], group_id),
+        )[:high_contribution_count]
+        remaining_groups = set(score) - set(neighborhood)
+        score_scale = max(max(score.values(), default=0.0), 1e-12)
+        while remaining_groups and len(neighborhood) < count:
+            best_group = max(
+                remaining_groups,
+                key=lambda group_id: (
+                    sum(
+                        len(
+                            selected_resources[chosen]
+                            & candidate_resources[group_id]
+                        )
+                        + len(
+                            selected_resources[group_id]
+                            & candidate_resources[chosen]
+                        )
+                        for chosen in neighborhood
+                    ),
+                    sum(
+                        int(
+                            bool(
+                                candidate_areas[group_id]
+                                & candidate_areas[chosen]
+                            )
+                        )
+                        for chosen in neighborhood
+                    ),
+                    score[group_id] / score_scale,
+                    group_id,
+                ),
+            )
+            neighborhood.append(best_group)
+            remaining_groups.remove(best_group)
+        return set(neighborhood)
+
+    def _solve_conflict_fix_optimize_subproblem(
+        self,
+        selected_zone_indices: set[int],
+        export_flow: dict[tuple[str, str], int],
+        import_reserve: dict[tuple[str, str, str], int],
+        deadline: float,
+    ) -> tuple[
+        set[int],
+        dict[tuple[str, str], int],
+        dict[tuple[str, str, str], int],
+        dict[str, object],
+    ]:
+        """Jointly reopen complete zones for one conflict neighborhood."""
+
+        remaining = deadline - perf_counter()
+        if remaining <= 1e-6:
+            return set(), {}, {}, {"status": "time_limit_before_fix_optimize"}
+        neighborhood = self._conflict_fix_optimize_neighborhood(
+            selected_zone_indices, export_flow
+        )
+        materialized_before = len(self._zones)
+        for group_id in sorted(neighborhood):
+            for strip_key, signature in self._iter_zone_signatures(group_id):
+                self._register_zone(strip_key, signature)
+        neighborhood_zone_indices = {
+            index
+            for group_id in neighborhood
+            for index in self._zone_indices_by_group[group_id]
+        }
+        fixed_zone_indices = {
+            index
+            for index in selected_zone_indices
+            if self._zones[index].group_id not in neighborhood
+        }
+        active_zone_indices = neighborhood_zone_indices | fixed_zone_indices
+        model, variables = self._build_zone_master()
+        try:
+            for zone_index in sorted(active_zone_indices):
+                self._add_zone_variable(model, variables, zone_index)
+            for zone_index, variable in variables["zone"].items():
+                if self._zones[zone_index].group_id not in neighborhood:
+                    variable.LB = 1.0
+                    variable.UB = 1.0
+                variable.Start = (
+                    1.0 if zone_index in selected_zone_indices else 0.0
+                )
+                variable.VType = "B"
+            for variable in variables["shortage"].values():
+                variable.UB = 0.0
+                variable.Start = 0.0
+            for key, variable in variables["export_flow"].items():
+                if key[0] not in neighborhood:
+                    fixed = int(export_flow.get(key, 0))
+                    variable.LB = float(fixed)
+                    variable.UB = float(fixed)
+                variable.Start = float(export_flow.get(key, 0))
+                variable.VType = "I"
+            used_areas = {
+                (group_id, self.bays[bay_key].area_no)
+                for (group_id, bay_key), quantity in export_flow.items()
+                if int(quantity) > 0
+            }
+            for key, variable in variables["area_use"].items():
+                variable.Start = 1.0 if key in used_areas else 0.0
+                variable.VType = "B"
+            used_attributes = {
+                key
+                for zone_index in selected_zone_indices
+                for key, value in self._zones[zone_index].bay_attr_uses
+                if value > 0
+            }
+            for key, variable in variables["attr_state"].items():
+                variable.Start = 1.0 if key in used_attributes else 0.0
+                variable.VType = "B"
+            for key, variable in variables["import_reserve"].items():
+                variable.Start = float(import_reserve.get(key, 0))
+                variable.VType = "I"
+            model.update()
+            self._set_gurobi_param(model, "TimeLimit", max(0.01, remaining))
+            self._set_gurobi_param(model, "MIPGap", 0.0)
+            self._set_gurobi_param(model, "MIPFocus", 1)
+            self._set_gurobi_param(model, "Heuristics", 0.30)
+            model.optimize()
+            status = self._gurobi_status_name(model)
+            if self._gurobi_solution_count(model) <= 0:
+                return set(), {}, {}, {
+                    "status": status,
+                    "has_solution": False,
+                    "neighborhood": sorted(neighborhood),
+                    "neighborhood_group_count": len(neighborhood),
+                    "active_zone_count": len(active_zone_indices),
+                }
+            selected = {
+                index
+                for index, variable in variables["zone"].items()
+                if self._gurobi_value(model, variable) > 0.5
+            }
+            flow = {
+                key: int(round(self._gurobi_value(model, variable)))
+                for key, variable in variables["export_flow"].items()
+                if self._gurobi_value(model, variable) > 1e-7
+            }
+            imports = {
+                key: int(round(self._gurobi_value(model, variable)))
+                for key, variable in variables["import_reserve"].items()
+                if self._gurobi_value(model, variable) > 1e-7
+            }
+            objective = self._gurobi_objective_value(model)
+            bound = self._gurobi_dual_bound(model)
+            certificate = self._zone_objective_certificate(
+                selected, flow, imports, objective
+            )
+            return selected, flow, imports, {
+                "status": status,
+                "has_solution": True,
+                "objective": float(certificate["objective"]),
+                "solver_objective": objective,
+                "bound": bound,
+                "relative_gap": max(0.0, objective - bound)
+                / max(abs(objective), 1e-12),
+                "neighborhood": sorted(neighborhood),
+                "neighborhood_group_count": len(neighborhood),
+                "active_zone_count": len(active_zone_indices),
+                "materialized_zone_count": len(self._zones) - materialized_before,
+                "selected_zone_count": len(selected),
+                "positive_export_flow_count": len(flow),
+                "positive_import_reservation_count": len(imports),
+            }
+        finally:
+            self._free_gurobi_model(model)
+
+    def _run_conflict_fix_optimize(
+        self,
+        model,
+        variables: dict,
+        incumbent_zones: set[int],
+        incumbent_export_flow: dict[tuple[str, str], int],
+        incumbent_import_reserve: dict[tuple[str, str, str], int],
+        deadline: float,
+    ) -> tuple[
+        set[int],
+        dict[tuple[str, str], int],
+        dict[tuple[str, str, str], int],
+        dict[str, object],
+    ]:
+        """Feed an exact conflict-neighborhood solution back into the zone RMP."""
+
+        started = perf_counter()
+        incumbent_certificate = self._zone_objective_certificate(
+            incumbent_zones,
+            incumbent_export_flow,
+            incumbent_import_reserve,
+            self._gurobi_objective_value(model),
+        )
+        incumbent_objective = float(incumbent_certificate["objective"])
+        local_deadline = perf_counter() + max(
+            0.0, deadline - perf_counter()
+        ) * float(self.zone_config.fix_optimize_local_fraction)
+        local_zones, local_flow, local_import, local = (
+            self._solve_conflict_fix_optimize_subproblem(
+                incumbent_zones,
+                incumbent_export_flow,
+                incumbent_import_reserve,
+                local_deadline,
+            )
+        )
+        if not local_zones:
+            return (
+                incumbent_zones,
+                incumbent_export_flow,
+                incumbent_import_reserve,
+                {
+                    "status": "local_subproblem_has_no_solution",
+                    "initial_objective": incumbent_objective,
+                    "local": local,
+                    "added_zone_count": 0,
+                    "improved": False,
+                    "seconds": perf_counter() - started,
+                },
+            )
+        added = 0
+        for zone_index in sorted(local_zones):
+            if zone_index not in variables["active_zone_indices"]:
+                variable = self._add_zone_variable(model, variables, zone_index)
+                variable.VType = "B"
+                added += 1
+        use_local_start = float(local["objective"]) <= incumbent_objective + 1e-9
+        start_zones = local_zones if use_local_start else incumbent_zones
+        start_flow = local_flow if use_local_start else incumbent_export_flow
+        start_import = (
+            local_import if use_local_start else incumbent_import_reserve
+        )
+        for zone_index, variable in variables["zone"].items():
+            variable.Start = 1.0 if zone_index in start_zones else 0.0
+        for key, variable in variables["export_flow"].items():
+            variable.Start = float(start_flow.get(key, 0))
+        for key, variable in variables["import_reserve"].items():
+            variable.Start = float(start_import.get(key, 0))
+        used_areas = {
+            (group_id, self.bays[bay_key].area_no)
+            for (group_id, bay_key), quantity in start_flow.items()
+            if int(quantity) > 0
+        }
+        for key, variable in variables["area_use"].items():
+            variable.Start = 1.0 if key in used_areas else 0.0
+        used_attributes = {
+            key
+            for zone_index in start_zones
+            for key, value in self._zones[zone_index].bay_attr_uses
+            if value > 0
+        }
+        for key, variable in variables["attr_state"].items():
+            variable.Start = 1.0 if key in used_attributes else 0.0
+        model.update()
+        remaining = deadline - perf_counter()
+        if remaining <= 1e-6:
+            local_objective = float(local["objective"])
+            candidate_zones = local_zones if use_local_start else incumbent_zones
+            candidate_flow = local_flow if use_local_start else incumbent_export_flow
+            candidate_import = (
+                local_import if use_local_start else incumbent_import_reserve
+            )
+            return candidate_zones, candidate_flow, candidate_import, {
+                "status": "time_limit_before_master_reoptimization",
+                "initial_objective": incumbent_objective,
+                "local": local,
+                "added_zone_count": added,
+                "improved": use_local_start
+                and local_objective < incumbent_objective - 1e-9,
+                "absolute_improvement": max(
+                    0.0, incumbent_objective - local_objective
+                )
+                if use_local_start
+                else 0.0,
+                "relative_improvement": max(
+                    0.0, incumbent_objective - local_objective
+                )
+                / max(abs(incumbent_objective), 1e-12)
+                if use_local_start
+                else 0.0,
+                "final_objective": (
+                    local_objective
+                    if use_local_start
+                    else incumbent_objective
+                ),
+                "seconds": perf_counter() - started,
+            }
+        self._set_gurobi_param(model, "TimeLimit", max(0.01, remaining))
+        model.optimize()
+        status = self._gurobi_status_name(model)
+        if self._gurobi_solution_count(model) <= 0:
+            local_improves = (
+                float(local["objective"]) < incumbent_objective - 1e-9
+            )
+            return (
+                local_zones if local_improves else incumbent_zones,
+                local_flow if local_improves else incumbent_export_flow,
+                local_import if local_improves else incumbent_import_reserve,
+                {
+                    "status": status,
+                    "initial_objective": incumbent_objective,
+                    "local": local,
+                    "added_zone_count": added,
+                    "improved": local_improves,
+                    "final_objective": (
+                        float(local["objective"])
+                        if local_improves
+                        else incumbent_objective
+                    ),
+                    "seconds": perf_counter() - started,
+                },
+            )
+        candidate_zones = {
+            index
+            for index, variable in variables["zone"].items()
+            if self._gurobi_value(model, variable) > 0.5
+        }
+        candidate_flow = {
+            key: int(round(self._gurobi_value(model, variable)))
+            for key, variable in variables["export_flow"].items()
+            if self._gurobi_value(model, variable) > 1e-7
+        }
+        candidate_import = {
+            key: int(round(self._gurobi_value(model, variable)))
+            for key, variable in variables["import_reserve"].items()
+            if self._gurobi_value(model, variable) > 1e-7
+        }
+        candidate_certificate = self._zone_objective_certificate(
+            candidate_zones,
+            candidate_flow,
+            candidate_import,
+            self._gurobi_objective_value(model),
+        )
+        candidate_objective = float(candidate_certificate["objective"])
+        best_zones = incumbent_zones
+        best_flow = incumbent_export_flow
+        best_import = incumbent_import_reserve
+        best_objective = incumbent_objective
+        if float(local["objective"]) < best_objective - 1e-9:
+            best_zones = local_zones
+            best_flow = local_flow
+            best_import = local_import
+            best_objective = float(local["objective"])
+        if candidate_objective < best_objective - 1e-9:
+            best_zones = candidate_zones
+            best_flow = candidate_flow
+            best_import = candidate_import
+            best_objective = candidate_objective
+        return best_zones, best_flow, best_import, {
+            "status": status,
+            "initial_objective": incumbent_objective,
+            "local": local,
+            "added_zone_count": added,
+            "master_reoptimization": {
+                "status": status,
+                "objective": self._gurobi_objective_value(model),
+            },
+            "improved": best_objective < incumbent_objective - 1e-9,
+            "absolute_improvement": max(
+                0.0, incumbent_objective - best_objective
+            ),
+            "relative_improvement": max(
+                0.0, incumbent_objective - best_objective
+            )
+            / max(abs(incumbent_objective), 1e-12),
+            "final_objective": best_objective,
+            "seconds": perf_counter() - started,
+        }
+
     def _root_branch_seed(self, variables: dict) -> dict[str, object] | None:
         """Reuse the certified root solution instead of resolving it in B&P."""
 
@@ -2620,7 +3268,6 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         """Reconstruct the primary zone objective from physical decisions."""
 
         flow_columns = self._master_index_sets()["flow_columns"]
-        unused_unit_cost = self._unused_capacity_unit_cost()
         reserved_capacity = sum(
             int(self._zones[index].capacity)
             for index in selected_zone_indices
@@ -2631,32 +3278,28 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 "zone solution assigns more export flow than reserved capacity: "
                 f"assigned={assigned_boxes}, reserved={reserved_capacity}"
             )
-        zone_activation = sum(
-            float(self._zones[index].objective_cost)
-            - unused_unit_cost * int(self._zones[index].capacity)
-            for index in selected_zone_indices
-        )
-        unused_capacity = unused_unit_cost * (
-            reserved_capacity - assigned_boxes
-        )
-        export_location = sum(
-            float(flow_columns[key].intrinsic_cost) * int(quantity)
-            for key, quantity in export_flow.items()
-        )
         used_group_areas = {
             (group_id, self.bays[bay_key].area_no)
             for (group_id, bay_key), quantity in export_flow.items()
             if int(quantity) > 0
         }
-        area_activation = (
-            self._area_activation_penalty() * len(used_group_areas)
-        )
+        if len(selected_zone_indices) < len(self.groups):
+            raise RuntimeError(
+                "a positive-demand group has no selected contiguous zone"
+            )
+        if len(used_group_areas) < len(self.groups):
+            raise RuntimeError(
+                "a positive-demand group has no positive area flow"
+            )
 
         export_by_quota: Counter[tuple[str, str, str, str]] = Counter()
         for key, quantity in export_flow.items():
             export_by_quota[flow_columns[key].quota_key] += int(quantity)
         export_guidance_deviation = sum(
-            abs(int(export_by_quota.get(key, 0)) - int(self._area_size_target(*key)))
+            abs(
+                float(export_by_quota.get(key, 0))
+                - float(self._area_size_target(*key))
+            )
             for key in self._master_area_guidance_keys
         )
         import_by_area: Counter[tuple[str, str, str]] = Counter()
@@ -2672,17 +3315,60 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             )
             for key in set(import_by_area) | set(self.import_area_size_reference)
         )
-        guidance = self._area_guidance_penalty() * (
-            export_guidance_deviation + import_guidance_deviation
-        )
-        components = {
-            "zone_activation": float(zone_activation),
-            "unused_reserved_capacity": float(unused_capacity),
-            "export_location": float(export_location),
-            "group_area_activation": float(area_activation),
-            "large_plan_guidance": float(guidance),
+        proximity_sum = 0.0
+        berth_distance_sum = 0.0
+        for (group_id, bay_key), quantity in export_flow.items():
+            if int(quantity) <= 0:
+                continue
+            group = self.groups_by_id[group_id]
+            proximity_sum += (
+                self._normalized_existing_proximity(group, bay_key)
+                * int(quantity)
+            )
+            berth_distance_sum += (
+                self._normalized_berth_distance(
+                    group.voyage_id, self.bays[bay_key].area_no
+                )
+                * int(quantity)
+            )
+        raw = {
+            "extra_group_areas": float(
+                len(used_group_areas) - len(self.groups)
+            ),
+            "extra_contiguous_zones": float(
+                len(selected_zone_indices) - len(self.groups)
+            ),
+            "existing_group_normalized_distance_sum": float(proximity_sum),
+            "large_plan_l1_deviation": float(
+                export_guidance_deviation + import_guidance_deviation
+            ),
+            "unused_reserved_capacity_boxes": float(
+                reserved_capacity - assigned_boxes
+            ),
+            "berth_normalized_distance_sum": float(berth_distance_sum),
         }
-        reconstructed = float(sum(components.values()))
+        normalized = {
+            "area_dispersion": raw["extra_group_areas"]
+            / self._zone_objective_scale("area_dispersion"),
+            "zone_dispersion": raw["extra_contiguous_zones"]
+            / self._zone_objective_scale("zone_dispersion"),
+            "existing_group_proximity": raw[
+                "existing_group_normalized_distance_sum"
+            ]
+            / self._zone_objective_scale("existing_group_proximity"),
+            "area_guidance": raw["large_plan_l1_deviation"]
+            / self._zone_objective_scale("area_guidance"),
+            "unused_capacity": raw["unused_reserved_capacity_boxes"]
+            / self._zone_objective_scale("unused_capacity"),
+            "berth_distance": raw["berth_normalized_distance_sum"]
+            / self._zone_objective_scale("berth_distance"),
+        }
+        weights = self._zone_objective_weights()
+        weighted = {
+            key: float(normalized[key]) * float(weights[key])
+            for key in weights
+        }
+        reconstructed = float(sum(weighted.values()))
         auxiliary_slack = self._absolute_deviation_auxiliary_slack(
             solver_objective,
             reconstructed,
@@ -2696,7 +3382,12 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "absolute_reconstruction_difference": abs(
                 float(solver_objective) - reconstructed
             ),
-            "components": components,
+            "raw": raw,
+            "normalized": normalized,
+            "weighted": weighted,
+            "components": weighted,
+            "weights": weights,
+            "scales": dict(self._zone_objective_scales),
             "selected_zone_count": len(selected_zone_indices),
             "reserved_export_capacity": reserved_capacity,
             "assigned_export_boxes": assigned_boxes,
@@ -2854,7 +3545,6 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                     "zone root did not cover all export demand before integerization: "
                     f"shortage={root.get('root_shortage')}"
                 )
-            root_branch_seed = self._root_branch_seed(variables)
             pool_enrichment = self._enrich_integer_pool(model, variables)
             zone_mip_deadline = perf_counter() + max(
                 0.0, deadline - perf_counter()
@@ -2872,67 +3562,30 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                     "restricted zone master did not obtain an integer support: "
                     f"{zone_mip_initial}"
                 )
-            branch_price_deadline = perf_counter() + max(
-                0.0, deadline - perf_counter()
-            ) * float(self.zone_config.branch_price_time_fraction)
+            fill_reserve = total_limit * float(
+                self.zone_config.fill_time_fraction
+            )
             (
                 selected_zones,
                 selected_export_flow,
                 selected_import_reserve,
-                branch_price,
-            ) = self._run_branch_and_price(
-                root_lower_bound=float(root["root_objective"]),
-                root_branch_seed=root_branch_seed,
-                incumbent_objective=float(zone_mip_initial["objective"]),
-                incumbent_zones=initial_zones,
-                incumbent_export_flow=initial_export_flow,
-                incumbent_import_reserve=initial_import_reserve,
-                root_lp_warm_start=variables.get("last_root_lp_warm_start"),
-                deadline=branch_price_deadline,
+                fix_optimize,
+            ) = self._run_conflict_fix_optimize(
+                model,
+                variables,
+                set(initial_zones),
+                initial_export_flow,
+                initial_import_reserve,
+                deadline - fill_reserve,
             )
-            zone_mip_resume = None
-            fill_reserve = total_limit * float(self.zone_config.fill_time_fraction)
-            resume_deadline = deadline - fill_reserve
-            if resume_deadline - perf_counter() > 0.01:
-                (
-                    resumed_zones,
-                    resumed_export_flow,
-                    resumed_import_reserve,
-                    zone_mip_resume,
-                ) = self._resume_integerized_zone_master(
-                    model,
-                    variables,
-                    resume_deadline,
-                )
-                if (
-                    resumed_zones
-                    and float(zone_mip_resume["objective"])
-                    < float(branch_price["incumbent_objective"]) - 1e-9
-                ):
-                    selected_zones = resumed_zones
-                    selected_export_flow = resumed_export_flow
-                    selected_import_reserve = resumed_import_reserve
-            zone_mip = (
-                zone_mip_resume
-                if zone_mip_resume and zone_mip_resume.get("has_solution")
-                else zone_mip_initial
-            )
+            zone_mip = zone_mip_initial
         finally:
             self._free_gurobi_model(model)
         selected_support_solver_objective = float(
-            branch_price["incumbent_objective"]
-        )
-        if (
-            zone_mip_resume
-            and zone_mip_resume.get("has_solution")
-            and resumed_zones
-            and set(selected_zones) == set(resumed_zones)
-            and selected_export_flow == resumed_export_flow
-            and selected_import_reserve == resumed_import_reserve
-        ):
-            selected_support_solver_objective = float(
-                zone_mip_resume["objective"]
+            fix_optimize.get(
+                "final_objective", zone_mip_initial["objective"]
             )
+        )
         objective_certificate = self._zone_objective_certificate(
             set(selected_zones),
             selected_export_flow,
@@ -2959,16 +3612,19 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             deadline,
         )
         selected_support_zone_objective = zone_upper_bound
-        zone_global_lower_bound = float(branch_price["global_lower_bound"])
+        zone_global_lower_bound = float(root["root_objective"])
         zone_absolute_gap = max(0.0, zone_upper_bound - zone_global_lower_bound)
         zone_relative_gap = zone_absolute_gap / max(abs(zone_upper_bound), 1e-12)
         diagnostics = {
-            "algorithm": "contiguous_zone_branch_and_price_with_exact_recourse",
+            "algorithm": (
+                "contiguous_zone_generation_conflict_fix_optimize_"
+                "with_exact_recourse"
+            ),
             "model_scope": "actual_quantity_flow_on_dedicated_contiguous_row_zones",
             "formulation": "zone_flow_master_plus_flow_fixed_exact_row_recourse",
             "decomposition": (
-                "exact_rmq_interval_pricing_adaptive_branch_and_price_"
-                "then_certified_single_support_row_realization"
+                "exact_rmq_interval_pricing_restricted_integer_master_"
+                "conflict_fix_optimize_then_certified_row_realization"
             ),
             "planned_group_count": len(self.groups),
             "planned_box_count": sum(group.demand for group in self.groups),
@@ -2978,13 +3634,12 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "zone_pool_enrichment": pool_enrichment,
             "zone_mip": zone_mip,
             "zone_mip_initial": zone_mip_initial,
-            "zone_mip_resume": zone_mip_resume,
-            "zone_branch_price": branch_price,
+            "zone_fix_optimize": fix_optimize,
             "zone_model_upper_bound": zone_upper_bound,
             "zone_model_global_lower_bound": zone_global_lower_bound,
             "zone_model_absolute_gap": zone_absolute_gap,
             "zone_model_relative_gap": zone_relative_gap,
-            "zone_model_lower_bound_source": "branch_and_price_open_node_bound",
+            "zone_model_lower_bound_source": "closed_exact_zone_pricing_root",
             "zone_restricted_pool_bound": zone_mip.get("bound"),
             "zone_restricted_pool_bound_is_global": False,
             "zone_selected_candidate_count": len(candidate_indices),
@@ -3001,41 +3656,42 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 "initial_mip_remaining_fraction": float(
                     self.zone_config.zone_mip_time_fraction
                 ),
-                "branch_remaining_fraction": float(
-                    self.zone_config.branch_price_time_fraction
+                "fix_optimize_local_remaining_fraction": float(
+                    self.zone_config.fix_optimize_local_fraction
                 ),
-                "branch_probe_elapsed_fraction": float(
-                    self.zone_config.branch_probe_time_fraction
+                "fix_optimize_group_cap": int(
+                    self.zone_config.fix_optimize_group_count
                 ),
-                "minimum_branch_gap_closure": float(
-                    self.zone_config.branch_min_gap_closure
+                "fix_optimize_group_policy": (
+                    "objective_conflict_ranking_up_to_group_cap"
                 ),
                 "final_fill_total_fraction": float(
                     self.zone_config.fill_time_fraction
                 ),
-                "maximum_branch_nodes": int(self.zone_config.max_branch_nodes),
             },
-            "master_status": zone_mip["status"],
+            "master_status": fix_optimize["status"],
             "master_objective": zone_upper_bound,
             "master_bound_scope": "complete_redefined_zone_model",
             "row_recourse_status": fill["status"],
-            "row_recourse_business_objective": fill["objective"],
+            "row_recourse_secondary_quality_objective": fill["objective"],
             "complete_model_lower_bound": zone_global_lower_bound,
             "complete_model_absolute_gap": zone_absolute_gap,
             "complete_model_relative_gap": zone_relative_gap,
             "complete_model_gap_source": (
-                "closed_zone_root_or_open_branch_and_price_node; not_an_M0_bound"
+                "closed_exact_zone_pricing_root; not_an_M0_bound"
             ),
             "restricted_fill_lower_bound": fill["bound"],
             "restricted_fill_absolute_gap": fill["absolute_gap"],
             "restricted_fill_relative_gap": fill["relative_gap"],
             "hard_demand_balance": True,
             "business_objective_normalization": {
-                "weights": self._objective_weights(),
-                "scales": dict(self._objective_scales),
+                "weights": self._zone_objective_weights(),
+                "scales": dict(self._zone_objective_scales),
                 "method": "natural_instance_scale",
             },
-            "business_objective": self._business_objective_specification(),
+            "business_objective": (
+                self._zone_business_objective_specification()
+            ),
             "import_capacity_reservation": {
                 "source_quantity_field": "new_qty",
                 "role": "anonymous_size_compatible_capacity_only",
@@ -3057,6 +3713,25 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "production_solver_registered": False,
         }
         result = self._assemble_result(selected, diagnostics)
+        row_quality_objective = result.diagnostics[
+            "final_business_objective"
+        ]
+        row_quality_components = result.diagnostics[
+            "final_business_objective_components"
+        ]
+        result.diagnostics["row_recourse_secondary_quality_objective"] = (
+            row_quality_objective
+        )
+        result.diagnostics["row_recourse_secondary_quality_components"] = (
+            row_quality_components
+        )
+        result.diagnostics["final_business_objective"] = zone_upper_bound
+        result.diagnostics["final_business_objective_components"] = {
+            "raw": objective_certificate["raw"],
+            "normalized": objective_certificate["normalized"],
+            "weighted": objective_certificate["weighted"],
+            "weighted_total": zone_upper_bound,
+        }
         result.columns = self._selected_direct_columns(selected)
         return result
 

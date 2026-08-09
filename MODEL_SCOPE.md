@@ -161,6 +161,16 @@ large-plan deviation are all evaluated on actual assigned quantities rather
 than on full zone capacity. Concentrated storage is represented by the number
 of selected contiguous zones, so this objective and feasible set are not M0.
 
+Problem 1 has one normalized weighted objective at this same decision level:
+extra group areas (0.25), extra disconnected contiguous zones (0.22),
+quantity-weighted proximity to existing same-class stock (0.08), export plus
+import large-plan L1 deviation (0.22), unused reserved zone capacity (0.13),
+and quantity-weighted berth distance (0.10). The six weights sum to one. Area
+and zone dispersion subtract the unavoidable first activation of every
+positive-demand group; the other terms use natural instance scales. Thus the
+priced root, integer incumbent, objective certificate, reported business
+objective, and gap all refer to exactly the same function.
+
 Two integer-hull inequalities strengthen every group-area pair. An active area
 must be supported by a selected zone, and its actual flow cannot exceed the sum
 of `min(zone capacity, group demand)` over selected zones. The latter clips an
@@ -180,16 +190,20 @@ rounds use adaptive batches, while the integer enrichment pool is capped by
 the square root of average interval count rather than a fixed number of columns
 per group.
 
-The custom best-bound Branch-and-Price probe branches on area states,
-hard-attribute states, interval variables, export flows, and import reserves.
-Forbidden interval branches are enforced in both the node master and pricing.
-The certified root primal/dual LP start is inherited by the first children;
-later children inherit their parent's matching variable and row values even
-though the node model is rebuilt over the shared generated pool. The first
-node is restricted to a dimensionless fraction of the available branch
-envelope. Failure to close it within that probe, or insufficient relative gap
-closure, returns unused time to the same persistent restricted-MIP search.
-There is no instance-name or fixed-second switch.
+The integer upper-bound phase keeps the persistent restricted zone master and
+adds one conflict-guided Fix-and-Optimize neighborhood. A per-group incumbent
+score attributes the unified zone objective to the incumbent groups. Half of
+the neighborhood contains the largest objective contributors; the other half
+contains groups whose candidate rows compete most strongly with the selected
+physical resources of those contributors. Its cardinality is bounded by a
+user cap. All decisions outside the neighborhood are fixed; inside it, every
+legal contiguous zone is opened in an exact local MIP. Any improving local
+solution is a globally feasible incumbent, and its previously absent zones are
+returned to the persistent integer master.
+The local/master time split is a dimensionless fraction of the remaining
+budget, with no instance-name or fixed-second switch. The former Branch-and-
+Price probe is no longer part of the solve path because repeated benchmarks
+showed no observable bound improvement.
 
 Problem 2 is an exact row-level recourse model on the single primary support.
 Both the integer group-bay export flows and the anonymous import reservation
@@ -198,46 +212,79 @@ Before optimization, a constructive assignment fills every group-bay flow
 within its selected atomic rows. Because selected zones have disjoint dedicated
 physical footprints, this is also an explicit feasibility certificate. The row
 MILP then applies every original detailed constraint, including 45-ft edge-bay
-eligibility, and its output passes the common independent validator. A separate
-objective certificate reconstructs the complete Problem-1 objective from the
+eligibility, and its output passes the common independent validator. Its legacy
+row-level score is retained only as a secondary realization-quality diagnostic;
+it is not part of Problem 1 or its gap. A separate objective certificate
+reconstructs the complete Problem-1 objective from the
 selected zones, actual flows, area states, guidance deviations, and import
 reservation; a negative discrepancy from the solver incumbent is an error.
 
-The lower-bound scopes remain separated. A closed generated root and the
-minimum open-node bound are valid for the complete zone model. The Gurobi bound
-of the integer restricted pool is not global, and the row-recourse bound is
-valid only after fixing the selected support and flows. None is reported as an
-M0 certificate. Exhausting a fully priced branch tree would prove the zone
-integer model; the current adaptive probe can stop earlier and retain a valid
-open-node bound.
+The lower-bound scopes remain separated. The closed generated root is a valid
+lower bound for the complete zone model. The Gurobi bounds of the restricted
+integer pool and the fixed-neighborhood MIP are not global, and the row-
+recourse bound is valid only after fixing the selected support and flows. None
+is reported as an M0 certificate. Fix-and-Optimize changes only the incumbent;
+it cannot weaken or overstate the exact priced-root certificate.
 
 The automated suite contains an independent exhaustive-pricing comparison,
 generated-versus-complete zone-LP equality, objective reconstruction, exact
 flow realization, bound ordering, and final output validation. On the base
-instance the strengthened root matches the 14,646-column complete LP at
-`1.0015367763`; 411 columns are active after 12 rounds, and root plus complete
-LP comparison takes about 5.87 seconds.
+instance, under the unified objective, exact pricing closes at
+`LB=0.1412735716`. Under the full 60-second algorithm budget the restricted
+integer master obtains `UB=0.1520166229`; reopening all nine groups improves it
+to `UB=0.1517378835`. The certified gap is 6.90%, the secondary row-realization
+score is `0.20204053`, and the algorithm core uses about 57.7 seconds.
 
 On the 72-group instance, 55,418 atomic row locations induce 120,038 possible
 zones. Under a 120-second, one-thread solver budget, exact root pricing closes
-at `LB=0.6243476451` with 9,741 active zones. Adaptive integer enrichment adds
-2,952 zones, and the persistent restricted MIP obtains `UB=0.6984712711`, a
-10.61% certified zone-model gap. The branch probe consumes 3.83 seconds and
-adds no bound improvement, so its time is returned. Exact recourse uses 505
-candidate row locations, assigns all 2,241 export boxes, preserves all 624
-import-reserved boxes, and has original row-business value `0.27737591`; the
-algorithm core uses about 117.2 seconds.
+at `LB=0.1789663283` with 15,764 active zones. Adaptive integer enrichment adds
+2,952 zones, and the persistent restricted MIP obtains an initial
+`UB=0.1922356183`. The 12-group objective/conflict neighborhood improves the
+incumbent to `UB=0.1889419525`, a 1.71% upper-bound reduction; its local gap is
+0.22% and the certified complete-zone gap is 5.28%. Exact recourse assigns all
+2,241 export boxes, preserves all 624 import-reserved boxes, and has secondary
+row-realization score `0.24722722`; the algorithm core uses about 117.0 seconds.
 
-The same-model fully enumerated zone MIP performs substantially worse under
-the same 120-second budget: `UB=0.8706292087`, `LB=0.6298336914`, and a 27.66%
-gap. Thus selective exact pricing and the restricted integer pool provide a
-clear same-model computational benefit. M0 remains a different-model reference:
-it obtains original row-business value `0.26001223` with a 10.41% M0 gap on
-this instance. The current evidence therefore supports the zone decomposition
-against its complete-zone baseline, but does not claim dominance over M0's
-different objective. The Branch-and-Price probe itself also remains a weak
-component; most primal progress comes from the persistent restricted MIP.
+Previously recorded complete-zone and M0 numbers used the former objective and
+are not numerically comparable after this unification. Same-model comparisons
+must use the complete-zone formulation with these six terms and scales; M0
+remains a different-model structural reference. The observed improvement is
+deliberately attributed to the objective/conflict neighborhood; the exact
+global lower bound remains the closed priced-root bound.
 
 The experiment remains absent from `run_yard_plan.py`. It neither imports nor
 invokes the existing `cg`, `direct`, or LBBD solvers, and no existing solver
 selects it by instance size.
+
+### Complete-group contiguous-zone pattern stage gate
+
+`yard_planning/group_zone_pattern_generation.py` is a separate structural
+experiment on the same redefined contiguous-zone model. One Dantzig--Wolfe
+column is a complete integer plan for one export group: it selects every
+dedicated zone needed by the group and routes its full declared quantity to
+anchor bays. The master selects exactly one pattern per group and coordinates
+physical rows, bay/size/stack capacities, hard bay states, large-plan
+deviation, and anonymous import reservation. Its persistent integer pricing
+MIP drops locally redundant hard-attribute states and keeps the bounded
+single-commodity flow continuous because its extreme points are integral.
+
+Root generation first uses exact multi-column pricing, then switches to a
+threshold oracle that either exhibits a negative-reduced-cost pattern or
+proves none exists. If the complete root cannot close, the reported lower
+bound is the restricted-master dual value corrected by the valid lower bound
+of every pricing MIP; it is never replaced by the restricted integer-master
+bound. A deterministic globally disjoint pattern seed avoids artificial
+Phase-I tails. The integer pattern pool is then strengthened by a
+conflict-aware Fix-and-Optimize step: a dimensionless square-root-sized set of
+high-cost groups sharing candidate areas and sizes is jointly reoptimized on
+the complete zone model, and the resulting group patterns are returned to the
+integer master. Selected group-bay flows and import reservation are finally
+fixed in the existing exact row-recourse formulation and independently
+validated.
+
+The automated micro instance matches the fully enumerated zone MIP under the
+unified objective. The former base and 72-group numbers used the superseded
+objective and have therefore been removed rather than presented as comparable
+evidence. The experiment remains an isolated, reproducible redesign rather
+than the current paper algorithm. It is not registered in `run_yard_plan.py`
+and does not modify any existing solver path.
