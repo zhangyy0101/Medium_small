@@ -100,11 +100,12 @@ dedicated contiguous row zones. Exact prefix/RMQ top-K pricing avoids scanning
 all intervals; adaptive batches accelerate degenerate rounds. Capacity-cover
 and zone-support inequalities strengthen the root relaxation. An integer
 restricted master uses a square-root adaptive enrichment pool. Its proportional
-conflict-guided Fix-and-Optimize stage chooses a capped group neighborhood:
-half are the largest contributors to the unified objective and half are their
-strongest physical-row competitors. It fixes all other group decisions, opens
-every legal zone in the neighborhood, and feeds improving zones back to the
-integer master. The selected
+Fix-and-Optimize stage chooses at most 18 groups with the largest incumbent
+contributions to the unified objective. It fixes all other group decisions,
+opens every legal zone in the neighborhood, and feeds improving zones back to
+the integer master. A group-area zone-count activation bound strengthens the
+exact root certificate and is removed before primal integer search because the
+ablation shows that retaining it slows incumbent discovery. The selected
 group-bay export flows and anonymous import reservation are then fixed in a
 compact row recourse model. A constructive capacity certificate proves that
 the chosen disjoint zones can realize every export flow, and the solver also
@@ -124,6 +125,11 @@ The unavoidable first area and first zone of every positive-demand group are
 removed from the dispersion terms. Exact row filling is a feasibility
 recourse and secondary quality diagnostic; its legacy row score is not mixed
 into the zone-model upper bound, lower bound, or gap.
+The model imposes an explicit capacity-protection rule: one zone may reserve
+at most its group demand plus one maximum atomic-row capacity on its strip.
+All contiguous intervals satisfying that rule are priced implicitly. This is
+a documented model constraint rather than a claim that longer intervals are
+universally dominated.
 
 ```bash
 python -X utf8 -B benchmark_contiguous_zones.py --root-only --compare-complete-zone-lp --total-time-limit 60 --solver-threads 1

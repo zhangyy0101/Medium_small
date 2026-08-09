@@ -177,8 +177,26 @@ of `min(zone capacity, group demand)` over selected zones. The latter clips an
 oversized interval's fractional capacity contribution without changing any
 integer solution. Individual group-bay flow-capacity links remain in the model;
 the aggregate cover is a strengthening, not a substitute.
+A third, proof-only dominance bound limits selected zones in a group-area pair
+by the number of its atomic row candidates times the area state. It preserves
+an optimum because every selected zone consumes at least one distinct atomic
+row and a positive-cost zone with no supporting area flow can be removed. This
+bound materially strengthens the exact root but is removed after root closure:
+controlled ablation shows that retaining it in the time-limited integer search
+slows incumbent discovery. The certified root bound remains valid, while every
+primal candidate is independently reconstructed under the complete model.
 
-Candidate intervals are counted but not materialized. For a fixed start row,
+Problem 1 includes an explicit zone-capacity protection rule. On each strip,
+a selected interval may reserve at most the group demand plus the largest
+atomic-row capacity on that strip. Thus indivisible row reservation may leave
+up to one maximum atomic row of slack, but a very long, lightly used bridge
+cannot be chosen solely to avoid an additional zone activation. The unused-
+capacity term still differentiates intervals within this hard operational
+limit. Intervals beyond the limit are excluded by the mathematical model; they
+are not claimed to be dominated preprocessing.
+
+Candidate intervals satisfying this rule are counted but not materialized. For
+a fixed start row,
 reduced cost is a prefix sum on each side of the group-demand capacity
 breakpoint. Static range-minimum trees identify the best end row in both
 regimes, and heap range splitting returns the exact top-K intervals without
@@ -186,18 +204,17 @@ scanning every end point. The first available interval for each group also
 certifies its minimum reduced cost. Root pricing therefore closes only when no
 nonactive interval is below `-1e-8`; complete materialization is confined to
 the explicit full-LP/full-MIP references. Phase I and degenerate business
-rounds use adaptive batches, while the integer enrichment pool is capped by
+rounds use adaptive batches. The integer enrichment pool is capped by
 the square root of average interval count rather than a fixed number of columns
 per group.
 
 The integer upper-bound phase keeps the persistent restricted zone master and
-adds one conflict-guided Fix-and-Optimize neighborhood. A per-group incumbent
-score attributes the unified zone objective to the incumbent groups. Half of
-the neighborhood contains the largest objective contributors; the other half
-contains groups whose candidate rows compete most strongly with the selected
-physical resources of those contributors. Its cardinality is bounded by a
-user cap. All decisions outside the neighborhood are fixed; inside it, every
-legal contiguous zone is opened in an exact local MIP. Any improving local
+adds one objective-guided Fix-and-Optimize neighborhood. A per-group incumbent
+score attributes the unified zone objective to the incumbent groups, and the
+18 largest contributors are reopened (or all groups when fewer than 18 exist).
+All decisions outside the neighborhood are fixed; inside it, every
+legal contiguous zone is opened in an exact local MIP. Any
+improving local
 solution is a globally feasible incumbent, and its previously absent zones are
 returned to the persistent integer master.
 The local/master time split is a dimensionless fraction of the remaining
@@ -229,28 +246,32 @@ it cannot weaken or overstate the exact priced-root certificate.
 The automated suite contains an independent exhaustive-pricing comparison,
 generated-versus-complete zone-LP equality, objective reconstruction, exact
 flow realization, bound ordering, and final output validation. On the base
-instance, under the unified objective, exact pricing closes at
-`LB=0.1412735716`. Under the full 60-second algorithm budget the restricted
-integer master obtains `UB=0.1520166229`; reopening all nine groups improves it
-to `UB=0.1517378835`. The certified gap is 6.90%, the secondary row-realization
-score is `0.20204053`, and the algorithm core uses about 57.7 seconds.
+instance, under the unified objective and proof-only area bound, exact pricing
+closes at `LB=0.1450871517`. Under the full 60-second algorithm budget the
+restricted integer master obtains `UB=0.1518776067`; reopening all nine groups
+improves it to `UB=0.1517428013`. The certified gap is 4.39%, the secondary
+row-realization score is `0.19907179`, and the algorithm core uses about 57.7
+seconds. The same-model complete MIP gives `UB=0.1515627477` and
+`LB=0.1507413501` (0.54% gap), so it remains preferable at this scale.
 
 On the 72-group instance, 55,418 atomic row locations induce 120,038 possible
 zones. Under a 120-second, one-thread solver budget, exact root pricing closes
-at `LB=0.1789663283` with 15,764 active zones. Adaptive integer enrichment adds
+at `LB=0.1792403938` with 14,055 active zones. Adaptive integer enrichment adds
 2,952 zones, and the persistent restricted MIP obtains an initial
-`UB=0.1922356183`. The 12-group objective/conflict neighborhood improves the
-incumbent to `UB=0.1889419525`, a 1.71% upper-bound reduction; its local gap is
-0.22% and the certified complete-zone gap is 5.28%. Exact recourse assigns all
-2,241 export boxes, preserves all 624 import-reserved boxes, and has secondary
-row-realization score `0.24722722`; the algorithm core uses about 117.0 seconds.
+`UB=0.1906908063`. The 18-group objective neighborhood improves the incumbent
+to `UB=0.1879968916`, a 1.41% upper-bound reduction; the certified complete-zone
+gap is 4.66%. Exact recourse assigns all 2,241 export boxes, preserves all 624
+import-reserved boxes, and has secondary row-realization score `0.24722919`;
+the algorithm core uses about 117.6 seconds.
 
-Previously recorded complete-zone and M0 numbers used the former objective and
-are not numerically comparable after this unification. Same-model comparisons
-must use the complete-zone formulation with these six terms and scales; M0
-remains a different-model structural reference. The observed improvement is
-deliberately attributed to the objective/conflict neighborhood; the exact
-global lower bound remains the closed priced-root bound.
+The same-model complete MIP gives `UB=0.2073750105`, `LB=0.1797169064`, and a
+13.34% gap on the 72-group case. Thus the generated algorithm is slightly
+weaker in its lower bound but markedly stronger in its incumbent and final
+certificate at scale. M0 remains a different-model structural reference. The
+observed upper-bound improvement is attributed only to the objective
+neighborhood; the tested resource-conflict score was removed after its ablation
+failed to improve the incumbent. The exact global lower bound remains the
+closed proof-root bound.
 
 The experiment remains absent from `run_yard_plan.py`. It neither imports nor
 invokes the existing `cg`, `direct`, or LBBD solvers, and no existing solver

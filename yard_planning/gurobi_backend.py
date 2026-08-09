@@ -96,6 +96,9 @@ class GurobiModel:
     def update(self) -> None:
         self._model.update()
 
+    def removeConstraints(self, constraints: Iterable[object]) -> None:
+        self._model.remove(list(constraints))
+
     @staticmethod
     def getVarObjective(variable) -> float:
         return float(variable.Obj)

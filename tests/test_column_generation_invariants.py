@@ -792,6 +792,55 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         )
         self.assertEqual(priced["pricing_method"], "exact_prefix_rmq_top_k")
 
+    def test_contiguous_zone_capacity_rule_is_explicit_and_uniform(self) -> None:
+        group = ExportGroup(
+            group_id="G1",
+            voyage_id="V1",
+            status="OF",
+            port="P1",
+            size="20",
+            height="96",
+            demand=2,
+        )
+        bays = {
+            bay.bay_key: bay
+            for bay in (
+                make_bay("A", "01", {"1": 2}),
+                make_bay("A", "03", {"1": 2}),
+                make_bay("A", "05", {"1": 2}),
+            )
+        }
+        problem = ProblemData(
+            export_groups=[group],
+            bays=bays,
+            area_guidance_target={("V1", "OF", "A", "20"): 2},
+            area_functions={"A": {"OF"}},
+            target_voyages=["V1"],
+            export_voyages={"V1"},
+            berth_distances={("A", "Q1"): 1.0},
+            berth_by_voyage={"V1": "Q1"},
+        )
+        planner = ContiguousZoneGenerationPlanner(
+            problem,
+            ColumnGenerationConfig(verbose=False),
+        )
+        preparation = planner._prepare_zones()
+        signatures = list(planner._iter_zone_signatures())
+        self.assertEqual(
+            preparation["zone_candidate_policy"],
+            "contiguous_intervals_with_one_atomic_row_capacity_slack",
+        )
+        self.assertEqual(preparation["zone_count"], 5)
+        self.assertEqual(preparation["excluded_by_zone_capacity_rule_count"], 1)
+        self.assertEqual(len(signatures), 5)
+        self.assertTrue(
+            all(
+                sum(planner._atomic_capacity[index] for index in signature)
+                <= planner._zone_capacity_limit_by_strip[strip]
+                for strip, signature in signatures
+            )
+        )
+
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
     def test_contiguous_zone_exact_fill_is_independently_valid(self) -> None:
         result = ContiguousZoneGenerationPlanner(
@@ -865,6 +914,23 @@ class ColumnGenerationInvariantTests(unittest.TestCase):
         )
         self.assertGreater(
             fix_optimize["local"]["neighborhood_group_count"], 0
+        )
+        self.assertGreater(
+            result.diagnostics[
+                "zone_root_proof_only_area_activation_cut_count"
+            ],
+            0,
+        )
+        self.assertFalse(
+            result.diagnostics[
+                "zone_root_proof_cuts_retained_in_primal_search"
+            ]
+        )
+        self.assertEqual(
+            result.diagnostics["zone_time_policy"][
+                "fix_optimize_group_policy"
+            ],
+            "objective",
         )
 
     @unittest.skipUnless(importlib.util.find_spec("gurobipy"), "gurobipy is unavailable")
