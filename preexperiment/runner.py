@@ -207,6 +207,7 @@ def validate_case(
         mip_progress = zone_mip.get("mip_progress", {})
         anytime = result.diagnostics.get("mip_anytime", {})
         fix_optimize = result.diagnostics.get("zone_fix_optimize", {})
+        primal_pool = result.diagnostics.get("primal_pool_diagnostics", {})
         certificate = result.diagnostics.get("zone_objective_certificate", {})
         summary["paper_algorithm"] = {
             "executed": True,
@@ -232,6 +233,32 @@ def validate_case(
             ),
             "primal_pool_zone_count": result.diagnostics.get(
                 "primal_pool_zone_count"
+            ),
+            "final_primal_pool_zone_count": result.diagnostics.get(
+                "final_primal_pool_zone_count"
+            ),
+            "proof_to_primal_reduction_fraction": result.diagnostics.get(
+                "proof_to_primal_reduction_fraction"
+            ),
+            "primal_pool_policy": primal_pool.get("policy"),
+            "primal_pool_build_seconds": primal_pool.get("build_seconds"),
+            "primal_pool_columns_by_origin": primal_pool.get(
+                "primal_pool_columns_by_origin", {}
+            ),
+            "primal_pool_mandatory_start_zone_count": primal_pool.get(
+                "mandatory_start_zone_count"
+            ),
+            "primal_pool_mandatory_overflow_count": primal_pool.get(
+                "mandatory_overflow_count"
+            ),
+            "primal_pool_budget_overflow_group_count": primal_pool.get(
+                "budget_overflow_group_count"
+            ),
+            "primal_pool_group_diagnostics": primal_pool.get(
+                "per_group", {}
+            ),
+            "primal_pool_lp_warm_start": primal_pool.get(
+                "lp_warm_start", {}
             ),
             "zone_mip_status": zone_mip.get("status"),
             "time_to_first_solution": anytime.get("time_to_first_solution"),
@@ -387,6 +414,11 @@ def _flat_case_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "implicit_zones": paper.get("implicit_zone_count"),
         "root_rounds": paper.get("root_round_count"),
         "root_seconds": paper.get("root_seconds"),
+        "proof_pool_zones": paper.get("proof_pool_zone_count"),
+        "primal_pool_zones": paper.get("primal_pool_zone_count"),
+        "proof_to_primal_reduction": paper.get(
+            "proof_to_primal_reduction_fraction"
+        ),
         "zone_mip_status": paper.get("zone_mip_status"),
         "algorithm_version": paper.get("algorithm_version"),
         "time_to_first_solution": paper.get("time_to_first_solution"),

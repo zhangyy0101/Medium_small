@@ -11,6 +11,7 @@ from yard_planning.contiguous_zone_generation import (
     V5_MULTI_START_POLICY,
     ContiguousZoneConfig,
     ContiguousZoneGenerationPlanner,
+    RootSnapshot,
 )
 from yard_planning.models import Bay, ExportGroup, ProblemData
 from yard_planning.planner import ColumnGenerationConfig
@@ -119,6 +120,10 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             ContiguousZoneConfig(
                 mip_start_total_time_fraction=0.05,
                 mip_start_repair_total_fraction=0.08,
+            ).validate()
+        with self.assertRaises(ValueError):
+            ContiguousZoneConfig(
+                primal_pool_apply_lp_warm_start=1,
             ).validate()
 
     def test_integrated_objective_has_no_large_plan_term(self) -> None:
@@ -550,7 +555,7 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             diagnostics["zone_root_proof_cuts_retained_in_primal_search"]
         )
         self.assertEqual(
-            "integrated_zone_v5_start_phase1_1",
+            "integrated_zone_v5_pool_phase2",
             diagnostics["algorithm_version"],
         )
         mip_start = diagnostics["mip_start_diagnostics"]
@@ -560,11 +565,25 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
         )
         self.assertTrue(mip_start["v5_multi_start_enabled"])
         self.assertTrue(mip_start["candidate_generation_executed"])
-        self.assertFalse(diagnostics["proof_primal_pool_separated"])
-        self.assertGreaterEqual(diagnostics["proof_pool_zone_count"], 1)
-        self.assertGreaterEqual(
-            diagnostics["primal_pool_zone_count"],
+        self.assertTrue(diagnostics["proof_primal_pool_separated"])
+        self.assertGreater(
             diagnostics["proof_pool_zone_count"],
+            diagnostics["primal_pool_zone_count"],
+        )
+        self.assertTrue(
+            diagnostics["root_snapshot"][
+                "proof_model_destroyed_before_primal_master"
+            ]
+        )
+        primal_pool = diagnostics["primal_pool_diagnostics"]
+        self.assertEqual(
+            "group_specific_round_robin_diversified_columns",
+            primal_pool["policy"],
+        )
+        self.assertTrue(primal_pool["lp_warm_start"]["enabled"])
+        self.assertGreater(
+            len(primal_pool["primal_pool_columns_by_origin"]),
+            1,
         )
         anytime = diagnostics["mip_anytime"]
         self.assertIsNotNone(anytime["time_to_first_solution"])
@@ -609,11 +628,16 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             planner,
             "_generate_greedy_support_candidate",
             wraps=planner._generate_greedy_support_candidate,
-        ) as v5_generation_spy:
+        ) as v5_generation_spy, patch.object(
+            planner,
+            "_build_integrality_aware_primal_pool",
+            wraps=planner._build_integrality_aware_primal_pool,
+        ) as primal_pool_spy:
             result = planner.solve_complete_zone_mip()
         diagnostics = result.diagnostics
 
         self.assertEqual(0, v5_generation_spy.call_count)
+        self.assertEqual(0, primal_pool_spy.call_count)
         self.assertTrue(diagnostics["independent_solution_validation"]["passed"])
         self.assertEqual(
             "complete_redefined_zone_model",
@@ -834,6 +858,179 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
         self.assertEqual(0, start["submitted_start_count"])
         self.assertEqual("budget_exhausted", start["start_termination_reason"])
         self.assertTrue(result.diagnostics["independent_solution_validation"]["passed"])
+
+    def test_diversified_pool_is_multi_origin_and_deterministic(self) -> None:
+        group = ExportGroup(
+            group_id="G1",
+            voyage_id="V1",
+            status="OF",
+            port="P1",
+            size="20",
+            height="96",
+            demand=10,
+        )
+        problem = ProblemData(
+            export_groups=[group],
+            bays={
+                bay.bay_key: bay
+                for bay in (
+                    make_bay("A", "01"),
+                    make_bay("A", "03"),
+                    make_bay("A", "05"),
+                    make_bay("A", "07"),
+                    make_bay("B", "01"),
+                    make_bay("B", "03"),
+                    make_bay("B", "05"),
+                    make_bay("B", "07"),
+                )
+            },
+            area_functions={"A": {"OF"}, "B": {"OF"}},
+            target_voyages=["V1"],
+            export_voyages={"V1"},
+            berth_distances={("A", "Q1"): 1.0, ("B", "Q1"): 2.0},
+            berth_by_voyage={"V1": "Q1"},
+        )
+
+        def build_once():
+            planner = ContiguousZoneGenerationPlanner(
+                problem,
+                ColumnGenerationConfig(verbose=False),
+            )
+            planner._prepare_zones()
+            snapshot = RootSnapshot(
+                objective=0.0,
+                duals={},
+                zone_values={},
+                export_flow_values={},
+                import_values={},
+                area_values={},
+                voyage_area_values={},
+                attr_values={},
+                lp_warm_start=None,
+                proof_zone_indices=frozenset(),
+            )
+            pool, provenance, diagnostics = (
+                planner._build_integrality_aware_primal_pool(snapshot)
+            )
+            signatures = sorted(
+                planner._zones[index].candidate_indices for index in pool
+            )
+            origins = {
+                origin for index in pool for origin in provenance[index]
+            }
+            return signatures, origins, diagnostics
+
+        first_signatures, first_origins, first_diagnostics = build_once()
+        second_signatures, second_origins, second_diagnostics = build_once()
+
+        self.assertEqual(first_signatures, second_signatures)
+        self.assertEqual(first_origins, second_origins)
+        self.assertEqual(
+            [
+                "root_support",
+                "reduced_cost",
+                "capacity_fit",
+                "business_efficiency",
+                "spatial_diversity",
+            ],
+            first_diagnostics["channel_order"],
+        )
+        self.assertTrue(
+            {
+                "reduced_cost",
+                "capacity_fit",
+                "business_efficiency",
+                "spatial_diversity",
+            }.issubset(first_origins)
+        )
+        self.assertEqual(
+            first_diagnostics["base_primal_pool_zone_count"],
+            second_diagnostics["base_primal_pool_zone_count"],
+        )
+
+    def test_mandatory_start_columns_may_overflow_group_budget(self) -> None:
+        planner = ContiguousZoneGenerationPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(verbose=False),
+        )
+        planner._prepare_zones()
+        planner._materialize_all_zones()
+        by_group = {
+            group.group_id: list(planner._zone_indices_by_group[group.group_id])
+            for group in planner.groups
+        }
+        base = {indices[0] for indices in by_group.values()}
+        mandatory = {indices[1] for indices in by_group.values()}
+        actual = base | mandatory
+        provenance = defaultdict(set)
+        for zone_index in base:
+            provenance[zone_index].add("capacity_fit")
+        diagnostics = {
+            "proof_pool_zone_count": len(planner._zones),
+            "per_group": {
+                group_id: {"nominal_budget": 1}
+                for group_id in by_group
+            },
+        }
+
+        planner._finalize_primal_pool_diagnostics(
+            diagnostics,
+            provenance,
+            base,
+            actual,
+            mandatory,
+        )
+
+        self.assertTrue(mandatory.issubset(actual))
+        self.assertTrue(diagnostics["budget_overflow"])
+        self.assertEqual(len(mandatory), diagnostics["mandatory_overflow_count"])
+        self.assertEqual(
+            len(mandatory),
+            diagnostics["primal_pool_columns_by_origin"]["greedy_start"],
+        )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("gurobipy"),
+        "gurobipy is unavailable",
+    )
+    def test_primal_lp_warm_start_does_not_change_solution(self) -> None:
+        common = ColumnGenerationConfig(
+            total_time_limit=10.0,
+            mip_gap=0.0,
+            solver_threads=1,
+            verbose=False,
+        )
+        with_warm_start = ContiguousZoneGenerationPlanner(
+            make_small_problem(),
+            common,
+            ContiguousZoneConfig(primal_pool_apply_lp_warm_start=True),
+        ).solve()
+        without_warm_start = ContiguousZoneGenerationPlanner(
+            make_small_problem(),
+            common,
+            ContiguousZoneConfig(primal_pool_apply_lp_warm_start=False),
+        ).solve()
+
+        self.assertAlmostEqual(
+            with_warm_start.diagnostics["zone_model_global_lower_bound"],
+            without_warm_start.diagnostics["zone_model_global_lower_bound"],
+            places=9,
+        )
+        self.assertAlmostEqual(
+            with_warm_start.diagnostics["zone_model_upper_bound"],
+            without_warm_start.diagnostics["zone_model_upper_bound"],
+            places=9,
+        )
+        self.assertTrue(
+            with_warm_start.diagnostics[
+                "independent_solution_validation"
+            ]["passed"]
+        )
+        self.assertTrue(
+            without_warm_start.diagnostics[
+                "independent_solution_validation"
+            ]["passed"]
+        )
 
 
 if __name__ == "__main__":

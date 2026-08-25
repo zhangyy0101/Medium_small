@@ -27,7 +27,7 @@ from .planner import ColumnGenerationConfig, ColumnGenerationResult
 
 Resource = tuple[str, str]
 StripKey = tuple[str, str, str]
-ALGORITHM_VERSION = "integrated_zone_v5_start_phase1_1"
+ALGORITHM_VERSION = "integrated_zone_v5_pool_phase2"
 V5_MULTI_START_POLICY = "v5_multi_start"
 COMPLETE_MIP_BASELINE_POLICY = "complete_mip_baseline"
 
@@ -88,6 +88,7 @@ class ContiguousZoneConfig:
     mip_start_repair_total_fraction: float = 0.08
     mip_start_total_time_fraction: float = 0.10
     max_mip_starts: int = 6
+    primal_pool_apply_lp_warm_start: bool = True
     shortage_penalty: float = 1_000.0
     # Integrated paper-model weights after removing the redundant group-area
     # objective.  Its former mass is redistributed proportionally so the
@@ -164,6 +165,8 @@ class ContiguousZoneConfig:
             )
         if int(self.max_mip_starts) <= 0:
             raise ValueError("max_mip_starts must be positive")
+        if not isinstance(self.primal_pool_apply_lp_warm_start, bool):
+            raise ValueError("primal_pool_apply_lp_warm_start must be boolean")
         if float(self.shortage_penalty) <= 0.0:
             raise ValueError("shortage_penalty must be positive")
         if not 0.0 <= float(self.peak_utilization_headroom_fraction) <= 1.0:
@@ -209,6 +212,22 @@ class ContiguousZone:
     stack_uses: tuple[tuple[tuple[str, str], int], ...]
     bay_attr_uses: tuple[tuple[tuple[str, str, str, str], int], ...]
     objective_cost: float
+
+
+@dataclass(frozen=True)
+class RootSnapshot:
+    """Exact-root state retained after the proof master is destroyed."""
+
+    objective: float
+    duals: dict[tuple[str, object], float]
+    zone_values: dict[int, float]
+    export_flow_values: dict[tuple[str, str], float]
+    import_values: dict[tuple[str, str, str], float]
+    area_values: dict[tuple[str, str], float]
+    voyage_area_values: dict[tuple[str, str], float]
+    attr_values: dict[tuple[str, str, str, str], float]
+    lp_warm_start: dict[str, dict[str, float]] | None
+    proof_zone_indices: frozenset[int]
 
 
 class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
@@ -1660,6 +1679,417 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "seconds": perf_counter() - started,
         }
 
+    def _capture_root_snapshot(
+        self,
+        variables: dict,
+        root: dict[str, object],
+    ) -> RootSnapshot:
+        """Detach the certified root state from the proof-model lifecycle."""
+
+        if not root.get("closed") or root.get("root_objective") is None:
+            raise RuntimeError("cannot snapshot an unclosed exact root")
+        required = (
+            "last_root_duals",
+            "last_root_zone_values",
+            "last_root_export_flow_values",
+            "last_root_import_values",
+            "last_root_area_values",
+            "last_root_voyage_area_values",
+            "last_root_attr_values",
+        )
+        missing = [key for key in required if key not in variables]
+        if missing:
+            raise RuntimeError(
+                "closed root is missing snapshot state: " + ", ".join(missing)
+            )
+        return RootSnapshot(
+            objective=float(root["root_objective"]),
+            duals=dict(variables["last_root_duals"]),
+            zone_values=dict(variables["last_root_zone_values"]),
+            export_flow_values=dict(
+                variables["last_root_export_flow_values"]
+            ),
+            import_values=dict(variables["last_root_import_values"]),
+            area_values=dict(variables["last_root_area_values"]),
+            voyage_area_values=dict(
+                variables["last_root_voyage_area_values"]
+            ),
+            attr_values=dict(variables["last_root_attr_values"]),
+            lp_warm_start=variables.get("last_root_lp_warm_start"),
+            proof_zone_indices=frozenset(variables["active_zone_indices"]),
+        )
+
+    @staticmethod
+    def _install_root_snapshot(
+        variables: dict,
+        snapshot: RootSnapshot,
+    ) -> None:
+        """Expose snapshot values through the existing start-helper contract."""
+
+        variables["last_root_duals"] = dict(snapshot.duals)
+        variables["last_root_zone_values"] = dict(snapshot.zone_values)
+        variables["last_root_export_flow_values"] = dict(
+            snapshot.export_flow_values
+        )
+        variables["last_root_import_values"] = dict(snapshot.import_values)
+        variables["last_root_area_values"] = dict(snapshot.area_values)
+        variables["last_root_voyage_area_values"] = dict(
+            snapshot.voyage_area_values
+        )
+        variables["last_root_attr_values"] = dict(snapshot.attr_values)
+        variables["last_root_lp_warm_start"] = snapshot.lp_warm_start
+
+    @staticmethod
+    def _spatial_diversity_ranking(
+        records: list[
+            tuple[StripKey, tuple[int, ...], int, float]
+        ],
+    ) -> list[tuple[int, ...]]:
+        """Interleave strong candidates across areas and physical strips."""
+
+        by_strip: defaultdict[
+            StripKey,
+            list[tuple[StripKey, tuple[int, ...], int, float]],
+        ] = defaultdict(list)
+        for record in records:
+            by_strip[record[0]].append(record)
+        for strip_records in by_strip.values():
+            strip_records.sort(
+                key=lambda item: (
+                    item[3] / max(1, item[2]),
+                    -item[2],
+                    len(item[1]),
+                    item[1],
+                )
+            )
+        strips_by_area: defaultdict[str, list[StripKey]] = defaultdict(list)
+        for strip_key in sorted(by_strip):
+            strips_by_area[strip_key[1]].append(strip_key)
+        strip_order: list[StripKey] = []
+        maximum_strip_count = max(
+            (len(strips) for strips in strips_by_area.values()),
+            default=0,
+        )
+        for position in range(maximum_strip_count):
+            for area_no in sorted(strips_by_area):
+                strips = strips_by_area[area_no]
+                if position < len(strips):
+                    strip_order.append(strips[position])
+        ranking: list[tuple[int, ...]] = []
+        maximum_depth = max(
+            (len(by_strip[strip_key]) for strip_key in strip_order),
+            default=0,
+        )
+        for depth in range(maximum_depth):
+            for strip_key in strip_order:
+                candidates = by_strip[strip_key]
+                if depth < len(candidates):
+                    ranking.append(candidates[depth][1])
+        return ranking
+
+    def _build_integrality_aware_primal_pool(
+        self,
+        snapshot: RootSnapshot,
+    ) -> tuple[
+        set[int],
+        defaultdict[int, set[str]],
+        dict[str, object],
+    ]:
+        """Compress proof columns into a diversified integer-search pool."""
+
+        started = perf_counter()
+        requested_limit = int(self.zone_config.integer_pool_columns_per_group)
+        records_by_group: defaultdict[
+            str,
+            list[tuple[StripKey, tuple[int, ...], int, float]],
+        ] = defaultdict(list)
+        record_by_signature: dict[
+            tuple[int, ...],
+            tuple[StripKey, tuple[int, ...], int, float],
+        ] = {}
+        for strip_key, signature in self._iter_zone_signatures():
+            capacity = sum(
+                int(self._atomic_capacity[index]) for index in signature
+            )
+            record = (
+                strip_key,
+                signature,
+                int(capacity),
+                float(
+                    self._zone_activation_penalty()
+                    + self._unused_capacity_unit_cost() * capacity
+                ),
+            )
+            records_by_group[strip_key[0]].append(record)
+            record_by_signature[signature] = record
+
+        budgets = {
+            group.group_id: min(
+                requested_limit,
+                max(
+                    1,
+                    int(
+                        math.ceil(
+                            math.sqrt(
+                                self._possible_zone_count_by_group[
+                                    group.group_id
+                                ]
+                            )
+                        )
+                    ),
+                ),
+            )
+            for group in self.groups
+        }
+        maximum_budget = max(budgets.values(), default=0)
+        reduced_cost_by_group: defaultdict[str, list[tuple[int, ...]]] = (
+            defaultdict(list)
+        )
+        pricing: dict[str, object] = {
+            "selected": [],
+            "evaluated_zone_count": 0,
+            "pricing_method": "not_executed",
+        }
+        if maximum_budget > 0:
+            pricing = self._price_zone_signatures(
+                snapshot.duals,
+                per_group_limit=maximum_budget,
+                active_zone_indices=set(),
+                improving_only=False,
+            )
+            for _reduced_cost, strip_key, signature in pricing["selected"]:
+                reduced_cost_by_group[strip_key[0]].append(signature)
+
+        proof_indices_by_group: defaultdict[str, list[int]] = defaultdict(list)
+        for zone_index in snapshot.proof_zone_indices:
+            proof_indices_by_group[self._zones[zone_index].group_id].append(
+                zone_index
+            )
+
+        selected_indices: set[int] = set()
+        provenance: defaultdict[int, set[str]] = defaultdict(set)
+        per_group_diagnostics: dict[str, object] = {}
+        channel_names = (
+            "root_support",
+            "reduced_cost",
+            "capacity_fit",
+            "business_efficiency",
+            "spatial_diversity",
+        )
+        for group in self.groups:
+            group_id = group.group_id
+            records = records_by_group[group_id]
+            demand = int(group.demand)
+            root_ranking = [
+                self._zones[index].candidate_indices
+                for index in sorted(
+                    proof_indices_by_group[group_id],
+                    key=lambda index: (
+                        -float(snapshot.zone_values.get(index, 0.0)),
+                        self._zones[index].objective_cost
+                        / max(1, self._zones[index].capacity),
+                        self._zones[index].candidate_indices,
+                    ),
+                )
+                if float(snapshot.zone_values.get(index, 0.0)) > 1e-8
+            ]
+            capacity_ranking = [
+                item[1]
+                for item in sorted(
+                    records,
+                    key=lambda item: (
+                        0 if item[2] >= demand else 1,
+                        abs(item[2] - demand),
+                        item[3] / max(1, item[2]),
+                        len(item[1]),
+                        item[0],
+                        item[1],
+                    ),
+                )
+            ]
+            business_ranking = [
+                item[1]
+                for item in sorted(
+                    records,
+                    key=lambda item: (
+                        item[3] / max(1, item[2]),
+                        max(0, item[2] - demand),
+                        abs(item[2] - demand),
+                        item[0],
+                        item[1],
+                    ),
+                )
+            ]
+            channels = {
+                "root_support": root_ranking,
+                "reduced_cost": list(reduced_cost_by_group[group_id]),
+                "capacity_fit": capacity_ranking,
+                "business_efficiency": business_ranking,
+                "spatial_diversity": self._spatial_diversity_ranking(records),
+            }
+            positions = {name: 0 for name in channel_names}
+            selected_signatures: set[tuple[int, ...]] = set()
+            signature_origins: defaultdict[tuple[int, ...], set[str]] = (
+                defaultdict(set)
+            )
+            budget = int(budgets[group_id])
+            while len(selected_signatures) < budget:
+                progressed = False
+                for channel_name in channel_names:
+                    if len(selected_signatures) >= budget:
+                        break
+                    ranking = channels[channel_name]
+                    position = positions[channel_name]
+                    while position < len(ranking):
+                        signature = ranking[position]
+                        position += 1
+                        if signature in selected_signatures:
+                            signature_origins[signature].add(channel_name)
+                            continue
+                        selected_signatures.add(signature)
+                        signature_origins[signature].add(channel_name)
+                        progressed = True
+                        break
+                    positions[channel_name] = position
+                if not progressed:
+                    break
+
+            for signature in sorted(selected_signatures):
+                strip_key = record_by_signature[signature][0]
+                zone_index = self._register_zone(strip_key, signature)
+                selected_indices.add(zone_index)
+                provenance[zone_index].update(signature_origins[signature])
+            per_group_diagnostics[group_id] = {
+                "possible_zone_count": int(
+                    self._possible_zone_count_by_group[group_id]
+                ),
+                "nominal_budget": budget,
+                "selected_zone_count": len(selected_signatures),
+                "channel_candidate_counts": {
+                    name: len(channels[name]) for name in channel_names
+                },
+                "selected_by_origin": {
+                    name: sum(
+                        name in origins
+                        for origins in signature_origins.values()
+                    )
+                    for name in channel_names
+                },
+            }
+
+        base_origin_counts = {
+            origin: sum(
+                origin in provenance[zone_index]
+                for zone_index in selected_indices
+            )
+            for origin in channel_names
+        }
+        return selected_indices, provenance, {
+            "policy": "group_specific_round_robin_diversified_columns",
+            "proof_primal_pool_separated": True,
+            "proof_pool_zone_count": len(snapshot.proof_zone_indices),
+            "implicit_zone_count": int(self._possible_zone_count),
+            "requested_columns_per_group_limit": requested_limit,
+            "group_budget_policy": (
+                "min(integer_pool_columns_per_group,"
+                "ceil(sqrt(possible_zone_count_by_group)))"
+            ),
+            "channel_order": list(channel_names),
+            "base_primal_pool_zone_count": len(selected_indices),
+            "base_columns_by_origin": base_origin_counts,
+            "per_group": per_group_diagnostics,
+            "reduced_cost_pricing_method": pricing["pricing_method"],
+            "reduced_cost_priced_interval_count": pricing[
+                "evaluated_zone_count"
+            ],
+            "mandatory_start_policy": "retain_all_submitted_repaired_start_zones",
+            "deterministic": True,
+            "build_seconds": perf_counter() - started,
+        }
+
+    def _finalize_primal_pool_diagnostics(
+        self,
+        diagnostics: dict[str, object],
+        provenance: defaultdict[int, set[str]],
+        base_pool_indices: set[int],
+        primal_pool_indices: set[int],
+        mandatory_start_indices: set[int],
+    ) -> None:
+        """Add mandatory starts and summarize the actual integer pool."""
+
+        for zone_index in mandatory_start_indices:
+            provenance[zone_index].add("greedy_start")
+        budgets = {
+            group_id: int(values["nominal_budget"])
+            for group_id, values in diagnostics["per_group"].items()
+        }
+        actual_by_group: Counter[str] = Counter(
+            self._zones[index].group_id for index in primal_pool_indices
+        )
+        mandatory_by_group: Counter[str] = Counter(
+            self._zones[index].group_id for index in mandatory_start_indices
+        )
+        overflow_by_group = {
+            group_id: max(0, int(actual_by_group[group_id]) - budget)
+            for group_id, budget in budgets.items()
+        }
+        for group_id, values in diagnostics["per_group"].items():
+            values["actual_zone_count_after_mandatory"] = int(
+                actual_by_group[group_id]
+            )
+            values["mandatory_start_zone_count"] = int(
+                mandatory_by_group[group_id]
+            )
+            values["budget_overflow"] = overflow_by_group[group_id] > 0
+            values["mandatory_overflow_count"] = int(
+                overflow_by_group[group_id]
+            )
+        origins = sorted(
+            {
+                origin
+                for index in primal_pool_indices
+                for origin in provenance[index]
+            }
+        )
+        proof_count = int(diagnostics["proof_pool_zone_count"])
+        primal_count = len(primal_pool_indices)
+        diagnostics.update(
+            {
+                "primal_pool_zone_count": primal_count,
+                "mandatory_start_zone_count": len(mandatory_start_indices),
+                "mandatory_added_zone_count": len(
+                    mandatory_start_indices - base_pool_indices
+                ),
+                "budget_overflow": any(overflow_by_group.values()),
+                "budget_overflow_group_count": sum(
+                    value > 0 for value in overflow_by_group.values()
+                ),
+                "mandatory_overflow_count": sum(overflow_by_group.values()),
+                "primal_pool_columns_by_origin": {
+                    origin: sum(
+                        origin in provenance[index]
+                        for index in primal_pool_indices
+                    )
+                    for origin in origins
+                },
+                "primal_pool_zone_origins": {
+                    str(index): sorted(provenance[index])
+                    for index in sorted(primal_pool_indices)
+                },
+                "proof_to_primal_reduction_fraction": (
+                    1.0 - primal_count / proof_count
+                    if proof_count > 0
+                    else None
+                ),
+                "primal_to_proof_ratio": (
+                    primal_count / proof_count if proof_count > 0 else None
+                ),
+                "primal_pool_less_than_proof_pool": (
+                    primal_count < proof_count
+                ),
+            }
+        )
+
     def _enrich_integer_pool(self, model, variables: dict) -> dict[str, object]:
         requested_limit = int(self.zone_config.integer_pool_columns_per_group)
         average_zone_count = self._possible_zone_count / max(1, len(self.groups))
@@ -2923,6 +3353,11 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         pending_results = [pair[0] for pair in pending_start_pairs]
         pending_starts = [pair[1] for pair in pending_start_pairs]
         variables["pending_repaired_mip_starts"] = []
+        variables["certified_repaired_start_zone_indices"] = {
+            zone_index
+            for result in pending_results
+            for zone_index in result["selected_zone_indices"]
+        }
 
         actual_seconds = perf_counter() - started
         budget_seconds = max(0.0, float(start_budget_seconds))
@@ -2952,6 +3387,9 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "repair_feasible_count": len(repaired),
             "provided_mip_start_count": len(pending_starts),
             "submitted_start_count": 0,
+            "mandatory_start_zone_count": len(
+                variables["certified_repaired_start_zone_indices"]
+            ),
             "best_repaired_start_objective": (
                 float(pending_results[0]["objective"])
                 if pending_results
@@ -4620,12 +5058,16 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         total_limit = max(0.01, float(self.config.total_time_limit))
         deadline = started + total_limit
         preparation = self._prepare_zones()
-        model, variables = self._build_zone_master()
+        proof_model, proof_variables = self._build_zone_master()
         try:
             root_deadline = perf_counter() + max(
                 0.0, deadline - perf_counter()
             ) * float(self.zone_config.root_time_fraction)
-            root = self._run_root_generation(model, variables, root_deadline)
+            root = self._run_root_generation(
+                proof_model,
+                proof_variables,
+                root_deadline,
+            )
             if not root.get("closed"):
                 raise RuntimeError(
                     "zone root pricing did not close within its adaptive time "
@@ -4638,12 +5080,42 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                     "zone root did not cover all export demand before integerization: "
                     f"shortage={root.get('root_shortage')}"
                 )
-            proof_pool_indices = set(variables["active_zone_indices"])
+            root_snapshot = self._capture_root_snapshot(
+                proof_variables,
+                root,
+            )
+            proof_pool_indices = set(root_snapshot.proof_zone_indices)
+        finally:
+            self._free_gurobi_model(proof_model)
+
+        (
+            base_primal_pool_indices,
+            zone_provenance,
+            primal_pool_diagnostics,
+        ) = self._build_integrality_aware_primal_pool(root_snapshot)
+        model, variables = self._build_zone_master()
+        try:
             proof_only_area_cut_count = self._remove_proof_only_area_rows(
                 model, variables
             )
-            pool_enrichment = self._enrich_integer_pool(model, variables)
-            enriched_pool_indices = set(variables["active_zone_indices"])
+            for zone_index in sorted(base_primal_pool_indices):
+                self._add_zone_variable(model, variables, zone_index)
+            model.update()
+            self._install_root_snapshot(variables, root_snapshot)
+            if self.zone_config.primal_pool_apply_lp_warm_start:
+                warm_start_diagnostics = {
+                    "enabled": True,
+                    "provided": root_snapshot.lp_warm_start is not None,
+                    **model.applyLpWarmStart(root_snapshot.lp_warm_start),
+                }
+            else:
+                warm_start_diagnostics = {
+                    "enabled": False,
+                    "provided": root_snapshot.lp_warm_start is not None,
+                    "matched_primal": 0,
+                    "matched_dual": 0,
+                }
+            primal_pool_diagnostics["lp_warm_start"] = warm_start_diagnostics
             fill_reserve = total_limit * float(
                 self.zone_config.fill_time_fraction
             )
@@ -4669,7 +5141,20 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                     "restricted zone master did not obtain an integer support: "
                     f"{zone_mip_initial}"
                 )
-            repaired_start_pool_indices = set(variables["active_zone_indices"])
+            mandatory_start_indices = set(
+                variables.get(
+                    "certified_repaired_start_zone_indices",
+                    set(),
+                )
+            )
+            primal_pool_indices = set(variables["active_zone_indices"])
+            self._finalize_primal_pool_diagnostics(
+                primal_pool_diagnostics,
+                zone_provenance,
+                set(base_primal_pool_indices),
+                primal_pool_indices,
+                mandatory_start_indices,
+            )
             if self.zone_config.fix_optimize_policy == "disabled":
                 selected_zones = set(initial_zones)
                 selected_export_flow = initial_export_flow
@@ -4703,6 +5188,15 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                     deadline - fill_reserve,
                 )
             final_primal_pool_indices = set(variables["active_zone_indices"])
+            for zone_index in (
+                final_primal_pool_indices - primal_pool_indices
+            ):
+                zone_provenance[zone_index].add(
+                    "single_round_fix_optimize"
+                )
+            primal_pool_diagnostics["final_primal_master_zone_count"] = len(
+                final_primal_pool_indices
+            )
             zone_mip = zone_mip_initial
         finally:
             self._free_gurobi_model(model)
@@ -4737,26 +5231,15 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             deadline,
         )
         selected_support_zone_objective = zone_upper_bound
-        zone_global_lower_bound = float(root["root_objective"])
+        zone_global_lower_bound = float(root_snapshot.objective)
         zone_absolute_gap = max(0.0, zone_upper_bound - zone_global_lower_bound)
         zone_relative_gap = zone_absolute_gap / max(abs(zone_upper_bound), 1e-12)
-        selected_zone_origin_counts = {
-            "root_proof_pool": len(set(selected_zones) & proof_pool_indices),
-            "root_enrichment": len(
-                set(selected_zones)
-                & (enriched_pool_indices - proof_pool_indices)
-            ),
-            "repaired_start_support": len(
-                set(selected_zones)
-                & (repaired_start_pool_indices - enriched_pool_indices)
-            ),
-            "single_round_fix_optimize": len(
-                set(selected_zones)
-                & (final_primal_pool_indices - repaired_start_pool_indices)
-            ),
-        }
-        selected_zone_origin_counts["unclassified"] = len(selected_zones) - sum(
-            selected_zone_origin_counts.values()
+        selected_zone_origin_counts: Counter[str] = Counter()
+        for zone_index in selected_zones:
+            origins = zone_provenance.get(zone_index) or {"unclassified"}
+            selected_zone_origin_counts.update(origins)
+        primal_pool_diagnostics["final_selected_zones_by_origin"] = dict(
+            sorted(selected_zone_origin_counts.items())
         )
         local_progress = fix_optimize.get("local", {}).get("mip_progress")
         final_master_progress = fix_optimize.get("master_reoptimization", {}).get(
@@ -4772,15 +5255,15 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         fix_improvement = float(fix_optimize.get("absolute_improvement", 0.0))
         diagnostics = {
             "algorithm": (
-                "contiguous_zone_generation_objective_fix_optimize_"
-                "with_exact_recourse"
+                "exact_proof_cg_diversified_primal_pool_"
+                "objective_fix_optimize_with_exact_recourse"
             ),
             "algorithm_version": ALGORITHM_VERSION,
             "model_scope": "actual_quantity_flow_on_dedicated_contiguous_row_zones",
             "formulation": "zone_flow_master_plus_flow_fixed_exact_row_recourse",
             "decomposition": (
-                "exact_rmq_interval_pricing_restricted_integer_master_"
-                "objective_fix_optimize_then_certified_row_realization"
+                "exact_rmq_proof_master_snapshot_diversified_primal_"
+                "master_objective_fix_optimize_then_certified_row_realization"
             ),
             "planned_group_count": len(self.groups),
             "planned_box_count": sum(group.demand for group in self.groups),
@@ -4791,10 +5274,32 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 proof_only_area_cut_count
             ),
             "zone_root_proof_cuts_retained_in_primal_search": False,
-            "zone_pool_enrichment": pool_enrichment,
-            "proof_primal_pool_separated": False,
+            "root_snapshot": {
+                "objective": root_snapshot.objective,
+                "proof_zone_count": len(root_snapshot.proof_zone_indices),
+                "positive_zone_count": sum(
+                    value > 1e-8
+                    for value in root_snapshot.zone_values.values()
+                ),
+                "lp_warm_start_captured": (
+                    root_snapshot.lp_warm_start is not None
+                ),
+                "proof_model_destroyed_before_primal_master": True,
+            },
+            "zone_pool_enrichment": primal_pool_diagnostics,
+            "primal_pool_diagnostics": primal_pool_diagnostics,
+            "proof_primal_pool_separated": True,
             "proof_pool_zone_count": len(proof_pool_indices),
-            "primal_pool_zone_count": len(final_primal_pool_indices),
+            "primal_pool_zone_count": len(primal_pool_indices),
+            "final_primal_pool_zone_count": len(final_primal_pool_indices),
+            "proof_to_primal_reduction_fraction": (
+                primal_pool_diagnostics[
+                    "proof_to_primal_reduction_fraction"
+                ]
+            ),
+            "primal_pool_columns_by_origin": primal_pool_diagnostics[
+                "primal_pool_columns_by_origin"
+            ],
             "zone_mip": zone_mip,
             "zone_mip_initial": zone_mip_initial,
             "zone_fix_optimize": fix_optimize,
@@ -4816,7 +5321,9 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "zone_restricted_pool_bound_is_global": False,
             "zone_selected_candidate_count": len(candidate_indices),
             "zone_selected_support_source": selected_support_source,
-            "zone_selected_origin_counts": selected_zone_origin_counts,
+            "zone_selected_origin_counts": dict(
+                sorted(selected_zone_origin_counts.items())
+            ),
             "zone_selected_support_objective": selected_support_zone_objective,
             "zone_objective_certificate": objective_certificate,
             "zone_candidate_reduction": 1.0
@@ -4852,6 +5359,12 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 ),
                 "integer_search_policy": V5_MULTI_START_POLICY,
                 "v5_multi_start_enabled": True,
+                "proof_primal_pool_policy": (
+                    "group_specific_round_robin_diversified_columns"
+                ),
+                "primal_pool_lp_warm_start_enabled": bool(
+                    self.zone_config.primal_pool_apply_lp_warm_start
+                ),
             },
             "master_status": fix_optimize["status"],
             "master_objective": zone_upper_bound,
@@ -4938,4 +5451,5 @@ __all__ = [
     "ContiguousZone",
     "ContiguousZoneConfig",
     "ContiguousZoneGenerationPlanner",
+    "RootSnapshot",
 ]
