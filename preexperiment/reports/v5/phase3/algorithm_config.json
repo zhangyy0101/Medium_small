@@ -1,0 +1,82 @@
+{
+  "model_schema_version": "integrated_zone_v4",
+  "algorithm_version": "integrated_zone_v5_conflict_multiround_phase3",
+  "fix_optimize_policy": "conflict_multi_round",
+  "fix_optimize_max_rounds": 3,
+  "fix_optimize_round_zone_fractions": [0.12, 0.22, 0.35],
+  "fix_optimize_local_fraction": 0.85,
+  "seed_signal": "current_incumbent_objective_contribution",
+  "conflict_graph": {
+    "components": [
+      "same_voyage",
+      "candidate_area_overlap",
+      "physical_resource_conflict",
+      "peak_utilization_exchange"
+    ],
+    "normalization": "each component in [0, 1]",
+    "weights": {
+      "same_voyage": 0.25,
+      "candidate_area_overlap": 0.25,
+      "physical_resource_conflict": 0.25,
+      "peak_utilization_exchange": 0.25
+    },
+    "full_zone_pair_materialization": false
+  },
+  "neighborhood_policy": "objective seed plus highest coupled groups under round candidate-zone budget",
+  "dynamic_zone_policy": "materialize complete legal zones only for selected neighborhood groups",
+  "column_injection_policy": "inject local incumbent used zones into the current primal master with round provenance",
+  "round_time_policy": "remaining search time divided by remaining rounds",
+  "unchanged_phase2_config": {
+    "proof_pool_policy": "closed_exact_rmq_root_generation",
+    "primal_pool_policy": "group_specific_round_robin_diversified_columns",
+    "integer_pool_columns_per_group": 100,
+    "primal_pool_channels": [
+      "root_support",
+      "reduced_cost",
+      "capacity_fit",
+      "business_efficiency",
+      "spatial_diversity"
+    ],
+    "mandatory_start_columns": "retain_all_submitted_repaired_start_zones",
+    "primal_pool_apply_lp_warm_start": true,
+    "mip_start_total_time_fraction": 0.10,
+    "mip_start_repair_total_fraction": 0.08,
+    "max_repaired_start_candidates": 8,
+    "max_mip_starts": 6,
+    "root_time_fraction": 0.50,
+    "zone_mip_time_fraction": 0.75,
+    "fill_time_fraction": 0.05
+  },
+  "unchanged_model_config": {
+    "peak_utilization_headroom_fraction": 0.50,
+    "objective_weights": {
+      "voyage_area_dispersion": 0.15,
+      "zone_dispersion": 0.35,
+      "existing_group_proximity": 0.125,
+      "unused_capacity": 0.2125,
+      "berth_distance": 0.1625
+    }
+  },
+  "implemented_scope": [
+    "incumbent_dependent_four_component_group_conflict_graph",
+    "objective_contribution_seed_selection",
+    "unsuccessful_seed_rotation",
+    "three_round_increasing_candidate_zone_budgets",
+    "complete_neighborhood_zone_materialization",
+    "local_mip_and_primal_master_reoptimization",
+    "round_provenance_column_injection",
+    "per_round_diagnostics"
+  ],
+  "explicitly_not_implemented_or_changed": [
+    "phase2_group_budget_or_static_pool_tuning",
+    "phase2_five_channel_pool_changes",
+    "multi_start_changes",
+    "objective_changes",
+    "pricing_changes",
+    "cuts",
+    "dynamic_initial_mip_stopping",
+    "dual_stabilization",
+    "local_branching",
+    "branch_and_price"
+  ]
+}
