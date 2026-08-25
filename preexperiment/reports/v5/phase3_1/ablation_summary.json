@@ -1,0 +1,39 @@
+{
+  "phase": "v5_phase3_1_neighborhood_ablation",
+  "status": "complete",
+  "tests": {
+    "passed": 40,
+    "failed": 0,
+    "skipped": 0
+  },
+  "winners": {
+    "pilot_l_301": {
+      "policy": "conflict_multi",
+      "upper_bound": 0.1343149583635132
+    },
+    "scale_g048_s601": {
+      "policy": "hybrid_multi",
+      "upper_bound": 0.14158001879786564
+    },
+    "scale_g096_s801": {
+      "policy": "conflict_single",
+      "upper_bound": 0.17023476191836232
+    }
+  },
+  "diagnosis": {
+    "universal_winner_found": false,
+    "conflict_single_reliably_dominates_objective_single": false,
+    "multi_round_is_uniformly_harmful": false,
+    "hybrid_is_safe_across_scales": false,
+    "selection_signal_is_scale_stable": false,
+    "time_fragmentation_is_the_only_regression_cause": false
+  },
+  "initial_incumbent_control": {
+    "pilot_l_301_identical_all_policies": true,
+    "scale_g048_s601_max_absolute_difference": 0.00017602295829744,
+    "scale_g096_s801_nonhybrid_identical": true,
+    "scale_g096_s801_hybrid_absolute_difference": 0.00049350571187326,
+    "interpretation": "TimeLimit-based initial MIP has small run-to-run variation; compare both final UB and F&O improvement. The hybrid 96 regression remains after accounting for its worse initial incumbent because its F&O improvement is also materially smaller."
+  },
+  "next_step": "implement_dynamic_initial_mip_stopping_as_a_separate_paired_ablation_before_redesigning_conflict_scores"
+}

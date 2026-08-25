@@ -1,0 +1,65 @@
+{
+  "scope": "phase3_neighborhood_selection_and_round_fragmentation_ablation",
+  "formal_holdout": false,
+  "policies": [
+    {
+      "label": "objective_single",
+      "policy": "objective",
+      "rounds": 1,
+      "zone_fractions": [0.35]
+    },
+    {
+      "label": "conflict_single",
+      "policy": "conflict_multi_round",
+      "rounds": 1,
+      "zone_fractions": [0.35]
+    },
+    {
+      "label": "conflict_multi",
+      "policy": "conflict_multi_round",
+      "rounds": 3,
+      "zone_fractions": [0.12, 0.22, 0.35]
+    },
+    {
+      "label": "hybrid_multi",
+      "policy": "hybrid_multi_round",
+      "rounds": 3,
+      "zone_fractions": [0.12, 0.22, 0.35],
+      "round_selection": ["objective", "conflict", "conflict"]
+    }
+  ],
+  "cases": [
+    {
+      "case_id": "pilot_l_301",
+      "groups": 24,
+      "seed": 301,
+      "time_limit_seconds": 60,
+      "manifest_sha1": "3f29840d61575f75ae0647dddd82e2e41c54e7f5"
+    },
+    {
+      "case_id": "scale_g048_s601",
+      "groups": 48,
+      "seed": 601,
+      "time_limit_seconds": 120,
+      "manifest_sha1": "b04b34d1fd51e7267c3b22bc63fe3d455d876c8a"
+    },
+    {
+      "case_id": "scale_g096_s801",
+      "groups": 96,
+      "seed": 801,
+      "time_limit_seconds": 120,
+      "manifest_sha1": "7d20bab411ab58baf0ed1f1a439fa56c3d3e00ab"
+    }
+  ],
+  "fixed_controls": {
+    "same_materialized_input": true,
+    "same_objective": true,
+    "same_phase2_static_pool_policy": true,
+    "same_multi_start_policy": true,
+    "same_pricing_and_root_proof": true,
+    "same_total_time_limit": true,
+    "same_exact_recourse": true,
+    "threads": 1,
+    "python_hash_seed": "0"
+  }
+}
