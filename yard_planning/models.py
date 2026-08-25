@@ -91,10 +91,20 @@ class ProblemData:
 
     export_groups: list[ExportGroup]
     bays: dict[str, Bay]
-    area_guidance_target: dict[tuple[str, str, str, str], int]
     area_functions: dict[str, set[str]]
     target_voyages: list[str]
     export_voyages: set[str] | None = None
+    # Legacy upstream-area target retained only for historical planners.  The
+    # integrated paper model neither requires nor reads it.
+    area_guidance_target: dict[tuple[str, str, str, str], int] = field(
+        default_factory=dict
+    )
+    import_demand_by_flow_size: dict[tuple[str, str], int] = field(
+        default_factory=dict
+    )
+    # Legacy area reference retained only for old callers and historical
+    # baselines.  The integrated paper model reads anonymous import demand
+    # from ``import_demand_by_flow_size`` and has no upstream area target.
     import_area_size_reference: dict[tuple[str, str, str], int] = field(default_factory=dict)
     existing_group_area_load: dict[tuple[str, ...], int] = field(default_factory=dict)
     existing_group_bay_load: dict[tuple[str, ...], int] = field(default_factory=dict)

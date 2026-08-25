@@ -105,9 +105,16 @@ class YardPlanningBase:
                 if int(qty) > 0
             }
         )
-        self.import_total_by_flow_size: Counter[tuple[str, str]] = Counter()
-        for (flow, _area_no, size), qty in self.import_area_size_reference.items():
-            self.import_total_by_flow_size[(flow, size)] += int(qty)
+        self.import_total_by_flow_size: Counter[tuple[str, str]] = Counter(
+            {
+                (str(flow), str(size)): int(qty)
+                for (flow, size), qty in problem.import_demand_by_flow_size.items()
+                if int(qty) > 0
+            }
+        )
+        if not self.import_total_by_flow_size:
+            for (flow, _area_no, size), qty in self.import_area_size_reference.items():
+                self.import_total_by_flow_size[(flow, size)] += int(qty)
         self.existing_group_area_load: Counter[tuple[str, ...]] = Counter(
             {
                 tuple(key): int(value)
@@ -235,6 +242,20 @@ class YardPlanningBase:
         consistency_stats = self._row_area_summary_consistency_stats(export_rows, bay_summary_rows)
         bay_consistency_stats = self._row_bay_summary_consistency_stats(export_rows, bay_summary_rows)
         operational_group_dispersion = self._operational_group_dispersion_stats(export_rows)
+        legacy_guidance_diagnostics = {}
+        if self.quota_by_key:
+            legacy_guidance_diagnostics = {
+                "area_summary_big_plan_inheritance": (
+                    self._area_summary_big_plan_inheritance_stats(
+                        bay_summary_rows
+                    )
+                ),
+                "final_area_summary_inheritance_energy_components": (
+                    self._area_summary_inheritance_energy_components(
+                        bay_summary_rows
+                    )
+                ),
+            }
         diagnostics.update(
             {
                 "expanded_integer_row_location_count": len(self._columns),
@@ -244,10 +265,9 @@ class YardPlanningBase:
                 "bay_summary_row_count": len(bay_summary_rows),
                 "planned_export_boxes": sum(int(row["planned_boxes"]) for row in export_rows),
                 "operational_group_dispersion": operational_group_dispersion,
-                "area_summary_big_plan_inheritance": self._area_summary_big_plan_inheritance_stats(bay_summary_rows),
-                "final_area_summary_inheritance_energy_components": self._area_summary_inheritance_energy_components(bay_summary_rows),
                 "capacity_reservation_margins": self._capacity_reservation_margins(selected),
                 "export_voyage_row_no_mix": self._export_voyage_row_no_mix_stats(selected),
+                **legacy_guidance_diagnostics,
                 **consistency_stats,
                 **bay_consistency_stats,
             }
@@ -374,14 +394,16 @@ class YardPlanningBase:
                 for (flow, reference_area, size), qty in self.import_area_size_reference.items()
                 if reference_area == area_no
             )
-            result[area_no] = {
+            values = {
                 "physical_slot_capacity": int(physical),
                 "export_slot_use": int(export_slots),
                 "import_reserved_slot_use": int(import_slots),
                 "residual_slot_units": int(physical - export_slots - import_slots),
-                "import_reference_boxes": int(reference_boxes),
                 "import_reserved_boxes": int(import_area_boxes[area_no]),
             }
+            if self.import_area_size_reference:
+                values["import_reference_boxes"] = int(reference_boxes)
+            result[area_no] = values
         return result
 
     def _make_import_reservation_rows(self) -> list[dict]:
@@ -410,21 +432,32 @@ class YardPlanningBase:
         for (flow, size, bay_key), qty in self._final_import_reservation.items():
             if qty > 0 and bay_key in self.bays:
                 actual[(flow, self.bays[bay_key].area_no, size)] += int(qty)
-        keys = set(actual) | set(self.import_area_size_reference)
+        keys = (
+            set(actual) | set(self.import_area_size_reference)
+            if self.import_area_size_reference
+            else set()
+        )
         l1 = sum(
             abs(int(actual.get(key, 0)) - int(self.import_area_size_reference.get(key, 0)))
             for key in keys
         )
-        return {
+        diagnostics = {
             "reserved_boxes": int(sum(actual.values())),
             "reserved_by_flow_area_size": {
                 f"{flow}|{area}|{size}": int(qty)
                 for (flow, area, size), qty in sorted(actual.items())
                 if qty > 0
             },
-            "area_l1_deviation": int(l1),
-            "boxes_shifted_between_areas": int(l1 // 2),
+            "area_reference_used": bool(self.import_area_size_reference),
         }
+        if self.import_area_size_reference:
+            diagnostics.update(
+                {
+                    "area_l1_deviation": int(l1),
+                    "boxes_shifted_between_areas": int(l1 // 2),
+                }
+            )
+        return diagnostics
 
     @staticmethod
     def _operational_group_dispersion_stats(rows: list[dict]) -> dict[str, int | float | str]:
@@ -508,7 +541,11 @@ class YardPlanningBase:
         for (flow, size, bay_key), qty in self._final_import_reservation.items():
             if qty > 0 and bay_key in self.bays:
                 import_actual_by_area[(flow, self.bays[bay_key].area_no, size)] += int(qty)
-        import_keys = set(self.import_area_size_reference) | set(import_actual_by_area)
+        import_keys = (
+            set(self.import_area_size_reference) | set(import_actual_by_area)
+            if self.import_area_size_reference
+            else set()
+        )
         import_guidance_l1 = sum(
             abs(
                 int(import_actual_by_area.get(key, 0))
@@ -782,6 +819,8 @@ class YardPlanningBase:
         objective_mode: str,
     ) -> dict[tuple[str, str, str], object]:
         """Penalize the minimum area adjustment of anonymous import reserve."""
+        if not self.import_area_size_reference:
+            return {}
         keys = set(self.import_area_size_reference) | set(import_by_flow_area_size)
         balance = {}
         penalty = 0.0 if objective_mode == "phase_one" else self._area_guidance_penalty()

@@ -8,6 +8,7 @@ import pandas as pd
 from adapters.input_adapter_gd import InputAdapterGd
 from adapters.planning_input import (
     active_large_container_shadow_slots,
+    calculate_declared_import_demand,
     existing_bay_attributes,
     existing_large_pair_members_by_bay,
     existing_operational_group_loads,
@@ -154,6 +155,58 @@ class PlanningInputPreprocessingTests(unittest.TestCase):
         )
         self.assertEqual(1, area_load[group_key + ("A",)])
         self.assertEqual(1, bay_load[group_key + ("A", "A|01")])
+
+    def test_declared_import_demand_is_anonymous_and_excludes_in_yard_ids(self) -> None:
+        adapter = InputAdapterGd()
+        adapter.take_over_vessel = {"I": ["I1"]}
+        adapter.vessel_berth_info = pd.DataFrame(
+            [{"VOY_ID": "I1", "VOY_IEFG": "I"}]
+        )
+        adapter.bay_slots_detail = pd.DataFrame(
+            [
+                {
+                    "HAS_CONTAINER": 1,
+                    "IYC_CNTRID": "C1",
+                }
+            ]
+        )
+        adapter.vessel_containers = {
+            "I1": {
+                "type": "I",
+                "doc_cntrs": pd.DataFrame(
+                    [
+                        {
+                            "IYC_CNTRID": "C1",
+                            "IYC_IVOY_ID": "I1",
+                            "IYC_CSZ_CSIZECD": "20",
+                            "IYC_STS_CSTATUSCD": "IF",
+                        },
+                        {
+                            "IYC_CNTRID": "C2",
+                            "IYC_IVOY_ID": "I1",
+                            "IYC_CSZ_CSIZECD": "20",
+                            "IYC_STS_CSTATUSCD": "IF",
+                        },
+                        {
+                            "IYC_CNTRID": "C3",
+                            "IYC_IVOY_ID": "I1",
+                            "IYC_CSZ_CSIZECD": "45",
+                            "IYC_STS_CSTATUSCD": "IZ",
+                        },
+                        {
+                            "IYC_CNTRID": "C3",
+                            "IYC_IVOY_ID": "I1",
+                            "IYC_CSZ_CSIZECD": "45",
+                            "IYC_STS_CSTATUSCD": "IZ",
+                        },
+                    ]
+                ),
+            }
+        }
+
+        demand = calculate_declared_import_demand(adapter)
+
+        self.assertEqual({("IF", "20"): 1, ("IZ", "40"): 1}, dict(demand))
 
 
 if __name__ == "__main__":

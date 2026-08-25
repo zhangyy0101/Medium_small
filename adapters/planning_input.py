@@ -265,6 +265,29 @@ def classified_export_voyages(input_guandong: InputAdapterGd) -> set[str]:
     return exports
 
 
+def classified_import_voyages(input_guandong: InputAdapterGd) -> set[str]:
+    """Return voyages explicitly classified as import."""
+
+    cache = planning_runtime_cache(input_guandong)
+    cached = cache.get("classified_import_voyages")
+    if isinstance(cached, set):
+        return set(cached)
+    imports = set(_take_over_vessels(input_guandong, "I"))
+    imports.update(
+        voyage
+        for voyage, content in _adapter_vessel_items(input_guandong)
+        if normalize_code(content.get("type")) == "I"
+    )
+    vessel_info = read_vessel_info(input_guandong)
+    imports.update(
+        normalize_voyage(row.get("voy_id"))
+        for row in vessel_info.to_dict("records")
+        if row.get("ie_flag") == "I" and normalize_voyage(row.get("voy_id"))
+    )
+    cache["classified_import_voyages"] = set(imports)
+    return imports
+
+
 def normalize_bay(value: Any) -> str:
     code = normalize_code(value)
     if code.isdigit():
@@ -401,21 +424,6 @@ def read_distance_matrix(
     return distances
 
 
-def parse_tops_time(series: pd.Series) -> pd.Series:
-    if pd.api.types.is_numeric_dtype(series):
-        return pd.to_datetime(series, unit="s", errors="coerce")
-    return pd.to_datetime(series, errors="coerce")
-
-
-def parse_tops_area_bay(value: Any) -> tuple[str, str]:
-    code = normalize_code(value).replace(".0", "")
-    if not code:
-        return "", ""
-    if len(code) < 4:
-        code = code.zfill(4)
-    return code[:2], normalize_bay(code[-2:])
-
-
 def bay_code_value(value: Any) -> int | None:
     code = normalize_code(value)
     if not code:
@@ -430,54 +438,6 @@ def bay_code_value(value: Any) -> int | None:
             return None
         total = total * 36 + digit
     return total
-
-
-def slot_range_mask_preparsed(
-    values: pd.Series,
-    parsed_values: pd.Series,
-    start_value: Any,
-    end_value: Any,
-    value_parser: Any,
-) -> pd.Series:
-    start = normalize_code(start_value)
-    end = normalize_code(end_value)
-    if not start and not end:
-        return pd.Series(True, index=values.index)
-    if start and not end:
-        return values.map(normalize_code).eq(start)
-    if end and not start:
-        return values.map(normalize_code).eq(end)
-    start_key = value_parser(start)
-    end_key = value_parser(end)
-    if start_key is None or end_key is None:
-        allowed = {value for value in [start, end] if value}
-        return values.map(normalize_code).isin(allowed)
-    lo = min(start_key, end_key)
-    hi = max(start_key, end_key)
-    return parsed_values.notna() & parsed_values.ge(lo) & parsed_values.le(hi)
-
-
-def active_tops_rows(input_guandong: InputAdapterGd, planning_time: datetime) -> pd.DataFrame:
-    cache = planning_runtime_cache(input_guandong)
-    tops = cache.get("tops_plan_normalized")
-    if not isinstance(tops, pd.DataFrame):
-        raw_tops = input_guandong.tops_plan
-        if raw_tops is None or raw_tops.empty:
-            tops = pd.DataFrame(columns=["condition_vessel", "start_time", "end_time"])
-            cache["tops_plan_normalized"] = tops
-            return tops.copy()
-        tops = raw_tops.copy()
-        tops["condition_vessel"] = tops["SPL_CONDITIONCODE"].map(normalize_voyage)
-        tops["start_time"] = parse_tops_time(tops["SPL_STDATE"])
-        tops["end_time"] = parse_tops_time(tops["SPL_EDDATE"])
-        if "SPL_ISVALID" in tops.columns:
-            tops = tops[tops["SPL_ISVALID"].astype(str).str.upper().eq("Y")].copy()
-        if "SPR_ISVALID" in tops.columns:
-            tops = tops[tops["SPR_ISVALID"].astype(str).str.upper().eq("Y")].copy()
-        cache["tops_plan_normalized"] = tops
-    if tops.empty:
-        return tops.copy()
-    return tops[(tops["start_time"] <= planning_time) & (planning_time <= tops["end_time"])].copy()
 
 
 def read_closed_areas(input_guandong: InputAdapterGd) -> set[str]:
@@ -507,6 +467,68 @@ def calculate_declared_export_demand(
                 )
             )
     return rows
+
+
+def calculate_declared_import_demand(
+    input_guandong: InputAdapterGd,
+) -> Counter[tuple[str, str]]:
+    """Count declared import boxes that are not already in the yard.
+
+    Import demand remains anonymous in the integrated paper model.  Voyage
+    identity is used only while deduplicating documents; the returned demand
+    is aggregated by operational flow and physical size.
+    """
+
+    occupied_ids: set[str] = set()
+    snapshot = getattr(input_guandong, "bay_slots_detail", None)
+    if (
+        isinstance(snapshot, pd.DataFrame)
+        and not snapshot.empty
+        and "HAS_CONTAINER" in snapshot.columns
+    ):
+        occupied = snapshot.loc[
+            pd.to_numeric(snapshot["HAS_CONTAINER"], errors="coerce")
+            .fillna(0)
+            .eq(1)
+        ]
+        for row in occupied.to_dict("records"):
+            container_id = normalize_code(row.get("IYC_CNTRID")) or normalize_code(
+                row.get("IYC_CNTRNO")
+            )
+            if container_id not in {"", "-1", "0"}:
+                occupied_ids.add(container_id)
+
+    demand: Counter[tuple[str, str]] = Counter()
+    seen_ids: set[str] = set()
+    import_voyages = classified_import_voyages(input_guandong)
+    content_by_voyage = dict(_adapter_vessel_items(input_guandong))
+    for voyage_id in sorted(import_voyages):
+        content = content_by_voyage.get(voyage_id, {})
+        frame = content.get("doc_cntrs") if isinstance(content, Mapping) else None
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            continue
+        for row in frame.to_dict("records"):
+            row_voyage = normalize_voyage(row.get("IYC_IVOY_ID"))
+            if row_voyage and row_voyage != voyage_id:
+                continue
+            container_id = normalize_code(row.get("IYC_CNTRID")) or normalize_code(
+                row.get("IYC_CNTRNO")
+            )
+            if container_id in {"", "-1", "0"}:
+                continue
+            if container_id in occupied_ids or container_id in seen_ids:
+                continue
+            seen_ids.add(container_id)
+            size = normalize_container_size(row.get("IYC_CSZ_CSIZECD"))
+            if size == "45":
+                size = "40"
+            if size not in {"20", "40"}:
+                continue
+            flow = normalize_planning_flow(
+                row.get("IYC_STS_CSTATUSCD"), default="IF"
+            )
+            demand[(flow, size)] += 1
+    return demand
 
 
 def existing_operational_group_loads(
@@ -765,8 +787,6 @@ def build_bays(
     input_guandong: InputAdapterGd,
     allowed_areas: set[str],
     closed_areas: set[str],
-    planning_time: datetime,
-    target_voyages: set[str],
     attribute_rules: AttributeRules | None = None,
 ) -> dict[str, Bay]:
     frame = input_guandong.bay_slots_detail.copy()
@@ -774,9 +794,6 @@ def build_bays(
     frame["YBY_BAYNO"] = frame["YBY_BAYNO"].map(normalize_bay)
     frame["YST_ROWNO"] = frame["YST_ROWNO"].map(normalize_row)
     frame = frame[frame["YAA_AREANO"].isin(allowed_areas) & ~frame["YAA_AREANO"].isin(closed_areas)].copy()
-
-    reserved_slots = tops_reserved_slots(input_guandong, frame, planning_time, target_voyages)
-    frame = drop_reserved_slots(frame, reserved_slots)
 
     large_bay_partner_by_bay = large_bay_partner_lookup_by_bay(frame)
     existing_large_pairs_by_member = existing_large_pair_members_by_bay(frame)
@@ -862,68 +879,6 @@ def build_bays(
             },
         )
     return bays
-
-
-def tops_reserved_slots(
-    input_guandong: InputAdapterGd,
-    frame: pd.DataFrame,
-    planning_time: datetime,
-    target_voyages: set[str],
-) -> set[tuple[str, str, str]]:
-    active = active_tops_rows(input_guandong, planning_time)
-    active = active[~active["condition_vessel"].isin({normalize_voyage(v) for v in target_voyages})].copy()
-    reserved: set[tuple[str, str, str]] = set()
-    if active.empty or frame.empty:
-        return reserved
-    empty = frame[frame["HAS_CONTAINER"].fillna(0).astype(int).eq(0)].copy()
-    empty["_bay_code"] = empty["YBY_BAYNO"].map(bay_code_value)
-    empty["_row_code"] = empty["YST_ROWNO"].map(bay_code_value)
-    by_area = {area: sub for area, sub in empty.groupby("YAA_AREANO")}
-    for _, tops in active.iterrows():
-        start_area, start_bay = parse_tops_area_bay(tops.get("SPR_STBAY"))
-        end_area, end_bay = parse_tops_area_bay(tops.get("SPR_EDBAY"))
-        area = start_area or end_area
-        if start_area and end_area and start_area != end_area:
-            area = end_area
-        if not area or area not in by_area:
-            continue
-        sub = by_area[area]
-        matched = sub[
-            slot_range_mask_preparsed(
-                sub["YBY_BAYNO"],
-                sub["_bay_code"],
-                start_bay,
-                end_bay,
-                bay_code_value,
-            )
-        ].copy()
-        if matched.empty:
-            continue
-        start_row = normalize_row(tops.get("SPR_STROW"))
-        end_row = normalize_row(tops.get("SPR_EDROW"))
-        if start_row or end_row:
-            matched = matched[
-                slot_range_mask_preparsed(
-                    matched["YST_ROWNO"],
-                    matched["_row_code"],
-                    start_row,
-                    end_row,
-                    bay_code_value,
-                )
-
-            ]
-        for row in matched.to_dict("records"):
-            reserved.add((row["YAA_AREANO"], row["YBY_BAYNO"], row["YST_ROWNO"]))
-    return reserved
-
-
-def drop_reserved_slots(frame: pd.DataFrame, reserved_slots: set[tuple[str, str, str]]) -> pd.DataFrame:
-    if not reserved_slots or frame.empty:
-        return frame
-    empty = frame["HAS_CONTAINER"].fillna(0).astype(int).eq(0)
-    keys = list(zip(frame["YAA_AREANO"], frame["YBY_BAYNO"], frame["YST_ROWNO"]))
-    mask = [not (is_empty and key in reserved_slots) for is_empty, key in zip(empty, keys)]
-    return frame.loc[mask].copy()
 
 
 def active_occupied(frame: pd.DataFrame) -> pd.DataFrame:
@@ -1365,7 +1320,6 @@ def existing_bay_attributes(
 
 def build_problem(
     input_guandong: InputAdapterGd,
-    big_plan: list[BigPlanRow],
     planning_time: datetime,
     target_voyages: list[str],
 ) -> ProblemData:
@@ -1373,8 +1327,6 @@ def build_problem(
     area_functions = read_area_functions(input_guandong)
     function_areas = set(area_functions)
 
-    area_guidance_target: dict[tuple[str, str, str, str], int] = {}
-    cleaned_plan: list[BigPlanRow] = []
     target_voyages = [normalize_voyage(v) for v in target_voyages]
     # Fixed, publication-oriented grouping and compatibility rules.
     attribute_rules = AttributeRules(
@@ -1382,100 +1334,26 @@ def build_problem(
         bay_no_mix_attributes=("IYC_CHEIGHTCD",),
         row_no_mix_attributes=("IYC_POT_UNLDPORT",),
     )
-    # Paper model: remove terminal-specific manual allow/block/required-area
-    # controls. Feasibility is defined by yard functions and the upstream big
-    # plan; operator overrides remain outside the mathematical model.
+    # Integrated paper model: remove terminal-specific manual
+    # allow/block/required-area controls. Feasibility is defined directly by
+    # yard functions; operator overrides remain outside the mathematical model.
     allowed_areas_by_voyage = {voyage_id: set(function_areas) for voyage_id in target_voyages}
     berth_by_voyage = read_export_berths(input_guandong, target_voyages)
-    plan_date = planning_time.date().isoformat()
-    target_big_plan_flows = {planning_area_flow(flow) for flow in DEFAULT_TARGET_BIG_PLAN_FLOWS}
     target_voyage_set = set(target_voyages)
     all_export_voyages = classified_export_voyages(input_guandong)
     export_voyages = all_export_voyages & target_voyage_set
-    # Detailed row allocation is limited to the selected export voyages, but
-    # every import row in the same big-plan snapshot is an external capacity
-    # commitment. Keeping these scopes separate prevents ``--voyages`` from
-    # accidentally disabling import-capacity protection.
-    input_plan = [
-        row
-        for row in big_plan
-        if (not row.plan_date or row.plan_date == plan_date)
-        and (row.voyage_id in export_voyages or row.voyage_id not in all_export_voyages)
-    ]
     allowed_areas = set().union(*(set(areas) for areas in allowed_areas_by_voyage.values())) if allowed_areas_by_voyage else set(function_areas)
-    skipped_closed_area: Counter[tuple[str, str]] = Counter()
-    skipped_flow_function: Counter[tuple[str, str]] = Counter()
-    for row in input_plan:
-        plan_flow = planning_area_flow(row.flow)
-        if plan_flow not in target_big_plan_flows:
-            continue
-        is_import = row.voyage_id not in all_export_voyages
-        if not is_import:
-            if row.area_no not in allowed_areas_by_voyage.get(row.voyage_id, set(function_areas)):
-                continue
-            if row.area_no in closed:
-                skipped_closed_area[(row.voyage_id, row.area_no)] += row.new_boxes
-                continue
-            if not area_allows_flow(row.area_no, plan_flow, area_functions):
-                skipped_flow_function[(row.voyage_id, row.area_no)] += row.new_boxes
-                continue
-        cleaned_plan.append(row)
     # Export groups contain declared, not-yet-gated-in containers only.
     export_groups = load_export_groups(input_guandong, target_voyages, attribute_rules)
     # Only declared export containers receive detailed row-level decisions.
     export_groups = [group for group in export_groups if group.voyage_id in export_voyages]
-
-    demand_by_voyage_size: Counter[tuple[str, str, str]] = Counter()
-    for group in export_groups:
-        big_size = "40" if group.size == "45" else group.size
-        demand_by_voyage_size[(group.voyage_id, group.status, big_size)] += group.demand
-    upstream_area_size_weights: Counter[tuple[str, str, str, str]] = Counter()
-    for row in cleaned_plan:
-        if row.voyage_id not in export_voyages:
-            continue
-        plan_flow = planning_area_flow(row.flow)
-        upstream_area_size_weights[(row.voyage_id, plan_flow, row.area_no, row.size_mode)] += row.new_boxes
-
-    # Import new_qty supplies a reference distribution for anonymous capacity
-    # reservation.  Its total is conserved by flow and size, while its area
-    # distribution may move when the upstream area is not physically usable.
-    # Export new_qty remains a soft area-distribution reference only.
-    import_area_size_reference: Counter[tuple[str, str, str]] = Counter()
-    for row in cleaned_plan:
-        if row.voyage_id not in all_export_voyages:
-            import_area_size_reference[
-                (planning_area_flow(row.flow), row.area_no, row.size_mode)
-            ] += row.new_boxes
-    for voyage_id in target_voyages:
-        flows = sorted({flow for (v, flow, _size), qty in demand_by_voyage_size.items() if v == voyage_id and qty > 0})
-        for flow in flows:
-            source_flow = planning_area_flow(flow)
-            compatible_plan_flows = {source_flow}
-            for size_mode in SIZE_MODES:
-                target_qty = demand_by_voyage_size[(voyage_id, flow, size_mode)]
-                if target_qty <= 0:
-                    continue
-                exact_upper = Counter(
-                    {
-                        area_no: qty
-                        for (v, f, area_no, size), qty in upstream_area_size_weights.items()
-                        if v == voyage_id and f in compatible_plan_flows and size == size_mode and qty > 0
-                    }
-                )
-                if exact_upper:
-                    # Normalize the upstream distribution to the declared
-                    # export demand. No forecast-only quantity survives as a
-                    # downstream target or capacity reservation.
-                    allocations = allocate_by_weights(dict(exact_upper), target_qty)
-                    for area_no, qty in allocations.items():
-                        area_guidance_target[(voyage_id, flow, area_no, size_mode)] = qty
-                    continue
+    import_demand_by_flow_size = calculate_declared_import_demand(
+        input_guandong
+    )
     bays = build_bays(
         input_guandong,
         allowed_areas,
         closed,
-        planning_time,
-        set(target_voyages),
         attribute_rules,
     )
     existing_group_area_load, existing_group_bay_load = existing_operational_group_loads(
@@ -1489,11 +1367,12 @@ def build_problem(
     return ProblemData(
         export_groups=export_groups,
         bays=bays,
-        area_guidance_target=area_guidance_target,
+        area_guidance_target={},
         area_functions=area_functions,
         target_voyages=target_voyages,
         export_voyages=export_voyages,
-        import_area_size_reference=dict(import_area_size_reference),
+        import_demand_by_flow_size=dict(import_demand_by_flow_size),
+        import_area_size_reference={},
         existing_group_area_load=dict(existing_group_area_load),
         existing_group_bay_load=dict(existing_group_bay_load),
         berth_distances=berth_distances,
@@ -1506,18 +1385,10 @@ def load_planning_inputs(
     input_guandong: InputAdapterGd,
     planning_time: datetime,
     voyages: Sequence[str],
-    big_plan: pd.DataFrame | Sequence[BigPlanRow] | None = None,
 ) -> PlanningInputs:
-    if big_plan is None:
-        big_plan_rows = read_big_plan(input_guandong.large_plan)
-    elif isinstance(big_plan, pd.DataFrame):
-        big_plan_rows = read_big_plan(big_plan)
-    else:
-        big_plan_rows = list(big_plan)
     demand_rows = calculate_declared_export_demand(input_guandong, voyages)
     problem = build_problem(
         input_guandong,
-        big_plan_rows,
         planning_time=planning_time,
         target_voyages=list(voyages),
     )

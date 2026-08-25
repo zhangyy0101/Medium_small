@@ -1,0 +1,102 @@
+{
+  "schema_version": 3,
+  "model_schema_version": "integrated_zone_v3",
+  "suite_id": "scale_v1_heterogeneous_voyages",
+  "base_input": "../example/input_data.json",
+  "base_input_sha256": "6eeed59a2f4b7660ffe84a378f2dba419cf1d2e89164c1b661773c01a7a09442",
+  "storage_policy": "base_snapshot_plus_deterministic_scenario_recipe",
+  "demand_policy": "yard_snapshot_plus_declared_documents_only",
+  "design": "fixed_yard_known_box_demand_with_deterministic_voyage_heterogeneity",
+  "cases": [
+    {
+      "case_id": "scale_g024_s401",
+      "seed": 401,
+      "export_voyage_count": 2,
+      "groups_per_voyage": 12,
+      "boxes_per_voyage": 320,
+      "import_fraction": 0.75,
+      "voyage_volume_spread": 0.18
+    },
+    {
+      "case_id": "scale_g024_s402",
+      "seed": 402,
+      "export_voyage_count": 2,
+      "groups_per_voyage": 12,
+      "boxes_per_voyage": 320,
+      "import_fraction": 0.75,
+      "voyage_volume_spread": 0.18
+    },
+    {
+      "case_id": "scale_g036_s501",
+      "seed": 501,
+      "export_voyage_count": 3,
+      "groups_per_voyage": 12,
+      "boxes_per_voyage": 320,
+      "import_fraction": 0.75,
+      "voyage_volume_spread": 0.18
+    },
+    {
+      "case_id": "scale_g036_s502",
+      "seed": 502,
+      "export_voyage_count": 3,
+      "groups_per_voyage": 12,
+      "boxes_per_voyage": 320,
+      "import_fraction": 0.75,
+      "voyage_volume_spread": 0.18
+    },
+    {
+      "case_id": "scale_g048_s601",
+      "seed": 601,
+      "export_voyage_count": 4,
+      "groups_per_voyage": 12,
+      "boxes_per_voyage": 320,
+      "import_fraction": 0.75,
+      "voyage_volume_spread": 0.18
+    },
+    {
+      "case_id": "scale_g048_s602",
+      "seed": 602,
+      "export_voyage_count": 4,
+      "groups_per_voyage": 12,
+      "boxes_per_voyage": 320,
+      "import_fraction": 0.75,
+      "voyage_volume_spread": 0.18
+    },
+    {
+      "case_id": "scale_g072_s701",
+      "seed": 701,
+      "export_voyage_count": 6,
+      "groups_per_voyage": 12,
+      "boxes_per_voyage": 320,
+      "import_fraction": 0.75,
+      "voyage_volume_spread": 0.18
+    },
+    {
+      "case_id": "scale_g072_s702",
+      "seed": 702,
+      "export_voyage_count": 6,
+      "groups_per_voyage": 12,
+      "boxes_per_voyage": 320,
+      "import_fraction": 0.75,
+      "voyage_volume_spread": 0.18
+    },
+    {
+      "case_id": "scale_g096_s801",
+      "seed": 801,
+      "export_voyage_count": 8,
+      "groups_per_voyage": 12,
+      "boxes_per_voyage": 320,
+      "import_fraction": 0.75,
+      "voyage_volume_spread": 0.18
+    },
+    {
+      "case_id": "scale_g096_s802",
+      "seed": 802,
+      "export_voyage_count": 8,
+      "groups_per_voyage": 12,
+      "boxes_per_voyage": 320,
+      "import_fraction": 0.75,
+      "voyage_volume_spread": 0.18
+    }
+  ]
+}

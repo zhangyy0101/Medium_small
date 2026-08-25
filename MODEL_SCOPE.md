@@ -2,11 +2,11 @@
 
 ## 1. Planning boundary
 
-Detailed decisions cover only declared export containers that have not entered the yard. Every declared export box must be allocated; export forecasts and unallocated-demand variables are excluded.
+The integrated paper model uses deterministic known-box demand only: in-yard containers plus declared documents, deduplicated by container ID. It does not read an upstream large-plan file. Forecast fields may remain in a legacy input payload but are ignored, and forecast-only voyages are excluded. Detailed decisions cover declared export containers that have not entered the yard, and every such box must be allocated; unallocated-demand variables are excluded from the final integer model.
 
-Import voyages are represented by anonymous capacity reservations. Only large-plan `new_qty` is incremental import demand. `planned_qty` already includes in-yard boxes and is never read as new demand. Import reservation obeys area-function compatibility, bay-size compatibility, and shared physical capacity, but it does not inherit export voyage, discharge-port, height, or other detailed no-mix rules.
+Import voyages are represented by anonymous capacity reservations. Incremental import demand is counted directly from declared import documents after excluding container IDs already in the yard. It is aggregated by operational flow and physical size. Import reservation obeys area-function compatibility, bay-size compatibility, shared physical capacity, and the peak-utilization epsilon constraint, but it does not inherit export voyage, discharge-port, height, detailed no-mix rules, or any export spatial-quality objective.
 
-Large-plan size must be `20` or `40`; `40` denotes the physical 40/45-ft category. `ALL`, blank, `45`, and unknown values are rejected. Detailed 45-ft export demand may use only available edge large bays, subject to all ordinary footprint, size, row, and no-mix constraints. This restriction does not block feasible non-45-ft demand from edge positions.
+Detailed 45-ft export demand may use only available edge large bays, subject to all ordinary footprint, size, row, and no-mix constraints. This restriction does not block feasible non-45-ft demand from edge positions. In anonymous import capacity, 45-ft documents are conservatively aggregated into the physical 40-ft category.
 
 ## 2. Contiguous-zone formulation
 
@@ -28,7 +28,9 @@ The master coordinates:
 - hard bay/row no-mix states;
 - voyage, discharge-port, and height separation for exports;
 - 40/45-ft paired footprints and 45-ft edge eligibility;
-- anonymous import capacity and export/import large-plan guidance.
+- voyage-area and group-area activation;
+- anonymous import capacity;
+- a data-derived peak residual-capacity-consumption epsilon constraint.
 
 An active group-area pair must have a selected zone, and actual area flow is bounded by the sum of selected-zone capacities clipped at group demand. A proof-only group-area zone-count inequality strengthens the root certificate; it is removed before primal integer search because it is valid for the root proof purpose but empirically delays incumbent discovery in the primal phase.
 
@@ -38,14 +40,16 @@ All optimization, pricing, certification, upper bounds, and lower bounds use one
 
 | Component | Weight | Natural scale |
 |---|---:|---|
-| extra group areas | 0.25 | reachable group-area activations |
-| extra disconnected zones | 0.22 | natural interval expansion by group |
-| existing-group proximity | 0.08 | reachable anchored quantity and normalized bay distance |
-| export/import large-plan L1 deviation | 0.22 | guided export and reserved import quantity |
-| unused reserved zone capacity | 0.13 | total declared export demand |
-| quantity-weighted berth distance | 0.10 | assigned quantity and voyage-specific distance range |
+| extra voyage areas | 0.12 | reachable voyage-area activations |
+| extra group areas | 0.20 | reachable group-area activations |
+| extra disconnected zones | 0.28 | natural interval expansion by group |
+| existing-group proximity | 0.10 | reachable anchored quantity and normalized bay distance |
+| unused reserved export-zone capacity | 0.17 | total declared export demand |
+| quantity-weighted berth distance | 0.13 | assigned export quantity and voyage-specific distance range |
 
-The unavoidable first area and first zone of each positive-demand group are removed from the two dispersion terms. All required berth-area distances must exist; missing data is an input error.
+The unavoidable first area of each positive-demand voyage and the first area and first zone of each positive-demand group are removed from the corresponding dispersion terms. All required berth-area distances must exist; missing data is an input error. Anonymous imports have zero coefficient in every objective component.
+
+Peak use is handled as an epsilon constraint rather than a seventh objective. Let `rho_LB` be the strongest planned-slot-load/residual-capacity lower bound computed for the whole instance, export/import subsets, voyages, groups, and import flow-size classes. The calculation includes integer area-capacity breakpoints, so fractional capacity that cannot hold another slot unit is not counted. With headroom parameter `h`, the cap is `rho_cap = rho_LB + h(1-rho_LB)`; the default is `h=0.50`. Both export footprints and anonymous import footprints count toward each area's load. This is a reproducible experimental proxy, not a terminal-approved safety threshold, and `h` must be covered by sensitivity analysis.
 
 Exact row filling has no primary-objective term. It is a feasibility recourse with a separately reported secondary row-quality diagnostic, so it cannot change the zone-model bound or gap.
 
@@ -73,12 +77,6 @@ The reported certificate is
 
 `analyze_complete_zone_mip()` solves the fully materialized version of the same zone model and is the valid small-scale direct comparison. `DirectMilpPlanner` allocates directly at row locations and is retained because the zone algorithm inherits its shared row model for recourse. As a standalone M0 it has a different concentration representation and feasible set; cross-model objective subtraction is therefore deliberately disabled.
 
-## 7. Reproducible stage-gate results
+## 7. Experiment-version boundary
 
-With one Gurobi thread and a common solver budget:
-
-- Base instance, 60 s: `LB=0.1450871517`, adaptive-neighborhood `UB=0.1518251117`, gap 4.44%. The neighborhood selects 3 of 9 groups and exposes 27.46% of candidate zones while covering 64.79% of attributable objective.
-- 72-group instance, 120 s: `LB=0.1792403938`, initial restricted-MIP `UB=0.1993817657`, final `UB=0.1918854490`, gap 6.59%. The neighborhood selects 23 groups and improves the incumbent by 3.76%. Exact recourse realizes all 2,241 export boxes and 624 import-reserved boxes.
-- Same-model complete zone MIP on the 72-group instance, 120 s: `UB=0.2073750105`, `LB=0.1797169064`, gap 13.34%.
-
-These measurements establish correctness and a scale-stage algorithmic advantage over the same-model complete MIP. They are development evidence, not a substitute for the final paper experiment design, multi-seed robustness analysis, or formal complexity discussion.
+Results produced with the former sequential large-plan guidance objective are not comparable with this integrated model's UB, LB, or gap. All stage-gate, ablation, and complete-zone-MIP experiments must be regenerated from schema-v3 materialized scenarios. Correctness checks still require the generated root to match the fully enumerated zone LP on micro instances, followed by multi-seed comparisons under equal solver budgets.

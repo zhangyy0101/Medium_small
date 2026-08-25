@@ -1,0 +1,59 @@
+{
+  "schema_version": 3,
+  "model_schema_version": "integrated_zone_v3",
+  "suite_id": "pilot_v1",
+  "base_input": "../example/input_data.json",
+  "base_input_sha256": "6eeed59a2f4b7660ffe84a378f2dba419cf1d2e89164c1b661773c01a7a09442",
+  "storage_policy": "base_snapshot_plus_deterministic_scenario_recipe",
+  "demand_policy": "yard_snapshot_plus_declared_documents_only",
+  "cases": [
+    {
+      "case_id": "pilot_s_101",
+      "seed": 101,
+      "export_voyage_count": 1,
+      "groups_per_voyage": 4,
+      "boxes_per_voyage": 80,
+      "import_fraction": 0.25
+    },
+    {
+      "case_id": "pilot_s_102",
+      "seed": 102,
+      "export_voyage_count": 1,
+      "groups_per_voyage": 4,
+      "boxes_per_voyage": 80,
+      "import_fraction": 0.25
+    },
+    {
+      "case_id": "pilot_m_201",
+      "seed": 201,
+      "export_voyage_count": 2,
+      "groups_per_voyage": 8,
+      "boxes_per_voyage": 180,
+      "import_fraction": 0.50
+    },
+    {
+      "case_id": "pilot_m_202",
+      "seed": 202,
+      "export_voyage_count": 2,
+      "groups_per_voyage": 8,
+      "boxes_per_voyage": 180,
+      "import_fraction": 0.50
+    },
+    {
+      "case_id": "pilot_l_301",
+      "seed": 301,
+      "export_voyage_count": 2,
+      "groups_per_voyage": 12,
+      "boxes_per_voyage": 320,
+      "import_fraction": 0.75
+    },
+    {
+      "case_id": "pilot_l_302",
+      "seed": 302,
+      "export_voyage_count": 2,
+      "groups_per_voyage": 12,
+      "boxes_per_voyage": 320,
+      "import_fraction": 0.75
+    }
+  ]
+}

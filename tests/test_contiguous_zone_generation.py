@@ -76,6 +76,44 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             ContiguousZoneConfig(fix_optimize_objective_mass=0.0).validate()
         with self.assertRaises(ValueError):
             ContiguousZoneConfig(fix_optimize_zone_fraction=1.1).validate()
+        with self.assertRaises(ValueError):
+            ContiguousZoneConfig(
+                peak_utilization_headroom_fraction=1.1
+            ).validate()
+
+    def test_integrated_objective_has_no_large_plan_term(self) -> None:
+        planner = ContiguousZoneGenerationPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(verbose=False),
+        )
+
+        preparation = planner._prepare_zones()
+
+        self.assertEqual(
+            {
+                "voyage_area_dispersion",
+                "group_area_dispersion",
+                "zone_dispersion",
+                "existing_group_proximity",
+                "unused_capacity",
+                "berth_distance",
+            },
+            set(planner._zone_objective_weights()),
+        )
+        policy = preparation["peak_utilization_policy"]
+        self.assertAlmostEqual(0.75, policy["load_lower_bound"], places=8)
+        self.assertAlmostEqual(0.875, policy["epsilon_cap"], places=8)
+        self.assertFalse(policy["terminal_approved_threshold_used"])
+
+    def test_legacy_import_area_reference_is_not_accepted_as_demand(self) -> None:
+        problem = make_small_problem()
+        problem.import_area_size_reference = {("IF", "A", "20"): 1}
+
+        with self.assertRaisesRegex(ValueError, "direct anonymous import"):
+            ContiguousZoneGenerationPlanner(
+                problem,
+                ColumnGenerationConfig(verbose=False),
+            )
 
     @unittest.skipUnless(
         importlib.util.find_spec("gurobipy"),
@@ -203,6 +241,41 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
         importlib.util.find_spec("gurobipy"),
         "gurobipy is unavailable",
     )
+    def test_anonymous_imports_only_affect_capacity_and_peak_constraint(self) -> None:
+        problem = make_small_problem()
+        problem.import_demand_by_flow_size = {("IF", "20"): 2}
+        for functions in problem.area_functions.values():
+            functions.add("IF")
+
+        result = ContiguousZoneGenerationPlanner(
+            problem,
+            ColumnGenerationConfig(
+                total_time_limit=10.0,
+                mip_gap=0.0,
+                solver_threads=1,
+                verbose=False,
+            ),
+        ).solve()
+
+        certificate = result.diagnostics["zone_objective_certificate"]
+        self.assertGreater(len(result.import_reservation_rows), 0)
+        self.assertEqual(
+            2,
+            sum(
+                int(row["reserved_boxes"])
+                for row in result.import_reservation_rows
+            ),
+        )
+        self.assertNotIn("area_guidance", certificate["weights"])
+        self.assertLessEqual(
+            certificate["peak_utilization"]["maximum"],
+            certificate["peak_utilization"]["epsilon_cap"] + 1e-9,
+        )
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("gurobipy"),
+        "gurobipy is unavailable",
+    )
     def test_exact_fill_is_independently_valid(self) -> None:
         result = ContiguousZoneGenerationPlanner(
             make_small_problem(),
@@ -239,6 +312,10 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             places=9,
         )
         self.assertAlmostEqual(sum(certificate["weights"].values()), 1.0, places=12)
+        self.assertLessEqual(
+            certificate["peak_utilization"]["maximum"],
+            certificate["peak_utilization"]["epsilon_cap"] + 1e-9,
+        )
         fix_optimize = diagnostics["zone_fix_optimize"]
         self.assertLessEqual(
             fix_optimize["final_objective"],
@@ -255,6 +332,45 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
         )
         self.assertFalse(
             diagnostics["zone_root_proof_cuts_retained_in_primal_search"]
+        )
+        self.assertNotIn("area_summary_big_plan_inheritance", diagnostics)
+        self.assertFalse(
+            diagnostics["import_capacity_reservation"]["area_reference_used"]
+        )
+        row_quality = diagnostics[
+            "row_recourse_secondary_quality_components"
+        ]
+        self.assertFalse(row_quality["large_plan_guidance_used"])
+        self.assertNotIn("area_guidance", row_quality["weighted"])
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("gurobipy"),
+        "gurobipy is unavailable",
+    )
+    def test_complete_zone_mip_has_valid_exact_recourse(self) -> None:
+        result = ContiguousZoneGenerationPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(
+                total_time_limit=10.0,
+                mip_gap=0.0,
+                solver_threads=1,
+                verbose=False,
+            ),
+        ).solve_complete_zone_mip()
+        diagnostics = result.diagnostics
+
+        self.assertTrue(diagnostics["independent_solution_validation"]["passed"])
+        self.assertEqual(
+            "complete_redefined_zone_model",
+            diagnostics["master_bound_scope"],
+        )
+        self.assertTrue(
+            diagnostics["zone_fill"]["recourse_certificate"]["certified"]
+        )
+        self.assertAlmostEqual(
+            diagnostics["zone_objective_certificate"]["objective"],
+            diagnostics["zone_model_upper_bound"],
+            places=9,
         )
 
 

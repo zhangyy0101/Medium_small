@@ -7,7 +7,7 @@ from pathlib import Path
 import pandas as pd
 
 from adapters.input_adapter_gd import InputAdapterGd, normalize_voyage_id
-from adapters.planning_input import load_planning_inputs
+from adapters.planning_input import classified_export_voyages, load_planning_inputs
 from yard_planning.contiguous_zone_generation import (
     ContiguousZoneConfig,
     ContiguousZoneGenerationPlanner,
@@ -18,27 +18,14 @@ from yard_planning.planner import ColumnGenerationConfig, write_json
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_INPUT = ROOT / "example" / "input_data.json"
-DEFAULT_LARGE_PLAN = ROOT / "example" / "large_plan.csv"
-
-
 def resolve_voyages(
-    large_plan: pd.DataFrame,
+    adapter: InputAdapterGd,
     requested: list[str] | None,
 ) -> list[str]:
     if requested:
         values = requested
     else:
-        voyage_column = next(
-            (
-                name
-                for name in ("voy_id", "voyage_id", "VOY_ID")
-                if name in large_plan.columns
-            ),
-            None,
-        )
-        if voyage_column is None:
-            raise SystemExit("large plan must contain voy_id or voyage_id")
-        values = large_plan[voyage_column].dropna().tolist()
+        values = sorted(classified_export_voyages(adapter))
     voyages = sorted(
         {
             normalized
@@ -47,7 +34,7 @@ def resolve_voyages(
         }
     )
     if not voyages:
-        raise SystemExit("no voyages found in the large plan")
+        raise SystemExit("no declared export voyages found in the shared input")
     return voyages
 
 
@@ -79,7 +66,6 @@ def parse_args() -> argparse.Namespace:
         description="Solve and benchmark the contiguous storage-zone model."
     )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
-    parser.add_argument("--large-plan", type=Path, default=DEFAULT_LARGE_PLAN)
     parser.add_argument("--voyages", nargs="+", default=None)
     parser.add_argument("--planning-time", default=None)
     parser.add_argument("--total-time-limit", type=float, default=60.0)
@@ -97,6 +83,15 @@ def parse_args() -> argparse.Namespace:
         default="objective",
     )
     parser.add_argument("--fill-time-fraction", type=float, default=0.05)
+    parser.add_argument(
+        "--peak-utilization-headroom-fraction",
+        type=float,
+        default=0.50,
+        help=(
+            "Fraction of the distance from the instance utilization lower "
+            "bound to 100%% retained as epsilon headroom."
+        ),
+    )
     parser.add_argument("--root-only", action="store_true")
     parser.add_argument("--complete-zone-mip-only", action="store_true")
     parser.add_argument("--compare-complete-zone-lp", action="store_true")
@@ -116,8 +111,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     adapter = InputAdapterGd.load_from_json(str(args.input.resolve()))
-    large_plan = pd.read_csv(args.large_plan.resolve())
-    voyages = resolve_voyages(large_plan, args.voyages)
+    voyages = resolve_voyages(adapter, args.voyages)
     planning_time = pd.Timestamp(
         args.planning_time if args.planning_time else adapter.planning_time
     )
@@ -127,7 +121,6 @@ def main() -> None:
         adapter,
         planning_time=planning_time.to_pydatetime(),
         voyages=voyages,
-        big_plan=large_plan,
     )
     common = ColumnGenerationConfig(
         total_time_limit=args.total_time_limit,
@@ -145,6 +138,9 @@ def main() -> None:
         fix_optimize_zone_fraction=args.fix_optimize_zone_fraction,
         fix_optimize_policy=args.fix_optimize_policy,
         fill_time_fraction=args.fill_time_fraction,
+        peak_utilization_headroom_fraction=(
+            args.peak_utilization_headroom_fraction
+        ),
     )
     planner = ContiguousZoneGenerationPlanner(
         inputs.problem,
@@ -171,7 +167,13 @@ def main() -> None:
             key: value
             for key, value in result.diagnostics.items()
             if key.startswith("zone_")
-            or key in {"independent_solution_validation", "total_seconds"}
+            or key
+            in {
+                "business_objective",
+                "peak_utilization_policy",
+                "independent_solution_validation",
+                "total_seconds",
+            }
         }
         if args.compare_row_m0:
             direct = DirectMilpPlanner(inputs.problem, common).solve()

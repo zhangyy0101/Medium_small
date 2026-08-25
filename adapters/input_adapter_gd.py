@@ -70,7 +70,6 @@ class InputAdapterGd:
     def __init__(self):
         self.take_over_vessel: Dict[str, List] = {}
         self.bay_slots_detail: Optional[pd.DataFrame] = None
-        self.tops_plan: Optional[pd.DataFrame] = None
         self.area_function_info: Optional[pd.DataFrame] = None
         self.vessel_berth_info: Optional[pd.DataFrame] = None
         self.planning_time: pd.Timestamp = pd.Timestamp.now()
@@ -84,7 +83,6 @@ class InputAdapterGd:
         return {
             "take_over_vessel": self.take_over_vessel,
             "bay_slots_detail": clean_for_json(self.bay_slots_detail),
-            "tops_plan": clean_for_json(self.tops_plan),
             "area_function_info": clean_for_json(self.area_function_info),
             "vessel_berth_info": clean_for_json(self.vessel_berth_info),
             "planning_time": self.planning_time,
@@ -100,7 +98,6 @@ class InputAdapterGd:
         obj = cls()
         obj.take_over_vessel = data.get("take_over_vessel", {})
         obj.bay_slots_detail = restore_dataframe_from_split(data.get("bay_slots_detail"))
-        obj.tops_plan = restore_dataframe_from_split(data.get("tops_plan"))
         obj.area_function_info = restore_dataframe_from_split(data.get("area_function_info"))
         obj.vessel_berth_info = restore_dataframe_from_split(data.get("vessel_berth_info"))
 
