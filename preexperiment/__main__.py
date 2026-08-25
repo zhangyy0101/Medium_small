@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
         default=(0.12, 0.22, 0.35),
     )
     parser.add_argument(
-        "--disable-dynamic-initial-mip-stopping",
+        "--enable-dynamic-initial-mip-stopping",
         action="store_true",
     )
     parser.add_argument("--threads", type=int, default=1)
@@ -71,7 +71,7 @@ def main() -> None:
             args.fix_optimize_round_zone_fractions
         ),
         initial_mip_dynamic_stopping_enabled=(
-            not args.disable_dynamic_initial_mip_stopping
+            args.enable_dynamic_initial_mip_stopping
         ),
         progress=lambda message: print(message, flush=True),
     )

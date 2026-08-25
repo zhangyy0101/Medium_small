@@ -75,7 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--integer-pool-per-group", type=int, default=100)
     parser.add_argument("--zone-mip-time-fraction", type=float, default=0.75)
     parser.add_argument(
-        "--disable-dynamic-initial-mip-stopping",
+        "--enable-dynamic-initial-mip-stopping",
         action="store_true",
     )
     parser.add_argument(
@@ -178,7 +178,7 @@ def main() -> None:
         integer_pool_columns_per_group=args.integer_pool_per_group,
         zone_mip_time_fraction=args.zone_mip_time_fraction,
         initial_mip_dynamic_stopping_enabled=(
-            not args.disable_dynamic_initial_mip_stopping
+            args.enable_dynamic_initial_mip_stopping
         ),
         initial_mip_max_remaining_fraction=(
             args.initial_mip_max_remaining_fraction

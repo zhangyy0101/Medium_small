@@ -36,7 +36,7 @@ def run_suite(
         0.22,
         0.35,
     ),
-    initial_mip_dynamic_stopping_enabled: bool = True,
+    initial_mip_dynamic_stopping_enabled: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     base_path, all_specs = load_suite(suite_path)

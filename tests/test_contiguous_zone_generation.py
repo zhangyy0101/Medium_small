@@ -934,6 +934,9 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
                 solver_threads=1,
                 verbose=False,
             ),
+            ContiguousZoneConfig(
+                initial_mip_dynamic_stopping_enabled=True
+            ),
         ).solve()
         diagnostics = result.diagnostics
         self.assertTrue(diagnostics["independent_solution_validation"]["passed"])

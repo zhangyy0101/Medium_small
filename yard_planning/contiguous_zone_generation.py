@@ -83,7 +83,7 @@ class ContiguousZoneConfig:
     integer_pool_columns_per_group: int = 100
     root_time_fraction: float = 0.50
     zone_mip_time_fraction: float = 0.75
-    initial_mip_dynamic_stopping_enabled: bool = True
+    initial_mip_dynamic_stopping_enabled: bool = False
     initial_mip_max_remaining_fraction: float = 0.50
     initial_mip_min_total_fraction: float = 0.05
     initial_mip_stagnation_total_fraction: float = 0.10
