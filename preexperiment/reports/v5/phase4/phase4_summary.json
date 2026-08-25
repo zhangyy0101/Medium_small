@@ -1,0 +1,36 @@
+{
+  "phase": "v5_phase4_dynamic_initial_mip_stopping",
+  "status": "implemented_but_stage_gate_failed_kept_opt_in",
+  "tests": {
+    "passed": 42,
+    "failed": 0,
+    "skipped": 0
+  },
+  "policy": {
+    "hard_cap_remaining_fraction": 0.5,
+    "minimum_run_total_fraction": 0.05,
+    "stagnation_total_fraction": 0.1,
+    "minimum_relative_improvement": 0.0001,
+    "no_incumbent_stagnation_stop_allowed": false
+  },
+  "relative_improvement_dynamic_vs_fixed": {
+    "pilot_l_301": -0.04790060514512684,
+    "scale_g048_s601": 0.0018846461225452864,
+    "scale_g096_s801": -0.024107693756166747
+  },
+  "stage_gate": {
+    "ub_improved_case_count": 1,
+    "ub_regressed_case_count": 2,
+    "passed": false
+  },
+  "diagnosis": {
+    "dynamic_stopping_releases_fo_time": true,
+    "extra_fo_time_reliably_recovers_initial_incumbent_loss": false,
+    "stagnation_default_too_aggressive_on_24": true,
+    "hard_cap_default_safe_on_96": false,
+    "root_lb_changed": false,
+    "mathematical_model_changed": false
+  },
+  "production_default": "fixed75_dynamic_stopping_disabled",
+  "next_step": "redesign_conflict_signal_before_reconsidering_time_reallocation"
+}
