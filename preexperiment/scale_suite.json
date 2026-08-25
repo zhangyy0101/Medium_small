@@ -1,6 +1,6 @@
 {
   "schema_version": 3,
-  "model_schema_version": "integrated_zone_v3",
+  "model_schema_version": "integrated_zone_v4",
   "suite_id": "scale_v1_heterogeneous_voyages",
   "base_input": "../example/input_data.json",
   "base_input_sha256": "6eeed59a2f4b7660ffe84a378f2dba419cf1d2e89164c1b661773c01a7a09442",

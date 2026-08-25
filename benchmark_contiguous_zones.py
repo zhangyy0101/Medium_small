@@ -92,6 +92,14 @@ def parse_args() -> argparse.Namespace:
             "bound to 100%% retained as epsilon headroom."
         ),
     )
+    parser.add_argument(
+        "--disable-unused-capacity-objective",
+        action="store_true",
+        help=(
+            "Run the declared objective ablation with zero unused-capacity "
+            "weight and proportional renormalization of retained weights."
+        ),
+    )
     parser.add_argument("--root-only", action="store_true")
     parser.add_argument("--complete-zone-mip-only", action="store_true")
     parser.add_argument("--compare-complete-zone-lp", action="store_true")
@@ -140,6 +148,9 @@ def main() -> None:
         fill_time_fraction=args.fill_time_fraction,
         peak_utilization_headroom_fraction=(
             args.peak_utilization_headroom_fraction
+        ),
+        unused_capacity_objective_enabled=(
+            not args.disable_unused_capacity_objective
         ),
     )
     planner = ContiguousZoneGenerationPlanner(

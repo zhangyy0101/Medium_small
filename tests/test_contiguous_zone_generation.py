@@ -92,7 +92,6 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
         self.assertEqual(
             {
                 "voyage_area_dispersion",
-                "group_area_dispersion",
                 "zone_dispersion",
                 "existing_group_proximity",
                 "unused_capacity",
@@ -100,10 +99,41 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             },
             set(planner._zone_objective_weights()),
         )
+        self.assertAlmostEqual(
+            1.0,
+            sum(planner._zone_objective_weights().values()),
+            places=12,
+        )
         policy = preparation["peak_utilization_policy"]
         self.assertAlmostEqual(0.75, policy["load_lower_bound"], places=8)
         self.assertAlmostEqual(0.875, policy["epsilon_cap"], places=8)
         self.assertFalse(policy["terminal_approved_threshold_used"])
+
+    def test_unused_capacity_ablation_renormalizes_retained_weights(self) -> None:
+        baseline = ContiguousZoneGenerationPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(verbose=False),
+        )
+        ablated = ContiguousZoneGenerationPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(verbose=False),
+            ContiguousZoneConfig(
+                unused_capacity_objective_enabled=False
+            ),
+        )
+
+        baseline_weights = baseline._zone_objective_weights()
+        ablated_weights = ablated._zone_objective_weights()
+        self.assertEqual(0.0, ablated_weights["unused_capacity"])
+        self.assertAlmostEqual(1.0, sum(ablated_weights.values()), places=12)
+        retained = [
+            key for key in baseline_weights if key != "unused_capacity"
+        ]
+        ratios = {
+            ablated_weights[key] / baseline_weights[key]
+            for key in retained
+        }
+        self.assertEqual(1, len({round(value, 12) for value in ratios}))
 
     def test_legacy_import_area_reference_is_not_accepted_as_demand(self) -> None:
         problem = make_small_problem()

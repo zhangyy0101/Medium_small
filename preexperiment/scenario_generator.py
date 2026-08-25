@@ -16,7 +16,7 @@ from adapters.planning_input import (
     normalize_voyage,
 )
 
-MODEL_SCHEMA_VERSION = "integrated_zone_v3"
+MODEL_SCHEMA_VERSION = "integrated_zone_v4"
 
 
 @dataclass(frozen=True)

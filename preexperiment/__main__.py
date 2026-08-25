@@ -21,6 +21,14 @@ def parse_args() -> argparse.Namespace:
         default=0.0,
         help="Positive values also run the full paper algorithm for every selected case.",
     )
+    parser.add_argument(
+        "--disable-unused-capacity-objective",
+        action="store_true",
+        help=(
+            "Run the unused-capacity objective ablation and proportionally "
+            "renormalize the retained objective weights."
+        ),
+    )
     parser.add_argument("--threads", type=int, default=1)
     return parser.parse_args()
 
@@ -33,6 +41,9 @@ def main() -> None:
         case_ids=args.cases,
         paper_time_limit=args.paper_time_limit,
         threads=args.threads,
+        disable_unused_capacity_objective=(
+            args.disable_unused_capacity_objective
+        ),
         progress=lambda message: print(message, flush=True),
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))

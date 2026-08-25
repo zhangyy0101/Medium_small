@@ -40,14 +40,15 @@ All optimization, pricing, certification, upper bounds, and lower bounds use one
 
 | Component | Weight | Natural scale |
 |---|---:|---|
-| extra voyage areas | 0.12 | reachable voyage-area activations |
-| extra group areas | 0.20 | reachable group-area activations |
-| extra disconnected zones | 0.28 | natural interval expansion by group |
-| existing-group proximity | 0.10 | reachable anchored quantity and normalized bay distance |
-| unused reserved export-zone capacity | 0.17 | total declared export demand |
-| quantity-weighted berth distance | 0.13 | assigned export quantity and voyage-specific distance range |
+| extra voyage areas | 0.1500 | reachable voyage-area activations |
+| extra disconnected zones | 0.3500 | natural interval expansion by group |
+| existing-group proximity | 0.1250 | reachable anchored quantity and normalized bay distance |
+| unused reserved export-zone capacity | 0.2125 | total declared export demand |
+| quantity-weighted berth distance | 0.1625 | assigned export quantity and voyage-specific distance range |
 
-The unavoidable first area of each positive-demand voyage and the first area and first zone of each positive-demand group are removed from the corresponding dispersion terms. All required berth-area distances must exist; missing data is an input error. Anonymous imports have zero coefficient in every objective component.
+Extra group areas remain a reported diagnostic but have zero objective coefficient because every cross-area group split already requires extra contiguous zones. The unavoidable first area of each positive-demand voyage and the first zone of each positive-demand group are removed from the corresponding dispersion terms. All required berth-area distances must exist; missing data is an input error. Anonymous imports have zero coefficient in every objective component.
+
+The declared unused-capacity ablation sets its weight to zero and proportionally renormalizes the other four weights. Raw objectives from the baseline and ablation are not subtracted because their objective definitions differ; comparisons use physical KPI values under paired inputs, seeds, threads, and time budgets.
 
 Peak use is handled as an epsilon constraint rather than a seventh objective. Let `rho_LB` be the strongest planned-slot-load/residual-capacity lower bound computed for the whole instance, export/import subsets, voyages, groups, and import flow-size classes. The calculation includes integer area-capacity breakpoints, so fractional capacity that cannot hold another slot unit is not counted. With headroom parameter `h`, the cap is `rho_cap = rho_LB + h(1-rho_LB)`; the default is `h=0.50`. Both export footprints and anonymous import footprints count toward each area's load. This is a reproducible experimental proxy, not a terminal-approved safety threshold, and `h` must be covered by sensitivity analysis.
 
@@ -79,4 +80,4 @@ The reported certificate is
 
 ## 7. Experiment-version boundary
 
-Results produced with the former sequential large-plan guidance objective are not comparable with this integrated model's UB, LB, or gap. All stage-gate, ablation, and complete-zone-MIP experiments must be regenerated from schema-v3 materialized scenarios. Correctness checks still require the generated root to match the fully enumerated zone LP on micro instances, followed by multi-seed comparisons under equal solver budgets.
+Results produced with earlier objective definitions are not comparable with this integrated model's UB, LB, or gap. All stage-gate, ablation, and complete-zone-MIP experiments must be regenerated under model schema `integrated_zone_v4`. Correctness checks still require the generated root to match the fully enumerated zone LP on micro instances, followed by multi-seed comparisons under equal solver budgets.

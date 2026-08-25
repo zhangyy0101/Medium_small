@@ -28,6 +28,7 @@ def run_suite(
     case_ids: Sequence[str] | None = None,
     paper_time_limit: float = 0.0,
     threads: int = 1,
+    disable_unused_capacity_objective: bool = False,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     base_path, all_specs = load_suite(suite_path)
@@ -55,6 +56,9 @@ def run_suite(
                 case_dir,
                 paper_time_limit=paper_time_limit,
                 threads=threads,
+                disable_unused_capacity_objective=(
+                    disable_unused_capacity_objective
+                ),
             )
         except Exception as exc:
             summary = {
@@ -79,6 +83,15 @@ def run_suite(
         "paper_algorithm_executed": paper_time_limit > 0,
         "paper_time_limit": paper_time_limit,
         "threads": max(1, int(threads)),
+        "objective_design": {
+            "group_area_dispersion": "diagnostic_only",
+            "unused_capacity_objective_enabled": bool(
+                not disable_unused_capacity_objective
+            ),
+            "retained_weights_renormalized": bool(
+                disable_unused_capacity_objective
+            ),
+        },
         "python_hash_seed": os.environ.get("PYTHONHASHSEED"),
         "cases": case_summaries,
     }
@@ -99,6 +112,7 @@ def validate_case(
     *,
     paper_time_limit: float,
     threads: int,
+    disable_unused_capacity_objective: bool,
 ) -> dict[str, Any]:
     case_dir = Path(case_dir)
     adapter, generation_manifest = materialize_scenario(base, spec)
@@ -168,7 +182,11 @@ def validate_case(
         result = ContiguousZoneGenerationPlanner(
             planning_inputs.problem,
             common,
-            ContiguousZoneConfig(),
+            ContiguousZoneConfig(
+                unused_capacity_objective_enabled=(
+                    not disable_unused_capacity_objective
+                )
+            ),
         ).solve()
         export_path = case_dir / "paper_export_rows.csv"
         import_path = case_dir / "paper_import_reservations.csv"
@@ -209,6 +227,13 @@ def validate_case(
                 "weighted", {}
             ),
             "objective_weights": certificate.get("weights", {}),
+            "objective_design": certificate.get(
+                "objective_design",
+                result.diagnostics.get("business_objective", {}).get(
+                    "objective_design",
+                    {},
+                ),
+            ),
             "peak_utilization_policy": _compact_peak_policy(
                 result.diagnostics.get("peak_utilization_policy", {})
             ),

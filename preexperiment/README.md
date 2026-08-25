@@ -56,7 +56,9 @@ python -m preexperiment.compare \
 
 结果汇总在 `comparison_summary.csv/json` 和 `comparison_report.md`。F&O improvement 为正表示完整算法取得了更小的目标值；全枚举 LP/MIP 仅与论文的连续箱区模型比较，不与目标定义不同的旧模型混为一谈。
 
-已有 `preexperiment_outputs` 中的结果来自旧的大计划引导目标，仅保留作开发记录，不能作为当前集成模型的实验结论。新实验必须使用本目录 schema v3 配方重新生成。
+已有 `preexperiment_outputs` 中采用旧目标定义的结果仅保留作开发记录，不能作为当前集成模型的实验结论。新实验必须使用模型 schema `integrated_zone_v4` 重新生成。
+
+未利用排区容量目标消融使用 `--disable-unused-capacity-objective`。该开关把对应权重置零，并按比例重新归一化其余目标；应与默认目标使用相同场景、seed、线程和时间预算，比较未利用容量、排区数量、跨区、邻近和泊位距离等原始 KPI，而不是直接相减两套不同定义的目标值。
 
 在中大型算例上运行同模型的全枚举完整排区 MIP：
 

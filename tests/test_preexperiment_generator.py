@@ -102,7 +102,7 @@ class PreexperimentGeneratorTests(unittest.TestCase):
         spec = ScenarioSpec("case_2", 11, 1, 4, 20, 0.5)
         base = make_base()
         generated, manifest = materialize_scenario(base, spec)
-        self.assertEqual("integrated_zone_v3", manifest["model_schema_version"])
+        self.assertEqual("integrated_zone_v4", manifest["model_schema_version"])
         self.assertEqual(20, manifest["declared_export_rows"])
         self.assertEqual(4, manifest["export_group_count"])
         self.assertEqual(2, manifest["declared_import_rows"])

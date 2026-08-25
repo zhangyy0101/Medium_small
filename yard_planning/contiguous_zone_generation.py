@@ -82,15 +82,18 @@ class ContiguousZoneConfig:
     fix_optimize_policy: str = "objective"
     fill_time_fraction: float = 0.05
     shortage_penalty: float = 1_000.0
-    # Integrated paper-model weights.  The former large-plan L1 term has been
-    # removed.  Its mass was redistributed, without fitting pilot outcomes,
-    # across the remaining spatial-concentration and zone-efficiency terms.
-    voyage_area_dispersion_weight: float = 0.12
-    group_area_dispersion_weight: float = 0.20
-    zone_dispersion_weight: float = 0.28
-    existing_group_proximity_weight: float = 0.10
-    unused_capacity_weight: float = 0.17
-    berth_distance_weight: float = 0.13
+    # Integrated paper-model weights after removing the redundant group-area
+    # objective.  Its former mass is redistributed proportionally so the
+    # remaining pairwise preferences do not change.
+    voyage_area_dispersion_weight: float = 0.1500
+    zone_dispersion_weight: float = 0.3500
+    existing_group_proximity_weight: float = 0.1250
+    unused_capacity_weight: float = 0.2125
+    berth_distance_weight: float = 0.1625
+    # Reproducible objective ablation.  When disabled, the unused-capacity
+    # weight is set to zero and all other weights are renormalized
+    # proportionally at model construction time.
+    unused_capacity_objective_enabled: bool = True
     # No terminal-approved utilization threshold is available.  The epsilon
     # cap is therefore placed halfway between the instance load lower bound and
     # full use of residual capacity by default.  This is a declared experiment
@@ -142,7 +145,6 @@ class ContiguousZoneConfig:
             )
         objective_weights = {
             "voyage_area_dispersion": self.voyage_area_dispersion_weight,
-            "group_area_dispersion": self.group_area_dispersion_weight,
             "zone_dispersion": self.zone_dispersion_weight,
             "existing_group_proximity": self.existing_group_proximity_weight,
             "unused_capacity": self.unused_capacity_weight,
@@ -227,12 +229,9 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         self._peak_utilization_policy: dict[str, object] = {}
 
     def _zone_objective_weights(self) -> dict[str, float]:
-        return {
+        weights = {
             "voyage_area_dispersion": float(
                 self.zone_config.voyage_area_dispersion_weight
-            ),
-            "group_area_dispersion": float(
-                self.zone_config.group_area_dispersion_weight
             ),
             "zone_dispersion": float(
                 self.zone_config.zone_dispersion_weight
@@ -247,6 +246,18 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 self.zone_config.berth_distance_weight
             ),
         }
+        if not self.zone_config.unused_capacity_objective_enabled:
+            weights["unused_capacity"] = 0.0
+            retained_total = sum(weights.values())
+            if retained_total <= 0.0:
+                raise ValueError(
+                    "unused-capacity ablation leaves no positive objective weight"
+                )
+            weights = {
+                key: value / retained_total
+                for key, value in weights.items()
+            }
+        return weights
 
     def _zone_objective_scale(self, key: str) -> float:
         value = self._zone_objective_scales.get(key)
@@ -258,19 +269,13 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
 
     def _voyage_area_activation_penalty(self) -> float:
         return (
-            float(self.zone_config.voyage_area_dispersion_weight)
+            self._zone_objective_weights()["voyage_area_dispersion"]
             / self._zone_objective_scale("voyage_area_dispersion")
-        )
-
-    def _group_area_activation_penalty(self) -> float:
-        return (
-            float(self.zone_config.group_area_dispersion_weight)
-            / self._zone_objective_scale("group_area_dispersion")
         )
 
     def _zone_activation_penalty(self) -> float:
         return (
-            float(self.zone_config.zone_dispersion_weight)
+            self._zone_objective_weights()["zone_dispersion"]
             / self._zone_objective_scale("zone_dispersion")
         )
 
@@ -279,7 +284,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
     ) -> float:
         group = self.groups_by_id[group_id]
         return (
-            float(self.zone_config.existing_group_proximity_weight)
+            self._zone_objective_weights()["existing_group_proximity"]
             * self._normalized_existing_proximity(group, bay_key)
             / self._zone_objective_scale("existing_group_proximity")
         )
@@ -289,7 +294,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
     ) -> float:
         group = self.groups_by_id[group_id]
         return (
-            float(self.zone_config.berth_distance_weight)
+            self._zone_objective_weights()["berth_distance"]
             * self._normalized_berth_distance(group.voyage_id, area_no)
             / self._zone_objective_scale("berth_distance")
         )
@@ -311,6 +316,12 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "upstream_large_plan_required": False,
             "weights": self._zone_objective_weights(),
             "scales": dict(self._zone_objective_scales),
+            "objective_design": {
+                "group_area_dispersion": "diagnostic_only",
+                "unused_capacity_objective_enabled": bool(
+                    self.zone_config.unused_capacity_objective_enabled
+                ),
+            },
             "peak_utilization_epsilon_constraint": dict(
                 self._peak_utilization_policy
             ),
@@ -438,7 +449,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
 
     def _unused_capacity_unit_cost(self) -> float:
         return (
-            float(self.zone_config.unused_capacity_weight)
+            self._zone_objective_weights()["unused_capacity"]
             / self._zone_objective_scale("unused_capacity")
         )
 
@@ -571,25 +582,12 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             )
             for group in self.groups
         )
-        areas_by_group: defaultdict[str, set[str]] = defaultdict(set)
         areas_by_voyage: defaultdict[str, set[str]] = defaultdict(set)
         demand_by_voyage: Counter[str] = Counter()
         for group in self.groups:
             demand_by_voyage[group.voyage_id] += int(group.demand)
         for column in self._columns:
-            areas_by_group[column.group_id].add(column.area_no)
             areas_by_voyage[column.voyage_id].add(column.area_no)
-        natural_group_area_expansion = sum(
-            max(
-                0,
-                min(
-                    int(group.demand),
-                    len(areas_by_group[group.group_id]),
-                )
-                - 1,
-            )
-            for group in self.groups
-        )
         natural_voyage_area_expansion = sum(
             max(
                 0,
@@ -605,9 +603,6 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         self._zone_objective_scales = {
             "voyage_area_dispersion": float(
                 max(1, natural_voyage_area_expansion)
-            ),
-            "group_area_dispersion": float(
-                max(1, natural_group_area_expansion)
             ),
             "zone_dispersion": float(max(1, natural_zone_expansion)),
             "existing_group_proximity": self._objective_scale(
@@ -850,17 +845,13 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         model.setMinimize()
         sets = self._master_index_sets()
         zero = model.addVar(lb=0.0, ub=0.0, name="zone_zero")
-        # Every positive-demand voyage uses at least one area, and every group
-        # uses at least one area and one zone.  Remove those unavoidable
-        # activations so the objective measures only extra dispersion.
+        # Every positive-demand voyage uses at least one area and every group
+        # uses at least one zone.  Remove those unavoidable activations so the
+        # objective measures only extra dispersion.
         voyage_count = len({group.voyage_id for group in self.groups})
         dispersion_baseline = (
             voyage_count * self._voyage_area_activation_penalty()
-            + len(self.groups)
-            * (
-                self._group_area_activation_penalty()
-                + self._zone_activation_penalty()
-            )
+            + len(self.groups) * self._zone_activation_penalty()
         )
         baseline = model.addVar(
             lb=1.0,
@@ -892,7 +883,6 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 lb=0.0,
                 ub=1.0,
                 vtype="C",
-                obj=self._group_area_activation_penalty(),
                 name=f"zone_group_area_{self._key_name(key)}",
             )
             for key in sets["area_pairs"]
@@ -2528,7 +2518,6 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                     "row_no_mix",
                     "container_group_attributes",
                     "voyage_area_dispersion_objective",
-                    "group_area_dispersion_objective",
                     "contiguous_zone_objective",
                     "existing_group_proximity_objective",
                     "unused_export_zone_capacity_objective",
@@ -2776,9 +2765,6 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 float(self._zones[index].objective_cost)
                 for index in zones_by_group[group_id]
             ) - self._zone_activation_penalty()
-            group_area_cost = self._group_area_activation_penalty() * max(
-                0, len(used_areas[group_id]) - 1
-            )
             voyage_area_cost = (
                 self._voyage_area_activation_penalty()
                 * max(
@@ -2792,7 +2778,6 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 0.0,
                 zone_cost
                 + flow_cost[group_id]
-                + group_area_cost
                 + voyage_area_cost,
             )
             contribution_by_group[group_id] = float(contribution)
@@ -3438,8 +3423,6 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         normalized = {
             "voyage_area_dispersion": raw["extra_voyage_areas"]
             / self._zone_objective_scale("voyage_area_dispersion"),
-            "group_area_dispersion": raw["extra_group_areas"]
-            / self._zone_objective_scale("group_area_dispersion"),
             "zone_dispersion": raw["extra_contiguous_zones"]
             / self._zone_objective_scale("zone_dispersion"),
             "existing_group_proximity": raw[
@@ -3476,6 +3459,12 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "weighted": weighted,
             "components": weighted,
             "weights": weights,
+            "objective_design": {
+                "group_area_dispersion": "diagnostic_only",
+                "unused_capacity_objective_enabled": bool(
+                    self.zone_config.unused_capacity_objective_enabled
+                ),
+            },
             "scales": dict(self._zone_objective_scales),
             "selected_zone_count": len(selected_zone_indices),
             "reserved_export_capacity": reserved_capacity,
@@ -3839,7 +3828,6 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                     "row_no_mix",
                     "container_group_attributes",
                     "voyage_area_dispersion_objective",
-                    "group_area_dispersion_objective",
                     "contiguous_zone_objective",
                     "existing_group_proximity_objective",
                     "unused_export_zone_capacity_objective",
