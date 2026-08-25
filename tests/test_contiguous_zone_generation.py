@@ -7,6 +7,8 @@ from time import perf_counter
 from unittest.mock import patch
 
 from yard_planning.contiguous_zone_generation import (
+    COMPLETE_MIP_BASELINE_POLICY,
+    V5_MULTI_START_POLICY,
     ContiguousZoneConfig,
     ContiguousZoneGenerationPlanner,
 )
@@ -112,6 +114,11 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ContiguousZoneConfig(
                 peak_utilization_headroom_fraction=1.1
+            ).validate()
+        with self.assertRaises(ValueError):
+            ContiguousZoneConfig(
+                mip_start_total_time_fraction=0.05,
+                mip_start_repair_total_fraction=0.08,
             ).validate()
 
     def test_integrated_objective_has_no_large_plan_term(self) -> None:
@@ -259,36 +266,60 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
         candidates = [
             {
                 "support": support,
+                "covered": {"G1": 2},
+                "support_key": tuple(sorted(support)),
                 "ordering_policy": f"test_{index}",
                 "import_protection": 0.0,
                 "complete_export_cover": True,
+                "generation_status": "complete",
+                "covered_boxes": 2,
+                "selected_zone_count": 1,
             }
             for index, support in enumerate(one_bay_supports[:2])
         ]
-        generation = {
-            "generated_candidate_count": 2,
-            "deduplicated_candidate_count": 2,
-            "complete_candidate_count": 2,
-            "candidate_summaries": [],
-            "generated_candidate_summaries": [],
-        }
+        generated = [
+            (
+                candidate,
+                {
+                    "ordering_policy": candidate["ordering_policy"],
+                    "import_protection": 0.0,
+                    "covered_boxes": 2,
+                    "complete_export_cover": True,
+                    "selected_zone_count": 1,
+                    "generation_status": "complete",
+                },
+            )
+            for candidate in candidates
+        ]
         model, variables = planner._build_zone_master()
         try:
             planner._remove_proof_only_area_rows(model, variables)
-            with patch.object(
-                planner,
-                "_generate_greedy_support_candidates",
-                return_value=(candidates, generation),
+            with (
+                patch.object(
+                    planner,
+                    "_greedy_candidate_strategies",
+                    return_value=[
+                        ("family_a", ["G1"], 1.0),
+                        ("family_b", ["G1"], 1.0),
+                    ],
+                ),
+                patch.object(
+                    planner,
+                    "_generate_greedy_support_candidate",
+                    side_effect=generated,
+                ) as generate_spy,
             ):
                 _zones, _flow, _imports, stats = planner._integerize_zone_master(
                     model,
                     variables,
                     perf_counter() + 5.0,
+                    start_policy=V5_MULTI_START_POLICY,
                 )
         finally:
             planner._free_gurobi_model(model)
 
         start = stats["mip_start"]
+        self.assertEqual(2, generate_spy.call_count)
         self.assertGreaterEqual(start["feasible_repaired_count"], 2)
         self.assertGreaterEqual(start["provided_mip_start_count"], 2)
         self.assertEqual(
@@ -519,9 +550,16 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             diagnostics["zone_root_proof_cuts_retained_in_primal_search"]
         )
         self.assertEqual(
-            "integrated_zone_v5_start_phase1",
+            "integrated_zone_v5_start_phase1_1",
             diagnostics["algorithm_version"],
         )
+        mip_start = diagnostics["mip_start_diagnostics"]
+        self.assertEqual(
+            V5_MULTI_START_POLICY,
+            mip_start["integer_search_policy"],
+        )
+        self.assertTrue(mip_start["v5_multi_start_enabled"])
+        self.assertTrue(mip_start["candidate_generation_executed"])
         self.assertFalse(diagnostics["proof_primal_pool_separated"])
         self.assertGreaterEqual(diagnostics["proof_pool_zone_count"], 1)
         self.assertGreaterEqual(
@@ -558,7 +596,7 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
         "gurobipy is unavailable",
     )
     def test_complete_zone_mip_has_valid_exact_recourse(self) -> None:
-        result = ContiguousZoneGenerationPlanner(
+        planner = ContiguousZoneGenerationPlanner(
             make_small_problem(),
             ColumnGenerationConfig(
                 total_time_limit=10.0,
@@ -566,9 +604,16 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
                 solver_threads=1,
                 verbose=False,
             ),
-        ).solve_complete_zone_mip()
+        )
+        with patch.object(
+            planner,
+            "_generate_greedy_support_candidate",
+            wraps=planner._generate_greedy_support_candidate,
+        ) as v5_generation_spy:
+            result = planner.solve_complete_zone_mip()
         diagnostics = result.diagnostics
 
+        self.assertEqual(0, v5_generation_spy.call_count)
         self.assertTrue(diagnostics["independent_solution_validation"]["passed"])
         self.assertEqual(
             "complete_redefined_zone_model",
@@ -582,6 +627,177 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             diagnostics["zone_model_upper_bound"],
             places=9,
         )
+        zone_mip = diagnostics["zone_mip"]
+        self.assertEqual(
+            COMPLETE_MIP_BASELINE_POLICY,
+            zone_mip["integer_search_policy"],
+        )
+        self.assertFalse(zone_mip["v5_multi_start_enabled"])
+        self.assertFalse(zone_mip["candidate_generation_executed"])
+        self.assertFalse(zone_mip["repair_executed"])
+        self.assertEqual(
+            "v4_single_partial_gurobi_repair_start",
+            zone_mip["baseline_start_type"],
+        )
+        self.assertIn("mip_progress", zone_mip)
+
+    def test_candidate_budget_interruption_is_not_infeasibility(self) -> None:
+        planner = ContiguousZoneGenerationPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(verbose=False),
+        )
+        planner._prepare_zones()
+
+        class FakeClock:
+            def __init__(self) -> None:
+                self.value = 0.0
+
+            def __call__(self) -> float:
+                self.value += 1.0
+                return self.value
+
+        with patch(
+            "yard_planning.contiguous_zone_generation.perf_counter",
+            side_effect=FakeClock(),
+        ):
+            candidates, diagnostics = planner._generate_greedy_support_candidates(
+                {},
+                deadline=3.5,
+            )
+
+        self.assertEqual([], candidates)
+        self.assertEqual(1, diagnostics["candidate_generation_interrupted_count"])
+        self.assertEqual(1, diagnostics["budget_interrupted_candidate_count"])
+        self.assertEqual(0, diagnostics["infeasible_candidate_count"])
+
+    def test_candidate_and_repair_share_one_hard_deadline(self) -> None:
+        planner = ContiguousZoneGenerationPlanner(
+            make_two_bay_single_group_problem(),
+            ColumnGenerationConfig(verbose=False),
+        )
+        planner._prepare_zones()
+        support = [next(planner._iter_zone_signatures("G1"))]
+
+        class MutableClock:
+            def __init__(self) -> None:
+                self.now = 0.0
+
+            def __call__(self) -> float:
+                return self.now
+
+        clock = MutableClock()
+        calls = {"candidate": 0, "repair": 0}
+
+        def generate_candidate(*_args, deadline: float, **_kwargs):
+            calls["candidate"] += 1
+            if calls["candidate"] == 1:
+                clock.now = 3.0
+                candidate = {
+                    "support": support,
+                    "covered": {"G1": 2},
+                    "support_key": tuple(sorted(support)),
+                    "ordering_policy": "family_a",
+                    "import_protection": 1.0,
+                    "covered_boxes": 2,
+                    "complete_export_cover": True,
+                    "generation_status": "complete",
+                    "selected_zone_count": 1,
+                }
+                return candidate, planner._greedy_candidate_summary(candidate)
+            clock.now = deadline
+            return None, {
+                "ordering_policy": "family_b",
+                "import_protection": 1.0,
+                "covered_boxes": 0,
+                "complete_export_cover": False,
+                "selected_zone_count": 0,
+                "generation_status": "budget_exhausted",
+            }
+
+        def repair_support(
+            _selected,
+            deadline: float,
+            start_source_variables=None,
+        ):
+            del start_source_variables
+            calls["repair"] += 1
+            clock.now = deadline
+            return {
+                "status": "timelimit",
+                "feasible": False,
+                "seconds": 0.5,
+            }
+
+        variables = {"active_zone_indices": set()}
+        with (
+            patch(
+                "yard_planning.contiguous_zone_generation.perf_counter",
+                side_effect=clock,
+            ),
+            patch.object(
+                planner,
+                "_greedy_candidate_strategies",
+                return_value=[
+                    ("family_a", ["G1"], 1.0),
+                    ("family_b", ["G1"], 1.0),
+                ],
+            ),
+            patch.object(
+                planner,
+                "_generate_greedy_support_candidate",
+                side_effect=generate_candidate,
+            ),
+            patch.object(
+                planner,
+                "_repair_zone_support",
+                side_effect=repair_support,
+            ),
+        ):
+            diagnostics = planner._greedy_zone_mip_start(
+                object(),
+                variables,
+                start_deadline=6.0,
+                start_budget_seconds=6.0,
+                repair_time_limit=4.0,
+            )
+
+        self.assertEqual(2, calls["candidate"])
+        self.assertEqual(1, calls["repair"])
+        self.assertLessEqual(
+            diagnostics["start_preparation_actual_seconds"],
+            diagnostics["start_preparation_budget_seconds"],
+        )
+        self.assertLessEqual(
+            diagnostics["candidate_generation_seconds"]
+            + diagnostics["repair_seconds"],
+            diagnostics["start_preparation_budget_seconds"],
+        )
+        self.assertEqual("budget_exhausted", diagnostics["start_termination_reason"])
+        self.assertEqual(1, diagnostics["candidate_generation_interrupted_count"])
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("gurobipy"),
+        "gurobipy is unavailable",
+    )
+    def test_zero_start_budget_falls_back_to_main_mip(self) -> None:
+        result = ContiguousZoneGenerationPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(
+                total_time_limit=10.0,
+                mip_gap=0.0,
+                solver_threads=1,
+                verbose=False,
+            ),
+            ContiguousZoneConfig(
+                mip_start_total_time_fraction=1e-6,
+                mip_start_repair_total_fraction=5e-7,
+            ),
+        ).solve()
+
+        start = result.diagnostics["mip_start_diagnostics"]
+        self.assertEqual(0, start["submitted_start_count"])
+        self.assertEqual("budget_exhausted", start["start_termination_reason"])
+        self.assertTrue(result.diagnostics["independent_solution_validation"]["passed"])
 
 
 if __name__ == "__main__":

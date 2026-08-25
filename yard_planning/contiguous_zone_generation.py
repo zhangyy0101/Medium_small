@@ -27,7 +27,9 @@ from .planner import ColumnGenerationConfig, ColumnGenerationResult
 
 Resource = tuple[str, str]
 StripKey = tuple[str, str, str]
-ALGORITHM_VERSION = "integrated_zone_v5_start_phase1"
+ALGORITHM_VERSION = "integrated_zone_v5_start_phase1_1"
+V5_MULTI_START_POLICY = "v5_multi_start"
+COMPLETE_MIP_BASELINE_POLICY = "complete_mip_baseline"
 
 
 class _RangeMinimumTree:
@@ -84,6 +86,7 @@ class ContiguousZoneConfig:
     fill_time_fraction: float = 0.05
     max_repaired_start_candidates: int = 8
     mip_start_repair_total_fraction: float = 0.08
+    mip_start_total_time_fraction: float = 0.10
     max_mip_starts: int = 6
     shortage_penalty: float = 1_000.0
     # Integrated paper-model weights after removing the redundant group-area
@@ -146,6 +149,18 @@ class ContiguousZoneConfig:
         if not 0.0 < float(self.mip_start_repair_total_fraction) < 1.0:
             raise ValueError(
                 "mip_start_repair_total_fraction must lie strictly between 0 and 1"
+            )
+        if not 0.0 < float(self.mip_start_total_time_fraction) < 1.0:
+            raise ValueError(
+                "mip_start_total_time_fraction must lie strictly between 0 and 1"
+            )
+        if (
+            float(self.mip_start_repair_total_fraction)
+            > float(self.mip_start_total_time_fraction)
+        ):
+            raise ValueError(
+                "mip_start_repair_total_fraction cannot exceed the total "
+                "mip-start preparation fraction"
             )
         if int(self.max_mip_starts) <= 0:
             raise ValueError("max_mip_starts must be positive")
@@ -1711,8 +1726,71 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
     def _generate_greedy_support_candidates(
         self,
         variables: dict,
+        *,
+        deadline: float | None = None,
     ) -> tuple[list[dict[str, object]], dict[str, object]]:
-        """Enumerate, deduplicate, and cheaply rank deterministic supports."""
+        """Enumerate Phase-1 strategies, with optional deadline interruption."""
+
+        context = self._greedy_candidate_context(variables)
+        generated: list[dict[str, object]] = []
+        generated_summaries: list[dict[str, object]] = []
+        interrupted_count = 0
+        for policy, ordering, protection in self._greedy_candidate_strategies(
+            context["group_ids"]
+        ):
+            candidate, summary = self._generate_greedy_support_candidate(
+                context,
+                ordering_policy=policy,
+                group_order=ordering,
+                import_protection=protection,
+                deadline=deadline,
+            )
+            generated_summaries.append(summary)
+            if candidate is None:
+                interrupted_count += 1
+                break
+            generated.append(candidate)
+
+        deduplicated: dict[tuple, dict[str, object]] = {}
+        duplicate_count = 0
+        for candidate in generated:
+            key = candidate["support_key"]
+            prior = deduplicated.get(key)
+            if prior is None:
+                deduplicated[key] = candidate
+            else:
+                duplicate_count += 1
+                if candidate["cheap_score"] < prior["cheap_score"]:
+                    deduplicated[key] = candidate
+        candidates = sorted(
+            deduplicated.values(),
+            key=lambda candidate: candidate["cheap_score"],
+        )
+        diagnostics = {
+            "generated_candidate_count": len(generated),
+            "deduplicated_candidate_count": len(candidates),
+            "complete_candidate_count": sum(
+                bool(candidate["complete_export_cover"])
+                for candidate in candidates
+            ),
+            "infeasible_candidate_count": sum(
+                candidate["generation_status"] == "infeasible"
+                for candidate in generated
+            ),
+            "budget_interrupted_candidate_count": interrupted_count,
+            "candidate_generation_completed_count": len(generated),
+            "candidate_generation_interrupted_count": interrupted_count,
+            "candidate_duplicate_count": duplicate_count,
+            "candidate_summaries": [
+                self._greedy_candidate_summary(candidate)
+                for candidate in candidates
+            ],
+            "generated_candidate_summaries": generated_summaries,
+        }
+        return candidates, diagnostics
+
+    def _greedy_candidate_context(self, variables: dict) -> dict[str, object]:
+        """Prepare immutable data shared by deterministic greedy strategies."""
 
         import_values = variables.get("last_root_import_values", {})
         import_by_bay: Counter[str] = Counter()
@@ -1731,22 +1809,25 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
 
         group_ids = [group.group_id for group in self.groups]
         total_demand = sum(int(self.groups_by_id[key].demand) for key in group_ids)
-        unregistered_zone_cache: dict[tuple[int, ...], ContiguousZone] = {}
+        return {
+            "variables": variables,
+            "root_zone_values": variables.get("last_root_zone_values", {}),
+            "import_by_bay": import_by_bay,
+            "import_by_bay_size": import_by_bay_size,
+            "import_slot_load_by_area": import_slot_load_by_area,
+            "group_ids": group_ids,
+            "total_demand": total_demand,
+            "unregistered_zone_cache": {},
+            "zone_slot_load_cache": {},
+        }
 
-        def zone_for(
-            strip_key: StripKey,
-            signature: tuple[int, ...],
-        ) -> ContiguousZone:
-            zone_index = self._zone_id_by_signature.get(signature)
-            if zone_index is not None:
-                return self._zones[zone_index]
-            zone = unregistered_zone_cache.get(signature)
-            if zone is None:
-                zone = self._make_zone(*strip_key, signature)
-                unregistered_zone_cache[signature] = zone
-            return zone
-
-        orderings = [
+    def _greedy_candidate_orderings(
+        self,
+        group_ids: list[str],
+        *,
+        include_voyage_clustered: bool = True,
+    ) -> list[tuple[str, list[str]]]:
+        orderings: list[tuple[str, list[str]]] = [
             (
                 "candidate_scarcity",
                 sorted(
@@ -1765,7 +1846,9 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 ),
             ),
             ("group_id", sorted(group_ids)),
-            (
+        ]
+        if include_voyage_clustered:
+            orderings.append((
                 "voyage_clustered",
                 sorted(
                     group_ids,
@@ -1776,203 +1859,330 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                         key,
                     ),
                 ),
-            ),
+            ))
+        return orderings
+
+    def _greedy_candidate_strategies(
+        self,
+        group_ids: list[str],
+    ) -> list[tuple[str, list[str], float]]:
+        """Round-robin the unchanged Phase-1 strategies across orderings."""
+
+        return [
+            (policy, ordering, float(protection))
+            for protection in (1.0, 0.75, 0.50, 0.25, 0.0)
+            for policy, ordering in self._greedy_candidate_orderings(group_ids)
         ]
 
-        def attempt(
-            group_order: list[str],
-            import_protection: float,
-        ) -> tuple[list[tuple[StripKey, tuple[int, ...]]], dict[str, int]]:
-            chosen: list[tuple[StripKey, tuple[int, ...]]] = []
-            chosen_signatures: set[tuple[int, ...]] = set()
-            covered: Counter[str] = Counter()
-            resources: set[Resource] = set()
-            bay_load: Counter[str] = Counter(
-                {
-                    key: import_protection * value
-                    for key, value in import_by_bay.items()
-                }
-            )
-            bay_size_load: Counter[tuple[str, str]] = Counter(
-                {
-                    key: import_protection * value
-                    for key, value in import_by_bay_size.items()
-                }
-            )
-            stack_load: Counter[tuple[str, str]] = Counter()
-            attr_value: dict[tuple[str, str, str], str] = {}
-            area_slot_load: Counter[str] = Counter(
-                {
-                    key: import_protection * value
-                    for key, value in import_slot_load_by_area.items()
-                }
-            )
+    def _greedy_zone_for(
+        self,
+        context: dict[str, object],
+        strip_key: StripKey,
+        signature: tuple[int, ...],
+    ) -> ContiguousZone:
+        zone_index = self._zone_id_by_signature.get(signature)
+        if zone_index is not None:
+            return self._zones[zone_index]
+        cache = context["unregistered_zone_cache"]
+        zone = cache.get(signature)
+        if zone is None:
+            zone = self._make_zone(*strip_key, signature)
+            cache[signature] = zone
+        return zone
 
-            def zone_slot_load(zone: ContiguousZone) -> Counter[str]:
-                load: Counter[str] = Counter()
-                group = self.groups_by_id[zone.group_id]
-                for bay_key, value in zone.anchor_bay_loads:
-                    load[self.bays[bay_key].area_no] += int(value) * len(
-                        self._placement_footprint_keys(bay_key, group.size)
-                    )
-                return load
+    def _greedy_zone_slot_load(
+        self,
+        context: dict[str, object],
+        zone: ContiguousZone,
+    ) -> Counter[str]:
+        cache = context["zone_slot_load_cache"]
+        cached = cache.get(zone.candidate_indices)
+        if cached is not None:
+            return cached
+        load: Counter[str] = Counter()
+        group = self.groups_by_id[zone.group_id]
+        for bay_key, value in zone.anchor_bay_loads:
+            load[self.bays[bay_key].area_no] += int(value) * len(
+                self._placement_footprint_keys(bay_key, group.size)
+            )
+        cache[zone.candidate_indices] = load
+        return load
 
-            def feasible(zone: ContiguousZone) -> bool:
-                if any(resource in resources for resource in zone.resources):
-                    return False
-                if any(
-                    bay_load[key] + int(value)
-                    > int(self.bays[key].physical_capacity) + 1e-7
-                    for key, value in zone.bay_loads
-                ):
-                    return False
-                if any(
-                    bay_size_load[key] + int(value)
-                    > int(self.bays[key[0]].cap_by_size.get(key[1], 0)) + 1e-7
-                    for key, value in zone.bay_size_loads
-                ):
-                    return False
-                if any(
-                    stack_load[key] + int(value)
-                    > int(self._stack_count_for_bay_size(*key))
-                    for key, value in zone.stack_uses
-                ):
-                    return False
+    def _attempt_greedy_support(
+        self,
+        context: dict[str, object],
+        group_order: list[str],
+        import_protection: float,
+        *,
+        deadline: float | None,
+        seed_root_zones: bool = False,
+        enforce_peak_cap: bool = True,
+    ) -> tuple[
+        list[tuple[StripKey, tuple[int, ...]]],
+        dict[str, int],
+        str,
+    ]:
+        """Build one support and distinguish infeasibility from interruption."""
+
+        def budget_exhausted() -> bool:
+            return deadline is not None and perf_counter() >= deadline
+
+        chosen: list[tuple[StripKey, tuple[int, ...]]] = []
+        chosen_signatures: set[tuple[int, ...]] = set()
+        covered: Counter[str] = Counter()
+        resources: set[Resource] = set()
+        bay_load: Counter[str] = Counter(
+            {
+                key: import_protection * value
+                for key, value in context["import_by_bay"].items()
+            }
+        )
+        bay_size_load: Counter[tuple[str, str]] = Counter(
+            {
+                key: import_protection * value
+                for key, value in context["import_by_bay_size"].items()
+            }
+        )
+        stack_load: Counter[tuple[str, str]] = Counter()
+        attr_value: dict[tuple[str, str, str], str] = {}
+        area_slot_load: Counter[str] = Counter(
+            {
+                key: import_protection * value
+                for key, value in context["import_slot_load_by_area"].items()
+            }
+        )
+
+        def feasible(zone: ContiguousZone) -> bool:
+            if any(resource in resources for resource in zone.resources):
+                return False
+            if any(
+                bay_load[key] + int(value)
+                > int(self.bays[key].physical_capacity) + 1e-7
+                for key, value in zone.bay_loads
+            ):
+                return False
+            if any(
+                bay_size_load[key] + int(value)
+                > int(self.bays[key[0]].cap_by_size.get(key[1], 0)) + 1e-7
+                for key, value in zone.bay_size_loads
+            ):
+                return False
+            if any(
+                stack_load[key] + int(value)
+                > int(self._stack_count_for_bay_size(*key))
+                for key, value in zone.stack_uses
+            ):
+                return False
+            if enforce_peak_cap:
                 peak_cap = float(self._peak_utilization_policy["epsilon_cap"])
                 area_capacity = self._peak_utilization_policy["area_capacity"]
                 if any(
                     area_slot_load[area_no] + int(value)
                     > peak_cap * int(area_capacity.get(area_no, 0)) + 1e-7
-                    for area_no, value in zone_slot_load(zone).items()
+                    for area_no, value in self._greedy_zone_slot_load(
+                        context, zone
+                    ).items()
                 ):
                     return False
-                return all(
-                    attr_value.get(key[:3], key[3]) == key[3]
-                    for key, _value in zone.bay_attr_uses
+            return all(
+                attr_value.get(key[:3], key[3]) == key[3]
+                for key, _value in zone.bay_attr_uses
+            )
+
+        def add(strip_key: StripKey, zone: ContiguousZone) -> None:
+            signature = zone.candidate_indices
+            chosen.append((strip_key, signature))
+            chosen_signatures.add(signature)
+            covered[zone.group_id] += int(zone.capacity)
+            resources.update(zone.resources)
+            for key, value in zone.bay_loads:
+                bay_load[key] += int(value)
+            for key, value in zone.bay_size_loads:
+                bay_size_load[key] += int(value)
+            for key, value in zone.stack_uses:
+                stack_load[key] += int(value)
+            for key, _value in zone.bay_attr_uses:
+                attr_value[key[:3]] = key[3]
+            if enforce_peak_cap:
+                area_slot_load.update(
+                    self._greedy_zone_slot_load(context, zone)
                 )
 
-            def add(strip_key: StripKey, zone: ContiguousZone) -> None:
-                signature = zone.candidate_indices
-                chosen.append((strip_key, signature))
-                chosen_signatures.add(signature)
-                covered[zone.group_id] += int(zone.capacity)
-                resources.update(zone.resources)
-                for key, value in zone.bay_loads:
-                    bay_load[key] += int(value)
-                for key, value in zone.bay_size_loads:
-                    bay_size_load[key] += int(value)
-                for key, value in zone.stack_uses:
-                    stack_load[key] += int(value)
-                for key, _value in zone.bay_attr_uses:
-                    attr_value[key[:3]] = key[3]
-                area_slot_load.update(zone_slot_load(zone))
+        if seed_root_zones:
+            root_values = context["root_zone_values"]
+            for zone_index in sorted(
+                root_values,
+                key=lambda index: -float(root_values.get(index, 0.0)),
+            ):
+                if budget_exhausted():
+                    return chosen, dict(covered), "budget_exhausted"
+                if root_values.get(zone_index, 0.0) <= 1e-8:
+                    break
+                zone = self._zones[zone_index]
+                demand = int(self.groups_by_id[zone.group_id].demand)
+                if covered[zone.group_id] < demand and feasible(zone):
+                    add((zone.group_id, zone.area_no, zone.row_no), zone)
 
-            for group_id in group_order:
-                demand = int(self.groups_by_id[group_id].demand)
-                while covered[group_id] < demand:
-                    remaining = demand - covered[group_id]
-                    best = None
-                    best_key = None
-                    for strip_key, signature in self._iter_zone_signatures(group_id):
-                        if signature in chosen_signatures:
-                            continue
-                        zone = zone_for(strip_key, signature)
-                        if not feasible(zone):
-                            continue
-                        key = (
-                            0 if zone.capacity >= remaining else 1,
-                            max(0, zone.capacity - remaining),
-                            zone.objective_cost / max(1, zone.capacity),
-                            -zone.capacity,
-                            strip_key,
-                            signature,
-                        )
-                        if best_key is None or key < best_key:
-                            best_key = key
-                            best = (strip_key, zone)
-                    if best is None:
-                        return chosen, dict(covered)
-                    add(*best)
-            return chosen, dict(covered)
+        for group_id in group_order:
+            if budget_exhausted():
+                return chosen, dict(covered), "budget_exhausted"
+            demand = int(self.groups_by_id[group_id].demand)
+            while covered[group_id] < demand:
+                if budget_exhausted():
+                    return chosen, dict(covered), "budget_exhausted"
+                remaining = demand - covered[group_id]
+                best = None
+                best_key = None
+                for strip_key, signature in self._iter_zone_signatures(group_id):
+                    if budget_exhausted():
+                        return chosen, dict(covered), "budget_exhausted"
+                    if signature in chosen_signatures:
+                        continue
+                    zone = self._greedy_zone_for(context, strip_key, signature)
+                    if not feasible(zone):
+                        continue
+                    key = (
+                        0 if zone.capacity >= remaining else 1,
+                        max(0, zone.capacity - remaining),
+                        zone.objective_cost / max(1, zone.capacity),
+                        -zone.capacity,
+                        strip_key,
+                        signature,
+                    )
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best = (strip_key, zone)
+                if best is None:
+                    return chosen, dict(covered), "infeasible"
+                add(*best)
+        return chosen, dict(covered), "complete"
 
-        generated: list[dict[str, object]] = []
-        for protection in (1.0, 0.75, 0.50, 0.25, 0.0):
-            for policy, ordering in orderings:
-                chosen, covered = attempt(ordering, protection)
-                covered_boxes = sum(
-                    min(int(self.groups_by_id[key].demand), covered.get(key, 0))
-                    for key in group_ids
-                )
-                support_key = tuple(sorted(chosen))
-                support_cost = 0.0
-                reserved_capacity = 0
-                for strip_key, signature in chosen:
-                    zone = zone_for(strip_key, signature)
-                    support_cost += float(zone.objective_cost)
-                    reserved_capacity += int(zone.capacity)
-                complete = covered_boxes == total_demand
-                generated.append(
-                    {
-                        "support": chosen,
-                        "covered": covered,
-                        "support_key": support_key,
-                        "ordering_policy": policy,
-                        "import_protection": float(protection),
-                        "covered_boxes": int(covered_boxes),
-                        "complete_export_cover": complete,
-                        "selected_zone_count": len(chosen),
-                        "reserved_capacity": reserved_capacity,
-                        "cheap_support_cost": support_cost,
-                        "cheap_score": (
-                            0 if complete else 1,
-                            -covered_boxes,
-                            len(chosen),
-                            max(0, reserved_capacity - total_demand),
-                            support_cost,
-                            support_key,
-                        ),
-                    }
-                )
-
-        deduplicated: dict[tuple, dict[str, object]] = {}
-        for candidate in generated:
-            key = candidate["support_key"]
-            prior = deduplicated.get(key)
-            if prior is None or candidate["cheap_score"] < prior["cheap_score"]:
-                deduplicated[key] = candidate
-        candidates = sorted(
-            deduplicated.values(),
-            key=lambda candidate: candidate["cheap_score"],
+    def _generate_greedy_support_candidate(
+        self,
+        context: dict[str, object],
+        *,
+        ordering_policy: str,
+        group_order: list[str],
+        import_protection: float,
+        deadline: float | None,
+        seed_root_zones: bool = False,
+        enforce_peak_cap: bool = True,
+    ) -> tuple[dict[str, object] | None, dict[str, object]]:
+        chosen, covered, status = self._attempt_greedy_support(
+            context,
+            group_order,
+            import_protection,
+            deadline=deadline,
+            seed_root_zones=seed_root_zones,
+            enforce_peak_cap=enforce_peak_cap,
         )
-        diagnostics = {
-            "generated_candidate_count": len(generated),
-            "deduplicated_candidate_count": len(candidates),
-            "complete_candidate_count": sum(
-                bool(candidate["complete_export_cover"])
-                for candidate in candidates
-            ),
-            "candidate_summaries": [
-                {
-                    "ordering_policy": candidate["ordering_policy"],
-                    "import_protection": candidate["import_protection"],
-                    "covered_boxes": candidate["covered_boxes"],
-                    "complete_export_cover": candidate["complete_export_cover"],
-                    "selected_zone_count": candidate["selected_zone_count"],
-                }
-                for candidate in candidates
-            ],
-            "generated_candidate_summaries": [
-                {
-                    "ordering_policy": candidate["ordering_policy"],
-                    "import_protection": candidate["import_protection"],
-                    "covered_boxes": candidate["covered_boxes"],
-                    "complete_export_cover": candidate["complete_export_cover"],
-                    "selected_zone_count": candidate["selected_zone_count"],
-                }
-                for candidate in generated
-            ],
+        group_ids = context["group_ids"]
+        covered_boxes = sum(
+            min(int(self.groups_by_id[key].demand), covered.get(key, 0))
+            for key in group_ids
+        )
+        summary = {
+            "ordering_policy": ordering_policy,
+            "import_protection": float(import_protection),
+            "covered_boxes": int(covered_boxes),
+            "complete_export_cover": status == "complete",
+            "selected_zone_count": len(chosen),
+            "generation_status": status,
         }
-        return candidates, diagnostics
+        if status == "budget_exhausted":
+            return None, summary
+
+        support_cost = 0.0
+        reserved_capacity = 0
+        for strip_key, signature in chosen:
+            if deadline is not None and perf_counter() >= deadline:
+                summary["generation_status"] = "budget_exhausted"
+                summary["complete_export_cover"] = False
+                return None, summary
+            zone = self._greedy_zone_for(context, strip_key, signature)
+            support_cost += float(zone.objective_cost)
+            reserved_capacity += int(zone.capacity)
+        support_key = tuple(sorted(chosen))
+        complete = status == "complete"
+        candidate = {
+            "support": chosen,
+            "covered": covered,
+            "support_key": support_key,
+            "ordering_policy": ordering_policy,
+            "import_protection": float(import_protection),
+            "covered_boxes": int(covered_boxes),
+            "complete_export_cover": complete,
+            "generation_status": status,
+            "selected_zone_count": len(chosen),
+            "reserved_capacity": reserved_capacity,
+            "cheap_support_cost": support_cost,
+            "cheap_score": (
+                0 if complete else 1,
+                -covered_boxes,
+                len(chosen),
+                max(0, reserved_capacity - int(context["total_demand"])),
+                support_cost,
+                support_key,
+            ),
+        }
+        return candidate, summary
+
+    @staticmethod
+    def _greedy_candidate_summary(candidate: dict[str, object]) -> dict[str, object]:
+        return {
+            "ordering_policy": candidate["ordering_policy"],
+            "import_protection": candidate["import_protection"],
+            "covered_boxes": candidate["covered_boxes"],
+            "complete_export_cover": candidate["complete_export_cover"],
+            "selected_zone_count": candidate["selected_zone_count"],
+            "generation_status": candidate["generation_status"],
+        }
+
+    def _baseline_v4_on_demand_greedy_support(
+        self,
+        variables: dict,
+    ) -> tuple[list[tuple[StripKey, tuple[int, ...]]], dict[str, int], float | None]:
+        """Reproduce the pre-Phase-1 single-start strategy for the baseline."""
+
+        context = self._greedy_candidate_context(variables)
+        best_chosen: list[tuple[StripKey, tuple[int, ...]]] = []
+        best_covered: dict[str, int] = {}
+        best_protection: float | None = None
+        orderings = self._greedy_candidate_orderings(
+            context["group_ids"],
+            include_voyage_clustered=False,
+        )
+        for protection in (1.0, 0.0):
+            for _policy, ordering in orderings:
+                chosen, covered, status = self._attempt_greedy_support(
+                    context,
+                    ordering,
+                    protection,
+                    deadline=None,
+                    seed_root_zones=True,
+                    enforce_peak_cap=False,
+                )
+                covered_boxes = sum(
+                    min(
+                        int(self.groups_by_id[key].demand),
+                        covered.get(key, 0),
+                    )
+                    for key in context["group_ids"]
+                )
+                best_boxes = sum(
+                    min(
+                        int(self.groups_by_id[key].demand),
+                        best_covered.get(key, 0),
+                    )
+                    for key in context["group_ids"]
+                )
+                if covered_boxes > best_boxes:
+                    best_chosen = chosen
+                    best_covered = covered
+                    best_protection = protection
+                if status == "complete":
+                    return chosen, covered, protection
+        return best_chosen, best_covered, best_protection
 
     def _export_flow_start_for_zones(
         self,
@@ -2135,7 +2345,9 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         Gurobi to complete).
         """
 
-        chosen, covered, protection = self._on_demand_greedy_support(variables)
+        chosen, covered, protection = (
+            self._baseline_v4_on_demand_greedy_support(variables)
+        )
         complete = all(
             covered.get(group.group_id, 0) >= int(group.demand)
             for group in self.groups
@@ -2544,44 +2756,99 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         self,
         model,
         variables: dict,
+        *,
+        start_deadline: float,
+        start_budget_seconds: float,
         repair_time_limit: float,
-        mip_deadline: float,
     ) -> dict[str, object]:
-        """Generate all greedy supports and retain only jointly feasible starts."""
+        """Lazily generate and repair starts under one shared hard deadline."""
 
         started = perf_counter()
-        candidates, generation = self._generate_greedy_support_candidates(variables)
-        generation_seconds = perf_counter() - started
-        repair_deadline = min(
-            mip_deadline,
-            perf_counter() + max(0.0, float(repair_time_limit)),
-        )
-        eligible = [
-            candidate
-            for candidate in candidates
-            if bool(candidate["complete_export_cover"])
-        ][: int(self.zone_config.max_repaired_start_candidates)]
+        context = self._greedy_candidate_context(variables)
+        generated_summaries: list[dict[str, object]] = []
+        candidate_summaries: list[dict[str, object]] = []
+        seen_supports: set[tuple] = set()
         repaired: list[dict[str, object]] = []
-        repair_summaries = []
-        repair_started = perf_counter()
-        for position, candidate in enumerate(eligible):
-            remaining = repair_deadline - perf_counter()
-            if remaining <= 1e-6:
+        repair_summaries: list[dict[str, object]] = []
+        generation_seconds = 0.0
+        repair_seconds = 0.0
+        generation_completed_count = 0
+        generation_interrupted_count = 0
+        duplicate_count = 0
+        infeasible_count = 0
+        termination_reason = "all_strategies_exhausted"
+
+        strategies = self._greedy_candidate_strategies(context["group_ids"])
+        for policy, ordering, protection in strategies:
+            if perf_counter() >= start_deadline:
+                termination_reason = "budget_exhausted"
                 break
+            generated_started = perf_counter()
+            candidate, generated_summary = self._generate_greedy_support_candidate(
+                context,
+                ordering_policy=policy,
+                group_order=ordering,
+                import_protection=protection,
+                deadline=start_deadline,
+            )
+            generation_seconds += perf_counter() - generated_started
+            generated_summaries.append(generated_summary)
+            if candidate is None:
+                generation_interrupted_count += 1
+                termination_reason = "budget_exhausted"
+                break
+            generation_completed_count += 1
+            if candidate["generation_status"] == "infeasible":
+                infeasible_count += 1
+            support_key = candidate["support_key"]
+            if support_key in seen_supports:
+                duplicate_count += 1
+                continue
+            seen_supports.add(support_key)
+            candidate_summaries.append(
+                self._greedy_candidate_summary(candidate)
+            )
+            if not bool(candidate["complete_export_cover"]):
+                continue
+            if (
+                len(repair_summaries)
+                >= int(self.zone_config.max_repaired_start_candidates)
+            ):
+                termination_reason = "max_repair_candidates_reached"
+                break
+
+            remaining_repair_budget = max(
+                0.0,
+                float(repair_time_limit) - repair_seconds,
+            )
+            remaining_start_budget = max(0.0, start_deadline - perf_counter())
+            if remaining_repair_budget <= 1e-6:
+                termination_reason = "repair_budget_exhausted"
+                break
+            if remaining_start_budget <= 1e-6:
+                termination_reason = "budget_exhausted"
+                break
+            remaining_repair_slots = max(
+                1,
+                int(self.zone_config.max_repaired_start_candidates)
+                - len(repair_summaries),
+            )
             candidate_deadline = min(
-                repair_deadline,
+                start_deadline,
                 perf_counter()
-                + remaining / max(1, len(eligible) - position),
+                + remaining_repair_budget / remaining_repair_slots,
             )
             selected = {
                 self._register_zone(strip_key, signature)
                 for strip_key, signature in candidate["support"]
             }
+            repair_started = perf_counter()
             result = self._repair_zone_support(
                 selected,
                 candidate_deadline,
                 start_source_variables=variables,
             )
+            repair_seconds += perf_counter() - repair_started
             summary = {
                 "ordering_policy": candidate["ordering_policy"],
                 "import_protection": candidate["import_protection"],
@@ -2596,6 +2863,9 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             if result["feasible"]:
                 result["candidate"] = summary
                 repaired.append(result)
+                if len(repaired) >= int(self.zone_config.max_mip_starts):
+                    termination_reason = "max_starts_reached"
+                    break
 
         repaired.sort(
             key=lambda result: (
@@ -2605,30 +2875,89 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         )
         provided = repaired[: int(self.zone_config.max_mip_starts)]
         added_seed_zone_count = 0
+        preparation_interrupted = False
         for result in provided:
             for zone_index in sorted(result["selected_zone_indices"]):
+                if perf_counter() >= start_deadline:
+                    preparation_interrupted = True
+                    break
                 if zone_index not in variables["active_zone_indices"]:
                     self._add_zone_variable(model, variables, zone_index)
                     added_seed_zone_count += 1
+            if preparation_interrupted:
+                break
         if added_seed_zone_count:
             model.update()
-        variables["pending_repaired_mip_starts"] = [
-            self._repaired_start_values(result, variables) for result in provided
-        ]
-        repair_seconds = perf_counter() - repair_started
+        active_zone_indices = set(variables["active_zone_indices"])
+        pending_starts = []
+        pending_results = []
+        for result in provided:
+            if perf_counter() >= start_deadline:
+                preparation_interrupted = True
+                break
+            if not set(result["selected_zone_indices"]).issubset(
+                active_zone_indices
+            ):
+                continue
+            pending_starts.append(
+                self._repaired_start_values(result, variables)
+            )
+            pending_results.append(result)
+        variables["pending_repaired_mip_starts"] = pending_starts
+        if preparation_interrupted:
+            termination_reason = "budget_exhausted"
+
+        actual_seconds = perf_counter() - started
+        budget_seconds = max(0.0, float(start_budget_seconds))
+        budget_exhausted = bool(
+            termination_reason == "budget_exhausted"
+            or perf_counter() >= start_deadline
+        )
+        if not pending_results and not repaired and termination_reason == "all_strategies_exhausted":
+            termination_reason = "no_feasible_start"
         return {
-            **generation,
+            "generated_candidate_count": generation_completed_count,
+            "deduplicated_candidate_count": len(seen_supports),
+            "complete_candidate_count": sum(
+                bool(summary["complete_export_cover"])
+                for summary in candidate_summaries
+            ),
+            "infeasible_candidate_count": infeasible_count,
+            "budget_interrupted_candidate_count": generation_interrupted_count,
+            "candidate_generation_completed_count": generation_completed_count,
+            "candidate_generation_interrupted_count": generation_interrupted_count,
+            "candidate_duplicate_count": duplicate_count,
+            "candidate_summaries": candidate_summaries,
+            "generated_candidate_summaries": generated_summaries,
             "repaired_candidate_count": len(repair_summaries),
+            "repair_attempt_count": len(repair_summaries),
             "feasible_repaired_count": len(repaired),
-            "provided_mip_start_count": len(provided),
+            "repair_feasible_count": len(repaired),
+            "provided_mip_start_count": len(pending_starts),
+            "submitted_start_count": 0,
             "best_repaired_start_objective": (
-                float(provided[0]["objective"]) if provided else None
+                float(pending_results[0]["objective"])
+                if pending_results
+                else None
             ),
             "added_seed_zone_count": added_seed_zone_count,
             "candidate_generation_seconds": generation_seconds,
             "repair_time_limit_seconds": float(repair_time_limit),
             "repair_seconds": repair_seconds,
-            "total_mip_start_seconds": perf_counter() - started,
+            "start_preparation_budget_seconds": budget_seconds,
+            "start_preparation_actual_seconds": actual_seconds,
+            "start_preparation_budget_utilization": (
+                actual_seconds / budget_seconds if budget_seconds > 0.0 else None
+            ),
+            "total_mip_start_seconds": actual_seconds,
+            "start_budget_exhausted": budget_exhausted,
+            "start_termination_reason": termination_reason,
+            "ordering_families_with_feasible_start": sorted(
+                {
+                    str(result["candidate"]["ordering_policy"])
+                    for result in repaired
+                }
+            ),
             "repair_summaries": repair_summaries,
             "solver_submission": None,
         }
@@ -2674,7 +3003,11 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 self._add_zone_variable(model, variables, zone.zone_id)
             model.update()
             selected, _export_flow, _import_reserve, stats = self._integerize_zone_master(
-                model, variables, deadline, progress_phase="complete_zone_mip"
+                model,
+                variables,
+                deadline,
+                start_policy=COMPLETE_MIP_BASELINE_POLICY,
+                progress_phase="complete_zone_mip",
             )
             stats["zone_count"] = self._possible_zone_count
             stats["selected_candidate_count"] = len(
@@ -2747,7 +3080,11 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 self._add_zone_variable(model, variables, zone.zone_id)
             model.update()
             selected, export_flow, import_reserve, stats = self._integerize_zone_master(
-                model, variables, deadline, progress_phase="complete_zone_mip"
+                model,
+                variables,
+                deadline,
+                start_policy=COMPLETE_MIP_BASELINE_POLICY,
+                progress_phase="complete_zone_mip",
             )
         finally:
             self._free_gurobi_model(model)
@@ -2808,6 +3145,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 model,
                 variables,
                 deadline - fill_reserve,
+                start_policy=COMPLETE_MIP_BASELINE_POLICY,
                 progress_phase="complete_zone_mip",
             )
             if not selected_zones:
@@ -2847,7 +3185,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         }
         diagnostics = {
             "algorithm": "complete_contiguous_zone_mip_with_exact_recourse",
-            "algorithm_version": "complete_zone_mip_v4_model_phase1_diagnostics",
+            "algorithm_version": "complete_zone_mip_v4_model_phase1_1_isolated",
             "model_scope": "actual_quantity_flow_on_dedicated_contiguous_row_zones",
             "baseline_role": "same_model_fully_enumerated_end_to_end_mip",
             "formulation": "fully_enumerated_zone_flow_master_plus_exact_row_recourse",
@@ -2878,6 +3216,8 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 "final_fill_total_fraction": float(
                     self.zone_config.fill_time_fraction
                 ),
+                "integer_search_policy": COMPLETE_MIP_BASELINE_POLICY,
+                "v5_multi_start_enabled": False,
             },
             "master_status": zone_mip["status"],
             "master_objective": zone_upper_bound,
@@ -3109,6 +3449,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         variables: dict,
         deadline: float,
         *,
+        start_policy: str,
         progress_phase: str = "initial_zone_mip",
     ) -> tuple[
         set[int],
@@ -3117,22 +3458,93 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         dict[str, object],
     ]:
         started = perf_counter()
+        if start_policy not in {
+            V5_MULTI_START_POLICY,
+            COMPLETE_MIP_BASELINE_POLICY,
+        }:
+            raise ValueError(f"unknown integer-search start policy: {start_policy!r}")
         lp_start = self._initialize_complete_mip_start_from_lp(
             model,
             variables,
             deadline,
         )
-        repair_time_limit = min(
-            max(0.0, deadline - perf_counter()),
-            max(0.0, float(self.config.total_time_limit))
-            * float(self.zone_config.mip_start_repair_total_fraction),
-        )
-        mip_start = self._greedy_zone_mip_start(
-            model,
-            variables,
-            repair_time_limit,
-            deadline,
-        )
+        if start_policy == V5_MULTI_START_POLICY:
+            start_phase_begin = perf_counter()
+            start_budget_seconds = (
+                max(0.0, float(self.config.total_time_limit))
+                * float(self.zone_config.mip_start_total_time_fraction)
+            )
+            start_deadline = min(
+                deadline,
+                start_phase_begin + start_budget_seconds,
+            )
+            repair_time_limit = min(
+                max(0.0, start_deadline - perf_counter()),
+                max(0.0, float(self.config.total_time_limit))
+                * float(self.zone_config.mip_start_repair_total_fraction),
+            )
+            mip_start = self._greedy_zone_mip_start(
+                model,
+                variables,
+                start_deadline=start_deadline,
+                start_budget_seconds=start_budget_seconds,
+                repair_time_limit=repair_time_limit,
+            )
+            mip_start.update(
+                {
+                    "integer_search_policy": start_policy,
+                    "v5_multi_start_enabled": True,
+                    "baseline_start_type": None,
+                }
+            )
+        else:
+            start_phase_begin = perf_counter()
+            start_deadline = None
+            baseline_start = self._legacy_gurobi_repair_start(model, variables)
+            baseline_start_count = int(
+                int(baseline_start.get("selected_zone_count", 0)) > 0
+            )
+            baseline_seconds = perf_counter() - start_phase_begin
+            mip_start = {
+                "integer_search_policy": start_policy,
+                "v5_multi_start_enabled": False,
+                "baseline_start_type": "v4_single_partial_gurobi_repair_start",
+                "baseline_start": baseline_start,
+                "candidate_generation_executed": False,
+                "candidate_generation_seconds": 0.0,
+                "candidate_generation_completed_count": 0,
+                "candidate_generation_interrupted_count": 0,
+                "generated_candidate_count": 0,
+                "deduplicated_candidate_count": 0,
+                "complete_candidate_count": 0,
+                "candidate_duplicate_count": 0,
+                "infeasible_candidate_count": 0,
+                "budget_interrupted_candidate_count": 0,
+                "repair_executed": False,
+                "repair_seconds": 0.0,
+                "repair_attempt_count": 0,
+                "repair_feasible_count": 0,
+                "repaired_candidate_count": 0,
+                "feasible_repaired_count": 0,
+                "provided_mip_start_count": baseline_start_count,
+                "submitted_start_count": baseline_start_count,
+                "submitted_mip_start_count": baseline_start_count,
+                "start_preparation_budget_seconds": None,
+                "start_preparation_actual_seconds": baseline_seconds,
+                "start_preparation_budget_utilization": None,
+                "total_mip_start_seconds": baseline_seconds,
+                "start_budget_exhausted": False,
+                "start_termination_reason": (
+                    "baseline_native_start_prepared"
+                    if baseline_start_count
+                    else "no_feasible_start"
+                ),
+                "solver_submission": {
+                    "mode": "native_variable_start",
+                    "provided_mip_start_count": baseline_start_count,
+                    "solver_acceptance_observed": False,
+                },
+            }
         for variable in variables["zone"].values():
             variable.VType = "B"
         for variable in variables["area_use"].values():
@@ -3148,14 +3560,63 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         for variable in variables["shortage"].values():
             variable.UB = 0.0
         model.update()
-        pending_starts = variables.pop("pending_repaired_mip_starts", [])
-        mip_start["solver_submission"] = model.apply_mip_starts(pending_starts)
+        if start_policy == V5_MULTI_START_POLICY:
+            pending_starts = variables.pop("pending_repaired_mip_starts", [])
+            submission = model.apply_mip_starts(
+                pending_starts,
+                deadline=start_deadline,
+            )
+            mip_start["solver_submission"] = submission
+            submitted_count = int(submission["provided_mip_start_count"])
+            mip_start["provided_mip_start_count"] = submitted_count
+            mip_start["submitted_start_count"] = submitted_count
+            mip_start["submitted_mip_start_count"] = submitted_count
+            if submission.get("deadline_exhausted"):
+                mip_start["start_budget_exhausted"] = True
+                mip_start["start_termination_reason"] = "budget_exhausted"
+            actual_start_seconds = perf_counter() - start_phase_begin
+            mip_start["start_preparation_actual_seconds"] = actual_start_seconds
+            mip_start["total_mip_start_seconds"] = actual_start_seconds
+            budget_seconds = float(
+                mip_start["start_preparation_budget_seconds"]
+            )
+            mip_start["start_preparation_budget_utilization"] = (
+                actual_start_seconds / budget_seconds
+                if budget_seconds > 0.0
+                else None
+            )
+            mip_start["candidate_generation_executed"] = bool(
+                int(mip_start["candidate_generation_completed_count"])
+                + int(mip_start["candidate_generation_interrupted_count"])
+            )
+            mip_start["repair_executed"] = bool(
+                int(mip_start["repair_attempt_count"])
+            )
+        policy_diagnostics = {
+            "integer_search_policy": start_policy,
+            "v5_multi_start_enabled": bool(
+                mip_start["v5_multi_start_enabled"]
+            ),
+            "candidate_generation_executed": bool(
+                mip_start.get("candidate_generation_executed", False)
+            ),
+            "candidate_generation_seconds": float(
+                mip_start.get("candidate_generation_seconds", 0.0)
+            ),
+            "repair_executed": bool(mip_start.get("repair_executed", False)),
+            "repair_seconds": float(mip_start.get("repair_seconds", 0.0)),
+            "submitted_mip_start_count": int(
+                mip_start.get("submitted_mip_start_count", 0)
+            ),
+            "baseline_start_type": mip_start.get("baseline_start_type"),
+        }
         remaining = deadline - perf_counter()
         if remaining <= 1e-6:
             return set(), {}, {}, {
                 "status": "time_limit_before_zone_mip",
                 "lp_start": lp_start,
                 "mip_start": mip_start,
+                **policy_diagnostics,
                 "seconds": perf_counter() - started,
             }
         self._set_gurobi_param(model, "TimeLimit", max(0.01, remaining))
@@ -3173,6 +3634,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 "lp_start": lp_start,
                 "mip_start": mip_start,
                 "mip_progress": progress,
+                **policy_diagnostics,
                 "seconds": perf_counter() - started,
             }
         selected = {
@@ -3220,6 +3682,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "lp_start": lp_start,
             "mip_start": mip_start,
             "mip_progress": progress,
+            **policy_diagnostics,
             "seconds": perf_counter() - started,
         }
 
@@ -4177,7 +4640,10 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 initial_import_reserve,
                 zone_mip_initial,
             ) = self._integerize_zone_master(
-                model, variables, zone_mip_deadline
+                model,
+                variables,
+                zone_mip_deadline,
+                start_policy=V5_MULTI_START_POLICY,
             )
             if not initial_zones:
                 raise RuntimeError(
@@ -4362,6 +4828,11 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 "mip_start_repair_total_fraction": float(
                     self.zone_config.mip_start_repair_total_fraction
                 ),
+                "mip_start_total_time_fraction": float(
+                    self.zone_config.mip_start_total_time_fraction
+                ),
+                "integer_search_policy": V5_MULTI_START_POLICY,
+                "v5_multi_start_enabled": True,
             },
             "master_status": fix_optimize["status"],
             "master_objective": zone_upper_bound,

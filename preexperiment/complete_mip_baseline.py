@@ -395,6 +395,20 @@ def _run_complete_mip(
         "mip_progress": zone_mip.get("mip_progress", {}),
         "mip_anytime": diagnostics.get("mip_anytime", {}),
         "mip_start_diagnostics": zone_mip.get("mip_start", {}),
+        "integer_search_policy": zone_mip.get("integer_search_policy"),
+        "v5_multi_start_enabled": zone_mip.get("v5_multi_start_enabled"),
+        "candidate_generation_executed": zone_mip.get(
+            "candidate_generation_executed"
+        ),
+        "candidate_generation_seconds": zone_mip.get(
+            "candidate_generation_seconds"
+        ),
+        "repair_executed": zone_mip.get("repair_executed"),
+        "repair_seconds": zone_mip.get("repair_seconds"),
+        "submitted_mip_start_count": zone_mip.get(
+            "submitted_mip_start_count"
+        ),
+        "baseline_start_type": zone_mip.get("baseline_start_type"),
         "objective_certificate": certificate,
         "row_recourse": diagnostics.get("zone_fill"),
         "internal_validation": internal,

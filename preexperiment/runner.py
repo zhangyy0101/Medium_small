@@ -245,8 +245,32 @@ def validate_case(
             "generated_candidate_count": mip_start.get(
                 "generated_candidate_count"
             ),
+            "integer_search_policy": zone_mip.get(
+                "integer_search_policy"
+            ),
+            "v5_multi_start_enabled": zone_mip.get(
+                "v5_multi_start_enabled"
+            ),
+            "candidate_generation_executed": zone_mip.get(
+                "candidate_generation_executed"
+            ),
             "deduplicated_candidate_count": mip_start.get(
                 "deduplicated_candidate_count"
+            ),
+            "candidate_generation_completed_count": mip_start.get(
+                "candidate_generation_completed_count"
+            ),
+            "candidate_generation_interrupted_count": mip_start.get(
+                "candidate_generation_interrupted_count"
+            ),
+            "candidate_duplicate_count": mip_start.get(
+                "candidate_duplicate_count"
+            ),
+            "infeasible_candidate_count": mip_start.get(
+                "infeasible_candidate_count"
+            ),
+            "budget_interrupted_candidate_count": mip_start.get(
+                "budget_interrupted_candidate_count"
             ),
             "repaired_candidate_count": mip_start.get(
                 "repaired_candidate_count"
@@ -264,8 +288,28 @@ def validate_case(
                 "repair_time_limit_seconds"
             ),
             "repair_seconds": mip_start.get("repair_seconds"),
+            "repair_attempt_count": mip_start.get("repair_attempt_count"),
+            "repair_feasible_count": mip_start.get("repair_feasible_count"),
             "total_mip_start_seconds": mip_start.get(
                 "total_mip_start_seconds"
+            ),
+            "start_preparation_budget_seconds": mip_start.get(
+                "start_preparation_budget_seconds"
+            ),
+            "start_preparation_actual_seconds": mip_start.get(
+                "start_preparation_actual_seconds"
+            ),
+            "start_preparation_budget_utilization": mip_start.get(
+                "start_preparation_budget_utilization"
+            ),
+            "submitted_start_count": mip_start.get(
+                "submitted_start_count"
+            ),
+            "start_budget_exhausted": mip_start.get(
+                "start_budget_exhausted"
+            ),
+            "start_termination_reason": mip_start.get(
+                "start_termination_reason"
             ),
             "best_repaired_start_objective": mip_start.get(
                 "best_repaired_start_objective"
@@ -350,6 +394,10 @@ def _flat_case_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "first_incumbent": paper.get("first_incumbent"),
         "best_incumbent": paper.get("best_incumbent"),
         "provided_mip_start_count": paper.get("provided_mip_start_count"),
+        "start_preparation_seconds": paper.get(
+            "start_preparation_actual_seconds"
+        ),
+        "start_termination_reason": paper.get("start_termination_reason"),
         "feasible_repaired_count": paper.get("feasible_repaired_count"),
         "selected_candidates": paper.get("selected_candidate_count"),
         "candidate_reduction": paper.get("candidate_reduction"),

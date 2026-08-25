@@ -332,38 +332,70 @@ class GurobiModel:
     def apply_mip_starts(
         self,
         starts: Iterable[dict[object, float]],
+        *,
+        deadline: float | None = None,
     ) -> dict[str, object]:
-        """Submit distinct complete/partial starts without claiming acceptance."""
+        """Submit starts, stopping cleanly if their shared deadline expires."""
 
         materialized = list(starts)
         self._model.update()
         self._model.NumStart = len(materialized)
         assigned_value_counts = []
         variables = self._model.getVars()
+        deadline_exhausted = False
         for start_number, start in enumerate(materialized):
+            if deadline is not None and perf_counter() >= deadline:
+                deadline_exhausted = True
+                break
             self._model.Params.StartNumber = int(start_number)
-            for variable in variables:
+            interrupted = False
+            for index, variable in enumerate(variables):
+                if (
+                    deadline is not None
+                    and index % 256 == 0
+                    and perf_counter() >= deadline
+                ):
+                    interrupted = True
+                    deadline_exhausted = True
+                    break
                 variable.Start = self._gp.GRB.UNDEFINED
+            if interrupted:
+                break
             assigned = 0
-            for variable, value in start.items():
+            for index, (variable, value) in enumerate(start.items()):
+                if (
+                    deadline is not None
+                    and index % 256 == 0
+                    and perf_counter() >= deadline
+                ):
+                    interrupted = True
+                    deadline_exhausted = True
+                    break
                 variable.Start = float(value)
                 assigned += 1
+            if interrupted:
+                break
             assigned_value_counts.append(assigned)
-        if materialized:
+        self._model.NumStart = len(assigned_value_counts)
+        if assigned_value_counts:
             self._model.Params.StartNumber = 0
         return {
-            "provided_mip_start_count": len(materialized),
+            "requested_mip_start_count": len(materialized),
+            "provided_mip_start_count": len(assigned_value_counts),
             "assigned_value_counts": assigned_value_counts,
+            "deadline_exhausted": deadline_exhausted,
             "solver_acceptance_observed": False,
         }
 
     def applyMipStarts(
         self,
         starts: Iterable[dict[object, float]],
+        *,
+        deadline: float | None = None,
     ) -> dict[str, object]:
         """Backward-compatible alias for the snake-case façade method."""
 
-        return self.apply_mip_starts(starts)
+        return self.apply_mip_starts(starts, deadline=deadline)
 
     def getStatusName(self) -> str:
         status_names = {
