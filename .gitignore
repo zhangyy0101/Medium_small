@@ -2,3 +2,8 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 outputs/
+.venv/
+.DS_Store
+paper_large_plan_outputs/
+preexperiment_outputs/
+flat_full_yard_plan_1.5_scip/
