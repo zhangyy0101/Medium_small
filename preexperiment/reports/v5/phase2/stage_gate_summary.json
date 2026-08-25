@@ -1,0 +1,102 @@
+{
+  "phase": "v5_phase2_proof_primal_pool",
+  "status": "complete",
+  "tests": {
+    "passed": 37,
+    "failed": 0,
+    "skipped": 0
+  },
+  "correctness": {
+    "exact_root_lower_bounds_match_phase1_1": true,
+    "generation_manifests_match_phase1_1": true,
+    "internal_validation_all_cases": true,
+    "external_validation_all_cases": true,
+    "complete_mip_baseline_isolated": true
+  },
+  "cases": [
+    {
+      "case_id": "pilot_l_301",
+      "groups": 24,
+      "implicit_zones": 40054,
+      "proof_pool": 1065,
+      "primal_pool": 994,
+      "final_primal_master_pool": 1006,
+      "proof_to_primal_reduction": 0.06666666666666665,
+      "mandatory_start_zones": 90,
+      "mandatory_overflow": 19,
+      "upper_bound": 0.13864872126056085,
+      "root_lower_bound": 0.1156267164519525,
+      "independent_gap": 0.16604556175706364,
+      "complete_mip_upper_bound": 0.13152150491960696,
+      "complete_mip_lower_bound": 0.1201990149110313,
+      "complete_mip_gap": 0.08608850708860559,
+      "relative_improvement_vs_complete": -0.05419050173817913,
+      "time_to_first": 8.002180137656978,
+      "time_to_best": 48.07571160537191
+    },
+    {
+      "case_id": "scale_g048_s601",
+      "groups": 48,
+      "implicit_zones": 79892,
+      "proof_pool": 4487,
+      "primal_pool": 2111,
+      "final_primal_master_pool": 2135,
+      "proof_to_primal_reduction": 0.5295297526186762,
+      "mandatory_start_zones": 278,
+      "mandatory_overflow": 164,
+      "upper_bound": 0.1429532100056037,
+      "root_lower_bound": 0.11830479121927327,
+      "independent_gap": 0.17242298221469968,
+      "complete_mip_upper_bound": 0.14282644845755862,
+      "complete_mip_lower_bound": 0.1198380519461714,
+      "complete_mip_gap": 0.16095335814653614,
+      "relative_improvement_vs_complete": -0.0008875215298989401,
+      "time_to_first": 13.365916544469655,
+      "time_to_best": 101.41012812552799
+    },
+    {
+      "case_id": "scale_g096_s801",
+      "groups": 96,
+      "implicit_zones": 159907,
+      "proof_pool": 19801,
+      "primal_pool": 4620,
+      "final_primal_master_pool": 4696,
+      "proof_to_primal_reduction": 0.7666784505833039,
+      "mandatory_start_zones": 887,
+      "mandatory_overflow": 726,
+      "upper_bound": 0.17032165576584077,
+      "root_lower_bound": 0.13988910192782317,
+      "independent_gap": 0.17867694921811034,
+      "complete_mip_upper_bound": 0.17110328931331037,
+      "complete_mip_lower_bound": 0.14027336696538878,
+      "complete_mip_gap": 0.18018310735960402,
+      "relative_improvement_vs_complete": 0.004568197084968587,
+      "time_to_first": 45.87793501152191,
+      "time_to_best": 113.05074325403257
+    }
+  ],
+  "aggregate_48_plus": {
+    "case_count": 2,
+    "mean_relative_ub_improvement_vs_complete": 0.0018403377775348235,
+    "median_relative_ub_improvement_vs_complete": 0.0018403377775348235,
+    "minimum_relative_ub_improvement_vs_complete": -0.0008875215298989401,
+    "maximum_relative_ub_improvement_vs_complete": 0.004568197084968587,
+    "win_rate": 0.5,
+    "tie_rate": 0.0,
+    "loss_rate": 0.5,
+    "mean_v5_independent_gap": 0.17554996571640502,
+    "median_v5_independent_gap": 0.17554996571640502,
+    "mean_complete_mip_gap": 0.1705682327530701,
+    "mean_independent_gap_difference_percentage_points": 0.49817329633349283,
+    "mean_time_to_best_ratio_v5_over_complete": 0.9559631294592534
+  },
+  "stage_gates": {
+    "small_scale_16_24": "FAIL",
+    "large_scale_ub": "FAIL",
+    "independent_gap": "FAIL",
+    "pool_scalability_48_96": "PASS",
+    "correctness": "PASS"
+  },
+  "next_phase_recommendation": "implement_and_evaluate_conflict_aware_multi_round_fix_and_optimize",
+  "phase2_stopped_before_prohibited_features": true
+}

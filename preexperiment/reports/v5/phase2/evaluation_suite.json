@@ -1,0 +1,53 @@
+{
+  "evaluation_scope": "phase2_representative_single_seed_smoke",
+  "formal_holdout": false,
+  "model_schema_version": "integrated_zone_v4",
+  "paired_policy": {
+    "same_materialized_input": true,
+    "same_scenario_seed": true,
+    "same_total_wall_clock_budget": true,
+    "threads": 1,
+    "python_hash_seed": "0",
+    "same_objective": true,
+    "same_exact_recourse": true,
+    "internal_and_external_validation": true
+  },
+  "cases": [
+    {
+      "case_id": "pilot_l_301",
+      "groups": 24,
+      "scenario_seed": 301,
+      "time_limit_seconds": 60,
+      "manifest_sha1": "3f29840d61575f75ae0647dddd82e2e41c54e7f5",
+      "phase2_output": "preexperiment_outputs/v5_phase2_pilot_l301_60s_20260825",
+      "phase1_1_output": "preexperiment_outputs/v5_phase1_1_pilot_l301_60s_20260825",
+      "complete_mip_output": "preexperiment_outputs/v5_phase1_1_pilot_l301_complete_mip_60s_20260825"
+    },
+    {
+      "case_id": "scale_g048_s601",
+      "groups": 48,
+      "scenario_seed": 601,
+      "time_limit_seconds": 120,
+      "manifest_sha1": "b04b34d1fd51e7267c3b22bc63fe3d455d876c8a",
+      "phase2_output": "preexperiment_outputs/v5_phase2_scale_g048_120s_20260825",
+      "phase1_1_output": "preexperiment_outputs/v5_phase1_1_scale_g048_120s_20260825",
+      "complete_mip_output": "preexperiment_outputs/v5_phase1_1_scale_g048_complete_mip_120s_20260825"
+    },
+    {
+      "case_id": "scale_g096_s801",
+      "groups": 96,
+      "scenario_seed": 801,
+      "time_limit_seconds": 120,
+      "manifest_sha1": "7d20bab411ab58baf0ed1f1a439fa56c3d3e00ab",
+      "phase2_output": "preexperiment_outputs/v5_phase2_scale_g096_120s_20260825",
+      "phase1_1_output": "preexperiment_outputs/v5_phase1_1_scale_g096_120s_20260825",
+      "complete_mip_output": "preexperiment_outputs/v5_phase1_1_scale_g096_complete_mip_120s_20260825"
+    }
+  ],
+  "not_run": [
+    "16-group representative",
+    "72-group representative",
+    "multi-seed development suite",
+    "formal paper_eval_suite_v5 holdout"
+  ]
+}

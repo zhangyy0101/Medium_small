@@ -1,0 +1,55 @@
+{
+  "model_schema_version": "integrated_zone_v4",
+  "algorithm_version": "integrated_zone_v5_pool_phase2",
+  "proof_pool_policy": "closed_exact_rmq_root_generation",
+  "primal_pool_policy": "group_specific_round_robin_diversified_columns",
+  "integer_pool_columns_per_group": 100,
+  "group_budget_formula": "min(integer_pool_columns_per_group, ceil(sqrt(possible_zone_count_by_group)))",
+  "primal_pool_channels": [
+    "root_support",
+    "reduced_cost",
+    "capacity_fit",
+    "business_efficiency",
+    "spatial_diversity"
+  ],
+  "mandatory_start_columns": "retain_all_submitted_repaired_start_zones",
+  "primal_pool_apply_lp_warm_start": true,
+  "mip_start_total_time_fraction": 0.10,
+  "mip_start_repair_total_fraction": 0.08,
+  "max_repaired_start_candidates": 8,
+  "max_mip_starts": 6,
+  "root_time_fraction": 0.50,
+  "zone_mip_time_fraction": 0.75,
+  "fix_optimize_policy": "objective",
+  "fix_optimize_round_count": 1,
+  "fix_optimize_local_fraction": 0.85,
+  "fix_optimize_objective_mass": 0.60,
+  "fix_optimize_zone_fraction": 0.35,
+  "fill_time_fraction": 0.05,
+  "peak_utilization_headroom_fraction": 0.50,
+  "objective_weights": {
+    "voyage_area_dispersion": 0.15,
+    "zone_dispersion": 0.35,
+    "existing_group_proximity": 0.125,
+    "unused_capacity": 0.2125,
+    "berth_distance": 0.1625
+  },
+  "implemented_scope": [
+    "root_snapshot",
+    "proof_primal_model_separation",
+    "group_specific_primal_pool_budget",
+    "five_channel_diversified_columns",
+    "mandatory_repaired_start_columns",
+    "column_provenance",
+    "name_matched_lp_warm_start"
+  ],
+  "explicitly_not_implemented": [
+    "multi_round_fix_and_optimize",
+    "conflict_graph",
+    "dynamic_initial_mip_stopping",
+    "dual_stabilization",
+    "valid_inequalities",
+    "local_branching",
+    "branch_and_price"
+  ]
+}

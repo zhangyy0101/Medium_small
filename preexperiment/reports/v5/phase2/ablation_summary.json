@@ -1,0 +1,37 @@
+{
+  "model_schema_version": "integrated_zone_v4",
+  "phase2_algorithm_version": "integrated_zone_v5_pool_phase2",
+  "v5_full_implemented": false,
+  "cases": [
+    {
+      "case_id": "pilot_l_301",
+      "groups": 24,
+      "v4_ub": 0.1350163332986197,
+      "v5_start_ub": 0.13371394428479183,
+      "v5_pool_ub": 0.13864872126056085,
+      "v5_full_ub": null,
+      "complete_mip_ub": 0.13152150491960696,
+      "v5_pool_relative_improvement_vs_complete": -0.05419050173817913
+    },
+    {
+      "case_id": "scale_g048_s601",
+      "groups": 48,
+      "v4_ub": 0.13906313081226643,
+      "v5_start_ub": 0.13931046747007203,
+      "v5_pool_ub": 0.1429532100056037,
+      "v5_full_ub": null,
+      "complete_mip_ub": 0.14282644845755862,
+      "v5_pool_relative_improvement_vs_complete": -0.0008875215298989401
+    },
+    {
+      "case_id": "scale_g096_s801",
+      "groups": 96,
+      "v4_ub": 0.16600057920002734,
+      "v5_start_ub": 0.168837081630008,
+      "v5_pool_ub": 0.17032165576584077,
+      "v5_full_ub": null,
+      "complete_mip_ub": 0.17110328931331037,
+      "v5_pool_relative_improvement_vs_complete": 0.004568197084968587
+    }
+  ]
+}
