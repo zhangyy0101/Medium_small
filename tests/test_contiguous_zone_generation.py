@@ -106,6 +106,69 @@ def make_two_bay_single_group_problem(*, import_boxes: int = 0) -> ProblemData:
     )
 
 
+def make_three_group_conflict_problem() -> ProblemData:
+    groups = [
+        ExportGroup(
+            group_id="G1",
+            voyage_id="V1",
+            status="OF",
+            port="P1",
+            size="20",
+            height="96",
+            demand=2,
+        ),
+        ExportGroup(
+            group_id="G2",
+            voyage_id="V1",
+            status="OF",
+            port="P2",
+            size="20",
+            height="96",
+            demand=2,
+        ),
+        ExportGroup(
+            group_id="G3",
+            voyage_id="V2",
+            status="OF",
+            port="P3",
+            size="20",
+            height="86",
+            demand=2,
+        ),
+    ]
+    area_a_01 = make_bay("A", "01")
+    area_a_03 = make_bay("A", "03")
+    area_b_01 = make_bay("B", "01")
+    area_b_03 = make_bay("B", "03")
+    area_a_01.existing_heights = {"96"}
+    area_a_03.existing_heights = {"96"}
+    area_b_01.existing_heights = {"86"}
+    area_b_03.existing_heights = {"86"}
+    bays = {
+        bay.bay_key: bay
+        for bay in (
+            area_a_01,
+            area_a_03,
+            area_b_01,
+            area_b_03,
+        )
+    }
+    return ProblemData(
+        export_groups=groups,
+        bays=bays,
+        area_functions={"A": {"OF"}, "B": {"OF"}},
+        target_voyages=["V1", "V2"],
+        export_voyages={"V1", "V2"},
+        berth_distances={
+            ("A", "Q1"): 1.0,
+            ("B", "Q1"): 2.0,
+            ("A", "Q2"): 2.0,
+            ("B", "Q2"): 1.0,
+        },
+        berth_by_voyage={"V1": "Q1", "V2": "Q2"},
+    )
+
+
 class ContiguousZoneGenerationTests(unittest.TestCase):
     def test_configuration_rejects_invalid_adaptive_neighborhood(self) -> None:
         with self.assertRaises(ValueError):
@@ -125,6 +188,157 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             ContiguousZoneConfig(
                 primal_pool_apply_lp_warm_start=1,
             ).validate()
+        with self.assertRaises(ValueError):
+            ContiguousZoneConfig(fix_optimize_max_rounds=0).validate()
+        with self.assertRaises(ValueError):
+            ContiguousZoneConfig(
+                fix_optimize_max_rounds=3,
+                fix_optimize_round_zone_fractions=(0.1, 0.2),
+            ).validate()
+        with self.assertRaises(ValueError):
+            ContiguousZoneConfig(
+                fix_optimize_round_zone_fractions=(0.2, 0.1, 0.3),
+            ).validate()
+
+    def test_conflict_graph_prioritizes_shared_physical_resources(self) -> None:
+        planner = ContiguousZoneGenerationPlanner(
+            make_three_group_conflict_problem(),
+            ColumnGenerationConfig(verbose=False),
+        )
+        planner._prepare_zones()
+
+        scores, diagnostics = planner._build_group_conflict_scores(
+            set(),
+            {("G1", "A|01"): 2},
+            {},
+        )
+
+        coupled = scores[("G1", "G2")]
+        independent = scores[("G1", "G3")]
+        self.assertGreater(coupled["score"], independent["score"])
+        self.assertEqual(1.0, coupled["same_voyage"])
+        self.assertEqual(1.0, coupled["shared_area"])
+        self.assertEqual(1.0, coupled["resource_conflict"])
+        self.assertGreater(coupled["peak_exchange"], 0.0)
+        self.assertAlmostEqual(
+            coupled["score"],
+            sum(
+                coupled[name]
+                for name in (
+                    "same_voyage",
+                    "shared_area",
+                    "resource_conflict",
+                    "peak_exchange",
+                )
+            )
+            / 4.0,
+        )
+        self.assertEqual(0.0, independent["score"])
+        self.assertEqual(
+            {
+                "same_voyage": 0.25,
+                "shared_area": 0.25,
+                "resource_conflict": 0.25,
+                "peak_exchange": 0.25,
+            },
+            diagnostics["component_weights"],
+        )
+        self.assertFalse(diagnostics["full_zone_pair_materialization_used"])
+
+    def test_multiround_rotates_seed_and_accepts_later_improvement(self) -> None:
+        planner = ContiguousZoneGenerationPlanner(
+            make_three_group_conflict_problem(),
+            ColumnGenerationConfig(verbose=False),
+        )
+        planner._prepare_zones()
+        observed = []
+
+        def controlled_round(
+            _model,
+            _variables,
+            zones,
+            flow,
+            imports,
+            objective,
+            **kwargs,
+        ):
+            selection = kwargs["neighborhood_selection"]
+            observed.append(
+                (
+                    kwargs["round_id"],
+                    selection["seed_group"],
+                    selection["candidate_zone_budget"],
+                )
+            )
+            improved = kwargs["round_id"] == 2
+            after = 0.8 if improved or objective <= 0.8 else objective
+            return set(zones), dict(flow), dict(imports), {
+                "round_id": kwargs["round_id"],
+                "seed_group": selection["seed_group"],
+                "selected_groups": selection["selected_groups"],
+                "neighborhood_group_count": len(kwargs["neighborhood"]),
+                "candidate_zone_budget": selection["candidate_zone_budget"],
+                "candidate_zone_count": selection[
+                    "selected_candidate_zone_count"
+                ],
+                "objective_before": objective,
+                "local_objective": after,
+                "master_reoptimized_objective": after,
+                "objective_after": after,
+                "absolute_improvement": max(0.0, objective - after),
+                "relative_improvement": max(0.0, objective - after)
+                / max(abs(objective), 1e-12),
+                "selection_seconds": 0.0,
+                "build_seconds": 0.0,
+                "local_mip_seconds": 0.0,
+                "master_reoptimization_seconds": 0.0,
+                "local_nodes": 0.0,
+                "local_time_to_first": 0.0,
+                "local_time_to_best": 0.0,
+                "added_zone_count": 0,
+                "added_zone_indices": [],
+                "improved": improved,
+                "neighborhood_selection": selection,
+                "local": {},
+                "master_reoptimization": {},
+                "seconds": 0.0,
+            }
+
+        with (
+            patch.object(
+                planner,
+                "_zone_objective_certificate",
+                return_value={"objective": 1.0},
+            ),
+            patch.object(planner, "_gurobi_objective_value", return_value=1.0),
+            patch.object(
+                planner,
+                "_run_fix_optimize_round",
+                side_effect=controlled_round,
+            ),
+        ):
+            _zones, _flow, _imports, diagnostics = (
+                planner._run_objective_fix_optimize(
+                    object(),
+                    {},
+                    set(),
+                    {},
+                    {},
+                    perf_counter() + 5.0,
+                )
+            )
+
+        self.assertEqual(3, diagnostics["round_count"])
+        self.assertEqual(1, diagnostics["successful_round_count"])
+        self.assertLessEqual(
+            diagnostics["final_objective"],
+            diagnostics["initial_objective"],
+        )
+        self.assertAlmostEqual(0.8, diagnostics["final_objective"])
+        self.assertNotEqual(observed[0][1], observed[1][1])
+        self.assertLessEqual(observed[0][2], observed[1][2])
+        self.assertLessEqual(observed[1][2], observed[2][2])
+        self.assertLess(observed[0][2], observed[2][2])
 
     def test_integrated_objective_has_no_large_plan_term(self) -> None:
         planner = ContiguousZoneGenerationPlanner(
@@ -542,20 +756,54 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             fix_optimize["final_objective"],
             fix_optimize["initial_objective"] + 1e-9,
         )
-        selection = fix_optimize["local"]["neighborhood_selection"]
+        self.assertEqual(3, fix_optimize["round_count"])
+        self.assertEqual(3, len(fix_optimize["rounds"]))
+        selection = fix_optimize["rounds"][0]["neighborhood_selection"]
         self.assertEqual(
             selection["policy"],
-            "objective_mass_under_candidate_zone_fraction",
+            "conflict_aware_objective_seed_under_zone_budget",
         )
-        self.assertIn(
-            selection["binding_condition"],
-            {"objective_mass_target", "candidate_zone_budget"},
+        self.assertEqual(
+            {
+                "same_voyage": 0.25,
+                "shared_area": 0.25,
+                "resource_conflict": 0.25,
+                "peak_exchange": 0.25,
+            },
+            selection["conflict_graph"]["component_weights"],
+        )
+        required_round_fields = {
+            "round_id",
+            "seed_group",
+            "selected_groups",
+            "neighborhood_group_count",
+            "candidate_zone_budget",
+            "candidate_zone_count",
+            "objective_before",
+            "local_objective",
+            "master_reoptimized_objective",
+            "objective_after",
+            "absolute_improvement",
+            "relative_improvement",
+            "build_seconds",
+            "local_mip_seconds",
+            "master_reoptimization_seconds",
+            "local_nodes",
+            "local_time_to_first",
+            "local_time_to_best",
+            "improved",
+        }
+        self.assertTrue(
+            all(
+                required_round_fields.issubset(round_values)
+                for round_values in fix_optimize["rounds"]
+            )
         )
         self.assertFalse(
             diagnostics["zone_root_proof_cuts_retained_in_primal_search"]
         )
         self.assertEqual(
-            "integrated_zone_v5_pool_phase2",
+            "integrated_zone_v5_conflict_multiround_phase3",
             diagnostics["algorithm_version"],
         )
         mip_start = diagnostics["mip_start_diagnostics"]
@@ -632,12 +880,17 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             planner,
             "_build_integrality_aware_primal_pool",
             wraps=planner._build_integrality_aware_primal_pool,
-        ) as primal_pool_spy:
+        ) as primal_pool_spy, patch.object(
+            planner,
+            "_build_group_conflict_scores",
+            wraps=planner._build_group_conflict_scores,
+        ) as conflict_graph_spy:
             result = planner.solve_complete_zone_mip()
         diagnostics = result.diagnostics
 
         self.assertEqual(0, v5_generation_spy.call_count)
         self.assertEqual(0, primal_pool_spy.call_count)
+        self.assertEqual(0, conflict_graph_spy.call_count)
         self.assertTrue(diagnostics["independent_solution_validation"]["passed"])
         self.assertEqual(
             "complete_redefined_zone_model",

@@ -245,6 +245,9 @@ def validate_case(
             "primal_pool_columns_by_origin": primal_pool.get(
                 "primal_pool_columns_by_origin", {}
             ),
+            "final_primal_master_columns_by_origin": primal_pool.get(
+                "final_primal_master_columns_by_origin", {}
+            ),
             "primal_pool_mandatory_start_zone_count": primal_pool.get(
                 "mandatory_start_zone_count"
             ),
@@ -359,6 +362,12 @@ def validate_case(
                 "fix_optimize_total_improvement"
             ),
             "fix_optimize_diagnostics": fix_optimize,
+            "fix_optimize_policy": fix_optimize.get("policy"),
+            "fix_optimize_stop_reason": fix_optimize.get("stop_reason"),
+            "fix_optimize_attempted_seed_groups": fix_optimize.get(
+                "attempted_seed_groups", []
+            ),
+            "fix_optimize_rounds": fix_optimize.get("rounds", []),
             "selected_zone_origin_counts": result.diagnostics.get(
                 "zone_selected_origin_counts", {}
             ),

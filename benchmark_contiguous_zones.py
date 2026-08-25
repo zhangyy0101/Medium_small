@@ -79,8 +79,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fix-optimize-zone-fraction", type=float, default=0.35)
     parser.add_argument(
         "--fix-optimize-policy",
-        choices=("disabled", "objective"),
-        default="objective",
+        choices=("disabled", "objective", "conflict_multi_round"),
+        default="conflict_multi_round",
+    )
+    parser.add_argument("--fix-optimize-max-rounds", type=int, default=3)
+    parser.add_argument(
+        "--fix-optimize-round-zone-fractions",
+        type=float,
+        nargs="+",
+        default=(0.12, 0.22, 0.35),
     )
     parser.add_argument("--fill-time-fraction", type=float, default=0.05)
     parser.add_argument(
@@ -145,6 +152,10 @@ def main() -> None:
         fix_optimize_objective_mass=args.fix_optimize_objective_mass,
         fix_optimize_zone_fraction=args.fix_optimize_zone_fraction,
         fix_optimize_policy=args.fix_optimize_policy,
+        fix_optimize_max_rounds=args.fix_optimize_max_rounds,
+        fix_optimize_round_zone_fractions=tuple(
+            args.fix_optimize_round_zone_fractions
+        ),
         fill_time_fraction=args.fill_time_fraction,
         peak_utilization_headroom_fraction=(
             args.peak_utilization_headroom_fraction

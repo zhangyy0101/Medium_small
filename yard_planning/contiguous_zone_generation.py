@@ -27,7 +27,7 @@ from .planner import ColumnGenerationConfig, ColumnGenerationResult
 
 Resource = tuple[str, str]
 StripKey = tuple[str, str, str]
-ALGORITHM_VERSION = "integrated_zone_v5_pool_phase2"
+ALGORITHM_VERSION = "integrated_zone_v5_conflict_multiround_phase3"
 V5_MULTI_START_POLICY = "v5_multi_start"
 COMPLETE_MIP_BASELINE_POLICY = "complete_mip_baseline"
 
@@ -82,7 +82,13 @@ class ContiguousZoneConfig:
     fix_optimize_local_fraction: float = 0.85
     fix_optimize_objective_mass: float = 0.60
     fix_optimize_zone_fraction: float = 0.35
-    fix_optimize_policy: str = "objective"
+    fix_optimize_policy: str = "conflict_multi_round"
+    fix_optimize_max_rounds: int = 3
+    fix_optimize_round_zone_fractions: tuple[float, ...] = (
+        0.12,
+        0.22,
+        0.35,
+    )
     fill_time_fraction: float = 0.05
     max_repaired_start_candidates: int = 8
     mip_start_repair_total_fraction: float = 0.08
@@ -138,10 +144,33 @@ class ContiguousZoneConfig:
         if self.fix_optimize_policy not in {
             "disabled",
             "objective",
+            "conflict_multi_round",
         }:
             raise ValueError(
-                "fix_optimize_policy must be disabled or objective: "
+                "fix_optimize_policy must be disabled, objective, or "
+                "conflict_multi_round: "
                 f"{self.fix_optimize_policy!r}"
+            )
+        if int(self.fix_optimize_max_rounds) <= 0:
+            raise ValueError("fix_optimize_max_rounds must be positive")
+        round_fractions = tuple(
+            float(value) for value in self.fix_optimize_round_zone_fractions
+        )
+        if len(round_fractions) < int(self.fix_optimize_max_rounds):
+            raise ValueError(
+                "fix_optimize_round_zone_fractions must provide one value "
+                "per configured round"
+            )
+        if any(value <= 0.0 or value > 1.0 for value in round_fractions):
+            raise ValueError(
+                "fix_optimize_round_zone_fractions must lie in (0, 1]"
+            )
+        if any(
+            later + 1e-12 < earlier
+            for earlier, later in zip(round_fractions, round_fractions[1:])
+        ):
+            raise ValueError(
+                "fix_optimize_round_zone_fractions must be nondecreasing"
             )
         if not 0.0 < float(self.fill_time_fraction) < 1.0:
             raise ValueError("fill_time_fraction must lie strictly between 0 and 1")
@@ -271,6 +300,10 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         self._atomic_capacity: list[int] = []
         self._atomic_attr_keys: list[tuple[tuple[str, str, str, str], ...]] = []
         self._atomic_resources: list[tuple[Resource, ...]] = []
+        self._candidate_areas_by_group: dict[str, frozenset[str]] = {}
+        self._candidate_resources_by_group: dict[
+            str, frozenset[Resource]
+        ] = {}
         self._zone_objective_scales: dict[str, float] = {}
         self._peak_utilization_policy: dict[str, object] = {}
 
@@ -576,6 +609,28 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                     )
             self._atomic_attr_keys.append(tuple(attr_keys))
             self._atomic_resources.append(tuple(resources))
+
+        candidate_areas_by_group: defaultdict[str, set[str]] = defaultdict(set)
+        candidate_resources_by_group: defaultdict[
+            str, set[Resource]
+        ] = defaultdict(set)
+        for index, column in enumerate(self._columns):
+            candidate_areas_by_group[column.group_id].add(str(column.area_no))
+            candidate_resources_by_group[column.group_id].update(
+                self._atomic_resources[index]
+            )
+        self._candidate_areas_by_group = {
+            group.group_id: frozenset(
+                candidate_areas_by_group[group.group_id]
+            )
+            for group in self.groups
+        }
+        self._candidate_resources_by_group = {
+            group.group_id: frozenset(
+                candidate_resources_by_group[group.group_id]
+            )
+            for group in self.groups
+        }
 
         self._zones = []
         self._zone_id_by_signature.clear()
@@ -4143,24 +4198,22 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "seconds": perf_counter() - started,
         }
 
-    def _objective_fix_optimize_neighborhood(
+    def _objective_contribution_by_group(
         self,
         selected_zone_indices: set[int],
         export_flow: dict[tuple[str, str], int],
-    ) -> tuple[set[str], dict[str, object]]:
-        """Choose a scale-free objective-mass neighborhood under a zone budget."""
+    ) -> dict[str, float]:
+        """Attribute the incumbent objective to groups for seed selection."""
 
         zones_by_group: defaultdict[str, list[int]] = defaultdict(list)
         for zone_index in selected_zone_indices:
             zones_by_group[self._zones[zone_index].group_id].append(zone_index)
-        used_areas: defaultdict[str, set[str]] = defaultdict(set)
         used_areas_by_voyage: defaultdict[str, set[str]] = defaultdict(set)
         flow_cost: Counter[str] = Counter()
         for (group_id, bay_key), quantity in export_flow.items():
             if int(quantity) <= 0:
                 continue
             area_no = self.bays[bay_key].area_no
-            used_areas[group_id].add(area_no)
             used_areas_by_voyage[
                 self.groups_by_id[group_id].voyage_id
             ].add(area_no)
@@ -4194,6 +4247,362 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 + voyage_area_cost,
             )
             contribution_by_group[group_id] = float(contribution)
+        return contribution_by_group
+
+    @staticmethod
+    def _set_jaccard(left: frozenset | set, right: frozenset | set) -> float:
+        union = left | right
+        return len(left & right) / len(union) if union else 0.0
+
+    def _incumbent_area_state(
+        self,
+        export_flow: dict[tuple[str, str], int],
+        import_reserve: dict[tuple[str, str, str], int],
+    ) -> tuple[dict[str, frozenset[str]], dict[str, float], dict[str, float]]:
+        """Return used areas, utilization, and cap-relative pressure."""
+
+        used_areas_by_group: defaultdict[str, set[str]] = defaultdict(set)
+        planned_slot_load_by_area: Counter[str] = Counter()
+        for (group_id, bay_key), quantity in export_flow.items():
+            if int(quantity) <= 0:
+                continue
+            area_no = str(self.bays[bay_key].area_no)
+            used_areas_by_group[group_id].add(area_no)
+            planned_slot_load_by_area[area_no] += (
+                self._container_slot_units(
+                    self.groups_by_id[group_id].size
+                )
+                * int(quantity)
+            )
+        for (area_no, _flow, size), quantity in import_reserve.items():
+            if int(quantity) <= 0:
+                continue
+            planned_slot_load_by_area[str(area_no)] += (
+                self._container_slot_units(size) * int(quantity)
+            )
+        area_capacity = self._peak_utilization_policy["area_capacity"]
+        utilization = {
+            str(area_no): (
+                float(planned_slot_load_by_area.get(str(area_no), 0))
+                / max(1.0, float(capacity))
+            )
+            for area_no, capacity in area_capacity.items()
+        }
+        peak_cap = max(
+            1e-12,
+            float(self._peak_utilization_policy["epsilon_cap"]),
+        )
+        pressure = {
+            area_no: min(1.0, max(0.0, value / peak_cap))
+            for area_no, value in utilization.items()
+        }
+        return (
+            {
+                group.group_id: frozenset(
+                    used_areas_by_group[group.group_id]
+                )
+                for group in self.groups
+            },
+            dict(sorted(utilization.items())),
+            dict(sorted(pressure.items())),
+        )
+
+    def _build_group_conflict_scores(
+        self,
+        selected_zone_indices: set[int],
+        export_flow: dict[tuple[str, str], int],
+        import_reserve: dict[tuple[str, str, str], int],
+    ) -> tuple[
+        dict[tuple[str, str], dict[str, float]],
+        dict[str, object],
+    ]:
+        """Build equal-weight incumbent-aware group coupling scores.
+
+        The four components are normalized independently to [0, 1].  No zone
+        pairs are materialized: candidate reachability comes from atomic row
+        placements prepared before root generation.
+        """
+
+        incumbent_resources: defaultdict[str, set[Resource]] = defaultdict(set)
+        for zone_index in selected_zone_indices:
+            zone = self._zones[zone_index]
+            incumbent_resources[zone.group_id].update(zone.resources)
+        used_areas, utilization, pressure = self._incumbent_area_state(
+            export_flow,
+            import_reserve,
+        )
+        group_ids = sorted(group.group_id for group in self.groups)
+        scores: dict[tuple[str, str], dict[str, float]] = {}
+        component_totals: Counter[str] = Counter()
+        nonzero_pair_count = 0
+        maximum_score = 0.0
+        for left_position, left_id in enumerate(group_ids):
+            left_group = self.groups_by_id[left_id]
+            left_areas = self._candidate_areas_by_group[left_id]
+            left_candidates = self._candidate_resources_by_group[left_id]
+            left_incumbent = frozenset(incumbent_resources[left_id])
+            for right_id in group_ids[left_position + 1 :]:
+                right_group = self.groups_by_id[right_id]
+                right_areas = self._candidate_areas_by_group[right_id]
+                right_candidates = self._candidate_resources_by_group[right_id]
+                right_incumbent = frozenset(incumbent_resources[right_id])
+                same_voyage = float(
+                    left_group.voyage_id == right_group.voyage_id
+                )
+                shared_area = self._set_jaccard(left_areas, right_areas)
+                candidate_resource_overlap = self._set_jaccard(
+                    left_candidates,
+                    right_candidates,
+                )
+                left_release = (
+                    len(left_incumbent & right_candidates)
+                    / len(left_incumbent)
+                    if left_incumbent
+                    else 0.0
+                )
+                right_release = (
+                    len(right_incumbent & left_candidates)
+                    / len(right_incumbent)
+                    if right_incumbent
+                    else 0.0
+                )
+                resource_conflict = max(
+                    candidate_resource_overlap,
+                    left_release,
+                    right_release,
+                )
+                exchange_areas = (
+                    (used_areas[left_id] & right_areas)
+                    | (used_areas[right_id] & left_areas)
+                    | (
+                        left_areas
+                        & right_areas
+                        & (used_areas[left_id] | used_areas[right_id])
+                    )
+                )
+                peak_exchange = max(
+                    (pressure.get(area_no, 0.0) for area_no in exchange_areas),
+                    default=0.0,
+                )
+                components = {
+                    "same_voyage": same_voyage,
+                    "shared_area": float(shared_area),
+                    "resource_conflict": float(resource_conflict),
+                    "peak_exchange": float(peak_exchange),
+                }
+                score = sum(components.values()) / len(components)
+                scores[(left_id, right_id)] = {
+                    **components,
+                    "score": float(score),
+                }
+                for name, value in components.items():
+                    component_totals[name] += float(value)
+                if score > 1e-12:
+                    nonzero_pair_count += 1
+                maximum_score = max(maximum_score, score)
+        pair_count = len(scores)
+        return scores, {
+            "policy": "equal_weight_four_component_group_conflict_graph",
+            "component_names": [
+                "same_voyage",
+                "shared_area",
+                "resource_conflict",
+                "peak_exchange",
+            ],
+            "component_weights": {
+                "same_voyage": 0.25,
+                "shared_area": 0.25,
+                "resource_conflict": 0.25,
+                "peak_exchange": 0.25,
+            },
+            "pair_count": pair_count,
+            "nonzero_pair_count": nonzero_pair_count,
+            "maximum_score": float(maximum_score),
+            "mean_score": (
+                sum(values["score"] for values in scores.values())
+                / pair_count
+                if pair_count
+                else 0.0
+            ),
+            "mean_components": {
+                name: float(component_totals[name]) / pair_count
+                if pair_count
+                else 0.0
+                for name in (
+                    "same_voyage",
+                    "shared_area",
+                    "resource_conflict",
+                    "peak_exchange",
+                )
+            },
+            "incumbent_utilization_by_area": utilization,
+            "incumbent_pressure_by_area": pressure,
+            "full_zone_pair_materialization_used": False,
+        }
+
+    @staticmethod
+    def _conflict_pair_key(left_id: str, right_id: str) -> tuple[str, str]:
+        return tuple(sorted((left_id, right_id)))
+
+    def _select_conflict_fix_optimize_neighborhood(
+        self,
+        selected_zone_indices: set[int],
+        export_flow: dict[tuple[str, str], int],
+        import_reserve: dict[tuple[str, str, str], int],
+        *,
+        round_id: int,
+        candidate_zone_fraction: float,
+        excluded_seed_groups: set[str] | None = None,
+    ) -> tuple[set[str], dict[str, object]]:
+        """Select one seed and its strongest incumbent-aware conflicts."""
+
+        contribution_by_group = self._objective_contribution_by_group(
+            selected_zone_indices,
+            export_flow,
+        )
+        conflict_scores, graph = self._build_group_conflict_scores(
+            selected_zone_indices,
+            export_flow,
+            import_reserve,
+        )
+        candidate_count_by_group = {
+            group.group_id: int(
+                self._possible_zone_count_by_group[group.group_id]
+            )
+            for group in self.groups
+        }
+        objective_ranked = sorted(
+            contribution_by_group,
+            key=lambda group_id: (
+                -contribution_by_group[group_id],
+                candidate_count_by_group[group_id],
+                group_id,
+            ),
+        )
+        excluded = set(excluded_seed_groups or set())
+        available_seeds = [
+            group_id for group_id in objective_ranked if group_id not in excluded
+        ]
+        seed_cycle_reset = not available_seeds and bool(objective_ranked)
+        if seed_cycle_reset:
+            available_seeds = objective_ranked
+        seed_group = available_seeds[0] if available_seeds else None
+        candidate_budget = max(
+            1,
+            int(
+                math.ceil(
+                    float(candidate_zone_fraction)
+                    * max(1, int(self._possible_zone_count))
+                )
+            ),
+        )
+        if seed_group is None:
+            return set(), {
+                "policy": "conflict_aware_objective_seed_under_zone_budget",
+                "round_id": int(round_id),
+                "seed_group": None,
+                "selected_groups": [],
+                "selected_group_count": 0,
+                "candidate_zone_fraction": float(candidate_zone_fraction),
+                "candidate_zone_budget": candidate_budget,
+                "selected_candidate_zone_count": 0,
+                "conflict_graph": graph,
+            }
+        selected = [seed_group]
+        selected_set = {seed_group}
+        selected_candidate_count = candidate_count_by_group[seed_group]
+        selected_links = []
+        while len(selected_set) < len(objective_ranked):
+            ranked_candidates = []
+            for group_id in objective_ranked:
+                if group_id in selected_set:
+                    continue
+                if (
+                    selected_candidate_count
+                    + candidate_count_by_group[group_id]
+                    > candidate_budget
+                ):
+                    continue
+                best_anchor = None
+                best_score = -1.0
+                best_components = None
+                for anchor in selected:
+                    values = conflict_scores[
+                        self._conflict_pair_key(group_id, anchor)
+                    ]
+                    if (
+                        values["score"] > best_score + 1e-12
+                        or (
+                            abs(values["score"] - best_score) <= 1e-12
+                            and (best_anchor is None or anchor < best_anchor)
+                        )
+                    ):
+                        best_anchor = anchor
+                        best_score = float(values["score"])
+                        best_components = values
+                ranked_candidates.append(
+                    (
+                        -best_score,
+                        -contribution_by_group[group_id],
+                        candidate_count_by_group[group_id],
+                        group_id,
+                        best_anchor,
+                        best_components,
+                    )
+                )
+            if not ranked_candidates:
+                break
+            (
+                _negative_score,
+                _negative_contribution,
+                candidate_count,
+                group_id,
+                anchor,
+                components,
+            ) = min(ranked_candidates)
+            selected.append(group_id)
+            selected_set.add(group_id)
+            selected_candidate_count += candidate_count
+            selected_links.append(
+                {
+                    "group_id": group_id,
+                    "anchor_group": anchor,
+                    **dict(components or {}),
+                }
+            )
+        return selected_set, {
+            "policy": "conflict_aware_objective_seed_under_zone_budget",
+            "round_id": int(round_id),
+            "seed_group": seed_group,
+            "seed_contribution": float(contribution_by_group[seed_group]),
+            "seed_cycle_reset": seed_cycle_reset,
+            "excluded_seed_groups": sorted(excluded),
+            "selected_groups": list(selected),
+            "selected_group_count": len(selected),
+            "candidate_zone_fraction": float(candidate_zone_fraction),
+            "candidate_zone_budget": candidate_budget,
+            "selected_candidate_zone_count": selected_candidate_count,
+            "candidate_budget_exceeded_by_seed": (
+                candidate_count_by_group[seed_group] > candidate_budget
+            ),
+            "selected_conflict_links": selected_links,
+            "objective_contribution_by_group": dict(
+                sorted(contribution_by_group.items())
+            ),
+            "conflict_graph": graph,
+        }
+
+    def _objective_fix_optimize_neighborhood(
+        self,
+        selected_zone_indices: set[int],
+        export_flow: dict[tuple[str, str], int],
+    ) -> tuple[set[str], dict[str, object]]:
+        """Legacy objective-only neighborhood retained only for ablation."""
+
+        contribution_by_group = self._objective_contribution_by_group(
+            selected_zone_indices,
+            export_flow,
+        )
 
         candidate_count_by_group = {
             group.group_id: int(
@@ -4295,6 +4704,10 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         export_flow: dict[tuple[str, str], int],
         import_reserve: dict[tuple[str, str, str], int],
         deadline: float,
+        *,
+        neighborhood: set[str] | None = None,
+        neighborhood_selection: dict[str, object] | None = None,
+        progress_phase: str = "fix_optimize_local_mip",
     ) -> tuple[
         set[int],
         dict[tuple[str, str], int],
@@ -4303,14 +4716,21 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
     ]:
         """Jointly reopen complete zones for the objective neighborhood."""
 
-        remaining = deadline - perf_counter()
+        started = perf_counter()
+        remaining = deadline - started
         if remaining <= 1e-6:
-            return set(), {}, {}, {"status": "time_limit_before_fix_optimize"}
-        neighborhood, neighborhood_selection = (
-            self._objective_fix_optimize_neighborhood(
-                selected_zone_indices, export_flow
+            return set(), {}, {}, {
+                "status": "time_limit_before_fix_optimize",
+                "build_seconds": 0.0,
+                "local_mip_seconds": 0.0,
+                "seconds": 0.0,
+            }
+        if neighborhood is None or neighborhood_selection is None:
+            neighborhood, neighborhood_selection = (
+                self._objective_fix_optimize_neighborhood(
+                    selected_zone_indices, export_flow
+                )
             )
-        )
         materialized_before = len(self._zones)
         for group_id in sorted(neighborhood):
             for strip_key, signature in self._iter_zone_signatures(group_id):
@@ -4380,6 +4800,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 variable.Start = float(import_reserve.get(key, 0))
                 variable.VType = "I"
             model.update()
+            build_seconds = perf_counter() - started
             remaining = deadline - perf_counter()
             if remaining <= 1e-6:
                 return set(), {}, {}, {
@@ -4391,13 +4812,16 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                     "active_zone_count": len(active_zone_indices),
                     "materialized_zone_count": len(self._zones)
                     - materialized_before,
+                    "build_seconds": build_seconds,
+                    "local_mip_seconds": 0.0,
+                    "seconds": perf_counter() - started,
                 }
             self._set_gurobi_param(model, "TimeLimit", max(0.01, remaining))
             self._set_gurobi_param(model, "MIPGap", 0.0)
             self._set_gurobi_param(model, "MIPFocus", 1)
             self._set_gurobi_param(model, "Heuristics", 0.30)
             progress_recorder = MipProgressRecorder(
-                phase="fix_optimize_local_mip"
+                phase=progress_phase
             )
             model.optimize(progress_recorder)
             progress = self._finalize_mip_progress(progress_recorder, model)
@@ -4411,6 +4835,11 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                     "neighborhood_selection": neighborhood_selection,
                     "active_zone_count": len(active_zone_indices),
                     "mip_progress": progress,
+                    "build_seconds": build_seconds,
+                    "local_mip_seconds": float(
+                        progress.get("wall_seconds", 0.0)
+                    ),
+                    "seconds": perf_counter() - started,
                 }
             selected = {
                 index
@@ -4449,6 +4878,11 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 "positive_export_flow_count": len(flow),
                 "positive_import_reservation_count": len(imports),
                 "mip_progress": progress,
+                "build_seconds": build_seconds,
+                "local_mip_seconds": float(
+                    progress.get("wall_seconds", 0.0)
+                ),
+                "seconds": perf_counter() - started,
             }
         finally:
             self._free_gurobi_model(model)
@@ -4461,13 +4895,14 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         incumbent_export_flow: dict[tuple[str, str], int],
         incumbent_import_reserve: dict[tuple[str, str, str], int],
         deadline: float,
+        zone_provenance: defaultdict[int, set[str]] | None = None,
     ) -> tuple[
         set[int],
         dict[tuple[str, str], int],
         dict[tuple[str, str, str], int],
         dict[str, object],
     ]:
-        """Feed an exact objective-neighborhood solution back into the zone RMP."""
+        """Run conflict-aware adaptive F&O without changing the master model."""
 
         started = perf_counter()
         incumbent_certificate = self._zone_objective_certificate(
@@ -4476,9 +4911,158 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             incumbent_import_reserve,
             self._gurobi_objective_value(model),
         )
-        incumbent_objective = float(incumbent_certificate["objective"])
+        initial_objective = float(incumbent_certificate["objective"])
+        current_zones = set(incumbent_zones)
+        current_flow = dict(incumbent_export_flow)
+        current_import = dict(incumbent_import_reserve)
+        current_objective = initial_objective
+        unsuccessful_seeds: set[str] = set()
+        attempted_seeds: list[str] = []
+        rounds: list[dict[str, object]] = []
+        if self.zone_config.fix_optimize_policy == "objective":
+            max_rounds = 1
+            round_fractions = (float(self.zone_config.fix_optimize_zone_fraction),)
+        else:
+            max_rounds = int(self.zone_config.fix_optimize_max_rounds)
+            round_fractions = tuple(
+                float(value)
+                for value in self.zone_config.fix_optimize_round_zone_fractions[
+                    :max_rounds
+                ]
+            )
+        stop_reason = "max_rounds"
+        for round_offset in range(max_rounds):
+            round_id = round_offset + 1
+            remaining = deadline - perf_counter()
+            if remaining <= 1e-6:
+                stop_reason = "time_limit_before_round"
+                break
+            remaining_rounds = max_rounds - round_offset
+            outer_deadline = min(
+                deadline,
+                perf_counter() + remaining / remaining_rounds,
+            )
+            selection_started = perf_counter()
+            if self.zone_config.fix_optimize_policy == "objective":
+                neighborhood, selection = (
+                    self._objective_fix_optimize_neighborhood(
+                        current_zones,
+                        current_flow,
+                    )
+                )
+                selection = {
+                    **selection,
+                    "round_id": round_id,
+                    "seed_group": (
+                        selection.get("selected_groups", [None])[0]
+                        if selection.get("selected_groups")
+                        else None
+                    ),
+                }
+            else:
+                neighborhood, selection = (
+                    self._select_conflict_fix_optimize_neighborhood(
+                        current_zones,
+                        current_flow,
+                        current_import,
+                        round_id=round_id,
+                        candidate_zone_fraction=round_fractions[round_offset],
+                        excluded_seed_groups=unsuccessful_seeds,
+                    )
+                )
+            selection_seconds = perf_counter() - selection_started
+            seed_group = selection.get("seed_group")
+            if seed_group is not None:
+                attempted_seeds.append(str(seed_group))
+            if not neighborhood:
+                stop_reason = "no_neighborhood"
+                break
+            (
+                next_zones,
+                next_flow,
+                next_import,
+                round_diagnostics,
+            ) = self._run_fix_optimize_round(
+                model,
+                variables,
+                current_zones,
+                current_flow,
+                current_import,
+                current_objective,
+                round_id=round_id,
+                neighborhood=neighborhood,
+                neighborhood_selection=selection,
+                selection_seconds=selection_seconds,
+                deadline=outer_deadline,
+                zone_provenance=zone_provenance,
+            )
+            rounds.append(round_diagnostics)
+            current_zones = next_zones
+            current_flow = next_flow
+            current_import = next_import
+            current_objective = float(
+                round_diagnostics["objective_after"]
+            )
+            if round_diagnostics["improved"]:
+                unsuccessful_seeds.clear()
+            elif seed_group is not None:
+                unsuccessful_seeds.add(str(seed_group))
+        if len(rounds) < max_rounds and stop_reason == "max_rounds":
+            stop_reason = "time_limit"
+        absolute_improvement = max(0.0, initial_objective - current_objective)
+        return current_zones, current_flow, current_import, {
+            "status": (
+                "completed" if stop_reason == "max_rounds" else stop_reason
+            ),
+            "policy": self.zone_config.fix_optimize_policy,
+            "initial_objective": initial_objective,
+            "final_objective": current_objective,
+            "rounds": rounds,
+            "round_count": len(rounds),
+            "successful_round_count": sum(
+                bool(values.get("improved")) for values in rounds
+            ),
+            "attempted_seed_groups": attempted_seeds,
+            "unsuccessful_seed_groups_at_end": sorted(unsuccessful_seeds),
+            "round_zone_fractions": list(round_fractions),
+            "stop_reason": stop_reason,
+            "added_zone_count": sum(
+                int(values.get("added_zone_count", 0)) for values in rounds
+            ),
+            "improved": absolute_improvement > 1e-9,
+            "absolute_improvement": absolute_improvement,
+            "relative_improvement": absolute_improvement
+            / max(abs(initial_objective), 1e-12),
+            "seconds": perf_counter() - started,
+        }
+
+    def _run_fix_optimize_round(
+        self,
+        model,
+        variables: dict,
+        incumbent_zones: set[int],
+        incumbent_export_flow: dict[tuple[str, str], int],
+        incumbent_import_reserve: dict[tuple[str, str, str], int],
+        incumbent_objective: float,
+        *,
+        round_id: int,
+        neighborhood: set[str],
+        neighborhood_selection: dict[str, object],
+        selection_seconds: float,
+        deadline: float,
+        zone_provenance: defaultdict[int, set[str]] | None,
+    ) -> tuple[
+        set[int],
+        dict[tuple[str, str], int],
+        dict[tuple[str, str, str], int],
+        dict[str, object],
+    ]:
+        """Solve one local neighborhood and feed its used columns to master."""
+
+        started = perf_counter()
         local_deadline = perf_counter() + max(
-            0.0, deadline - perf_counter()
+            0.0,
+            deadline - perf_counter(),
         ) * float(self.zone_config.fix_optimize_local_fraction)
         local_zones, local_flow, local_import, local = (
             self._solve_objective_fix_optimize_subproblem(
@@ -4486,188 +5070,196 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 incumbent_export_flow,
                 incumbent_import_reserve,
                 local_deadline,
+                neighborhood=set(neighborhood),
+                neighborhood_selection=neighborhood_selection,
+                progress_phase=f"fix_optimize_round_{round_id}_local_mip",
             )
         )
-        if not local_zones:
-            return (
-                incumbent_zones,
-                incumbent_export_flow,
-                incumbent_import_reserve,
-                {
-                    "status": "local_subproblem_has_no_solution",
-                    "initial_objective": incumbent_objective,
-                    "local": local,
-                    "added_zone_count": 0,
-                    "improved": False,
-                    "seconds": perf_counter() - started,
-                },
-            )
-        added = 0
-        for zone_index in sorted(local_zones):
-            if zone_index not in variables["active_zone_indices"]:
-                variable = self._add_zone_variable(model, variables, zone_index)
-                variable.VType = "B"
-                added += 1
-        use_local_start = float(local["objective"]) <= incumbent_objective + 1e-9
+        local_objective = (
+            float(local["objective"]) if local_zones else None
+        )
+        added_indices: list[int] = []
+        if local_zones:
+            for zone_index in sorted(local_zones):
+                if zone_provenance is not None:
+                    zone_provenance[zone_index].add(
+                        f"fix_opt_round_{round_id}"
+                    )
+                if zone_index not in variables["active_zone_indices"]:
+                    variable = self._add_zone_variable(
+                        model,
+                        variables,
+                        zone_index,
+                    )
+                    variable.VType = "B"
+                    added_indices.append(zone_index)
+        use_local_start = (
+            local_objective is not None
+            and local_objective <= incumbent_objective + 1e-9
+        )
         start_zones = local_zones if use_local_start else incumbent_zones
         start_flow = local_flow if use_local_start else incumbent_export_flow
         start_import = (
             local_import if use_local_start else incumbent_import_reserve
         )
+        if local_zones:
+            self._apply_zone_master_start(
+                variables,
+                start_zones,
+                start_flow,
+                start_import,
+            )
+            model.update()
+        best_zones = set(incumbent_zones)
+        best_flow = dict(incumbent_export_flow)
+        best_import = dict(incumbent_import_reserve)
+        best_objective = float(incumbent_objective)
+        if local_objective is not None and local_objective < best_objective - 1e-9:
+            best_zones = set(local_zones)
+            best_flow = dict(local_flow)
+            best_import = dict(local_import)
+            best_objective = local_objective
+        master_diagnostics: dict[str, object] = {
+            "status": "not_run",
+            "mip_progress": None,
+            "seconds": 0.0,
+        }
+        remaining = deadline - perf_counter()
+        if local_zones and remaining > 1e-6:
+            self._set_gurobi_param(model, "TimeLimit", max(0.01, remaining))
+            recorder = MipProgressRecorder(
+                phase=f"fix_optimize_round_{round_id}_master_reoptimization"
+            )
+            master_started = perf_counter()
+            model.optimize(recorder)
+            progress = self._finalize_mip_progress(recorder, model)
+            master_seconds = perf_counter() - master_started
+            master_status = self._gurobi_status_name(model)
+            master_diagnostics = {
+                "status": master_status,
+                "mip_progress": progress,
+                "seconds": master_seconds,
+            }
+            if self._gurobi_solution_count(model) > 0:
+                candidate_zones = {
+                    index
+                    for index, variable in variables["zone"].items()
+                    if self._gurobi_value(model, variable) > 0.5
+                }
+                candidate_flow = {
+                    key: int(round(self._gurobi_value(model, variable)))
+                    for key, variable in variables["export_flow"].items()
+                    if self._gurobi_value(model, variable) > 1e-7
+                }
+                candidate_import = {
+                    key: int(round(self._gurobi_value(model, variable)))
+                    for key, variable in variables["import_reserve"].items()
+                    if self._gurobi_value(model, variable) > 1e-7
+                }
+                certificate = self._zone_objective_certificate(
+                    candidate_zones,
+                    candidate_flow,
+                    candidate_import,
+                    self._gurobi_objective_value(model),
+                )
+                candidate_objective = float(certificate["objective"])
+                master_diagnostics["objective"] = candidate_objective
+                if candidate_objective < best_objective - 1e-9:
+                    best_zones = candidate_zones
+                    best_flow = candidate_flow
+                    best_import = candidate_import
+                    best_objective = candidate_objective
+        elif local_zones:
+            master_diagnostics["status"] = (
+                "time_limit_before_master_reoptimization"
+            )
+        absolute_improvement = max(0.0, incumbent_objective - best_objective)
+        local_progress = local.get("mip_progress", {})
+        round_diagnostics = {
+            "round_id": int(round_id),
+            "seed_group": neighborhood_selection.get("seed_group"),
+            "selected_groups": list(
+                neighborhood_selection.get(
+                    "selected_groups", sorted(neighborhood)
+                )
+            ),
+            "neighborhood_group_count": len(neighborhood),
+            "candidate_zone_budget": neighborhood_selection.get(
+                "candidate_zone_budget"
+            ),
+            "candidate_zone_count": neighborhood_selection.get(
+                "selected_candidate_zone_count"
+            ),
+            "objective_before": float(incumbent_objective),
+            "local_objective": local_objective,
+            "master_reoptimized_objective": master_diagnostics.get(
+                "objective"
+            ),
+            "objective_after": float(best_objective),
+            "absolute_improvement": absolute_improvement,
+            "relative_improvement": absolute_improvement
+            / max(abs(incumbent_objective), 1e-12),
+            "selection_seconds": float(selection_seconds),
+            "build_seconds": float(local.get("build_seconds", 0.0)),
+            "local_mip_seconds": float(
+                local.get("local_mip_seconds", 0.0)
+            ),
+            "master_reoptimization_seconds": float(
+                master_diagnostics.get("seconds", 0.0)
+            ),
+            "local_nodes": float(local_progress.get("node_count", 0.0)),
+            "local_time_to_first": local_progress.get(
+                "time_to_first_solution"
+            ),
+            "local_time_to_best": local_progress.get(
+                "time_to_best_solution"
+            ),
+            "added_zone_count": len(added_indices),
+            "added_zone_indices": added_indices,
+            "improved": absolute_improvement > 1e-9,
+            "neighborhood_selection": neighborhood_selection,
+            "local": local,
+            "master_reoptimization": master_diagnostics,
+            "seconds": perf_counter() - started,
+        }
+        return best_zones, best_flow, best_import, round_diagnostics
+
+    def _apply_zone_master_start(
+        self,
+        variables: dict,
+        selected_zones: set[int],
+        export_flow: dict[tuple[str, str], int],
+        import_reserve: dict[tuple[str, str, str], int],
+    ) -> None:
+        """Apply one certified incumbent as a native master MIP start."""
+
         for zone_index, variable in variables["zone"].items():
-            variable.Start = 1.0 if zone_index in start_zones else 0.0
+            variable.Start = 1.0 if zone_index in selected_zones else 0.0
         for key, variable in variables["export_flow"].items():
-            variable.Start = float(start_flow.get(key, 0))
+            variable.Start = float(export_flow.get(key, 0))
         for key, variable in variables["import_reserve"].items():
-            variable.Start = float(start_import.get(key, 0))
+            variable.Start = float(import_reserve.get(key, 0))
         used_areas = {
             (group_id, self.bays[bay_key].area_no)
-            for (group_id, bay_key), quantity in start_flow.items()
+            for (group_id, bay_key), quantity in export_flow.items()
             if int(quantity) > 0
         }
         for key, variable in variables["area_use"].items():
             variable.Start = 1.0 if key in used_areas else 0.0
         used_voyage_areas = {
-            (
-                self.groups_by_id[group_id].voyage_id,
-                area_no,
-            )
+            (self.groups_by_id[group_id].voyage_id, area_no)
             for group_id, area_no in used_areas
         }
         for key, variable in variables["voyage_area_use"].items():
             variable.Start = 1.0 if key in used_voyage_areas else 0.0
         used_attributes = {
             key
-            for zone_index in start_zones
+            for zone_index in selected_zones
             for key, value in self._zones[zone_index].bay_attr_uses
             if value > 0
         }
         for key, variable in variables["attr_state"].items():
             variable.Start = 1.0 if key in used_attributes else 0.0
-        model.update()
-        remaining = deadline - perf_counter()
-        if remaining <= 1e-6:
-            local_objective = float(local["objective"])
-            candidate_zones = local_zones if use_local_start else incumbent_zones
-            candidate_flow = local_flow if use_local_start else incumbent_export_flow
-            candidate_import = (
-                local_import if use_local_start else incumbent_import_reserve
-            )
-            return candidate_zones, candidate_flow, candidate_import, {
-                "status": "time_limit_before_master_reoptimization",
-                "initial_objective": incumbent_objective,
-                "local": local,
-                "added_zone_count": added,
-                "improved": use_local_start
-                and local_objective < incumbent_objective - 1e-9,
-                "absolute_improvement": max(
-                    0.0, incumbent_objective - local_objective
-                )
-                if use_local_start
-                else 0.0,
-                "relative_improvement": max(
-                    0.0, incumbent_objective - local_objective
-                )
-                / max(abs(incumbent_objective), 1e-12)
-                if use_local_start
-                else 0.0,
-                "final_objective": (
-                    local_objective
-                    if use_local_start
-                    else incumbent_objective
-                ),
-                "seconds": perf_counter() - started,
-            }
-        self._set_gurobi_param(model, "TimeLimit", max(0.01, remaining))
-        progress_recorder = MipProgressRecorder(
-            phase="final_primal_master_reoptimization"
-        )
-        model.optimize(progress_recorder)
-        progress = self._finalize_mip_progress(progress_recorder, model)
-        status = self._gurobi_status_name(model)
-        if self._gurobi_solution_count(model) <= 0:
-            local_improves = (
-                float(local["objective"]) < incumbent_objective - 1e-9
-            )
-            return (
-                local_zones if local_improves else incumbent_zones,
-                local_flow if local_improves else incumbent_export_flow,
-                local_import if local_improves else incumbent_import_reserve,
-                {
-                    "status": status,
-                    "initial_objective": incumbent_objective,
-                    "local": local,
-                    "added_zone_count": added,
-                    "improved": local_improves,
-                    "master_reoptimization": {
-                        "status": status,
-                        "mip_progress": progress,
-                    },
-                    "final_objective": (
-                        float(local["objective"])
-                        if local_improves
-                        else incumbent_objective
-                    ),
-                    "seconds": perf_counter() - started,
-                },
-            )
-        candidate_zones = {
-            index
-            for index, variable in variables["zone"].items()
-            if self._gurobi_value(model, variable) > 0.5
-        }
-        candidate_flow = {
-            key: int(round(self._gurobi_value(model, variable)))
-            for key, variable in variables["export_flow"].items()
-            if self._gurobi_value(model, variable) > 1e-7
-        }
-        candidate_import = {
-            key: int(round(self._gurobi_value(model, variable)))
-            for key, variable in variables["import_reserve"].items()
-            if self._gurobi_value(model, variable) > 1e-7
-        }
-        candidate_certificate = self._zone_objective_certificate(
-            candidate_zones,
-            candidate_flow,
-            candidate_import,
-            self._gurobi_objective_value(model),
-        )
-        candidate_objective = float(candidate_certificate["objective"])
-        best_zones = incumbent_zones
-        best_flow = incumbent_export_flow
-        best_import = incumbent_import_reserve
-        best_objective = incumbent_objective
-        if float(local["objective"]) < best_objective - 1e-9:
-            best_zones = local_zones
-            best_flow = local_flow
-            best_import = local_import
-            best_objective = float(local["objective"])
-        if candidate_objective < best_objective - 1e-9:
-            best_zones = candidate_zones
-            best_flow = candidate_flow
-            best_import = candidate_import
-            best_objective = candidate_objective
-        return best_zones, best_flow, best_import, {
-            "status": status,
-            "initial_objective": incumbent_objective,
-            "local": local,
-            "added_zone_count": added,
-            "master_reoptimization": {
-                "status": status,
-                "objective": self._gurobi_objective_value(model),
-                "mip_progress": progress,
-            },
-            "improved": best_objective < incumbent_objective - 1e-9,
-            "absolute_improvement": max(
-                0.0, incumbent_objective - best_objective
-            ),
-            "relative_improvement": max(
-                0.0, incumbent_objective - best_objective
-            )
-            / max(abs(incumbent_objective), 1e-12),
-            "final_objective": best_objective,
-            "seconds": perf_counter() - started,
-        }
 
     def _construct_zone_row_realization(
         self,
@@ -5161,6 +5753,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 selected_import_reserve = initial_import_reserve
                 fix_optimize = {
                     "status": "disabled",
+                    "policy": "disabled",
                     "initial_objective": float(
                         zone_mip_initial["objective"]
                     ),
@@ -5171,6 +5764,9 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                     "improved": False,
                     "absolute_improvement": 0.0,
                     "relative_improvement": 0.0,
+                    "rounds": [],
+                    "round_count": 0,
+                    "successful_round_count": 0,
                     "seconds": 0.0,
                 }
             else:
@@ -5186,17 +5782,28 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                     initial_export_flow,
                     initial_import_reserve,
                     deadline - fill_reserve,
+                    zone_provenance,
                 )
             final_primal_pool_indices = set(variables["active_zone_indices"])
-            for zone_index in (
-                final_primal_pool_indices - primal_pool_indices
-            ):
-                zone_provenance[zone_index].add(
-                    "single_round_fix_optimize"
-                )
             primal_pool_diagnostics["final_primal_master_zone_count"] = len(
                 final_primal_pool_indices
             )
+            final_pool_origins = sorted(
+                {
+                    origin
+                    for zone_index in final_primal_pool_indices
+                    for origin in zone_provenance[zone_index]
+                }
+            )
+            primal_pool_diagnostics[
+                "final_primal_master_columns_by_origin"
+            ] = {
+                origin: sum(
+                    origin in zone_provenance[zone_index]
+                    for zone_index in final_primal_pool_indices
+                )
+                for origin in final_pool_origins
+            }
             zone_mip = zone_mip_initial
         finally:
             self._free_gurobi_model(model)
@@ -5241,29 +5848,35 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         primal_pool_diagnostics["final_selected_zones_by_origin"] = dict(
             sorted(selected_zone_origin_counts.items())
         )
-        local_progress = fix_optimize.get("local", {}).get("mip_progress")
-        final_master_progress = fix_optimize.get("master_reoptimization", {}).get(
-            "mip_progress"
-        )
+        fix_optimize_progresses = []
+        for round_diagnostics in fix_optimize.get("rounds", []):
+            fix_optimize_progresses.extend(
+                [
+                    round_diagnostics.get("local", {}).get("mip_progress"),
+                    round_diagnostics.get("master_reoptimization", {}).get(
+                        "mip_progress"
+                    ),
+                ]
+            )
         mip_anytime = self._aggregate_mip_progress(
             [
                 zone_mip_initial.get("mip_progress"),
-                local_progress,
-                final_master_progress,
+                *fix_optimize_progresses,
             ]
         )
         fix_improvement = float(fix_optimize.get("absolute_improvement", 0.0))
         diagnostics = {
             "algorithm": (
                 "exact_proof_cg_diversified_primal_pool_"
-                "objective_fix_optimize_with_exact_recourse"
+                "conflict_aware_multiround_fix_optimize_with_exact_recourse"
             ),
             "algorithm_version": ALGORITHM_VERSION,
             "model_scope": "actual_quantity_flow_on_dedicated_contiguous_row_zones",
             "formulation": "zone_flow_master_plus_flow_fixed_exact_row_recourse",
             "decomposition": (
                 "exact_rmq_proof_master_snapshot_diversified_primal_"
-                "master_objective_fix_optimize_then_certified_row_realization"
+                "master_conflict_aware_multiround_fix_optimize_then_"
+                "certified_row_realization"
             ),
             "planned_group_count": len(self.groups),
             "planned_box_count": sum(group.demand for group in self.groups),
@@ -5305,11 +5918,11 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "zone_fix_optimize": fix_optimize,
             "mip_anytime": mip_anytime,
             "mip_start_diagnostics": zone_mip_initial.get("mip_start", {}),
-            "fix_optimize_round_count": (
-                0 if self.zone_config.fix_optimize_policy == "disabled" else 1
+            "fix_optimize_round_count": int(
+                fix_optimize.get("round_count", 0)
             ),
             "fix_optimize_success_count": int(
-                bool(fix_optimize.get("improved"))
+                fix_optimize.get("successful_round_count", 0)
             ),
             "fix_optimize_total_improvement": fix_improvement,
             "zone_model_upper_bound": zone_upper_bound,
@@ -5347,6 +5960,12 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 ),
                 "fix_optimize_group_policy": (
                     self.zone_config.fix_optimize_policy
+                ),
+                "fix_optimize_max_rounds": int(
+                    self.zone_config.fix_optimize_max_rounds
+                ),
+                "fix_optimize_round_zone_fractions": list(
+                    self.zone_config.fix_optimize_round_zone_fractions
                 ),
                 "final_fill_total_fraction": float(
                     self.zone_config.fill_time_fraction
