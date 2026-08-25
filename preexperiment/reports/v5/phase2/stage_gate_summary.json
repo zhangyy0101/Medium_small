@@ -97,6 +97,17 @@
     "pool_scalability_48_96": "PASS",
     "correctness": "PASS"
   },
-  "next_phase_recommendation": "implement_and_evaluate_conflict_aware_multi_round_fix_and_optimize",
+  "next_phase_recommendation": "stop_phase2_after_confirmed_oracle_coverage_failure",
+  "oracle_coverage_audit": {
+    "status": "CONFIRMED",
+    "final_master_oracle_coverage_fractions": {
+      "pilot_l_301": 0.49122807017543857,
+      "scale_g048_s601": 0.40186915887850466,
+      "scale_g096_s801": 0.47368421052631576
+    },
+    "oracle_addback_all_optimal": true,
+    "production_algorithm_modified": false,
+    "phase2_disposition": "closed"
+  },
   "phase2_stopped_before_prohibited_features": true
 }

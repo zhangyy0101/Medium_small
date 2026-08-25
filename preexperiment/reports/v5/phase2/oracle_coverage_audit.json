@@ -1,0 +1,145 @@
+{
+  "audit": "phase2_oracle_coverage",
+  "date": "2026-08-25",
+  "status": "CONFIRMED",
+  "question": "Did Phase 2 prune columns required by known better integer combinations?",
+  "answer": "yes",
+  "method": {
+    "oracle_source": "independent deterministic Phase 1.1 rerun with exact selected zone signatures captured",
+    "signature_key": [
+      "group_id",
+      "area_no",
+      "row_no",
+      "candidate_indices"
+    ],
+    "coverage_stages": [
+      "phase2 diversified base pool",
+      "phase2 pool after mandatory repaired-start columns",
+      "phase2 final master after existing single-round F&O"
+    ],
+    "addback_test": "add only missing oracle signatures, fix the certified oracle decisions, solve the unchanged current master to optimality",
+    "threads": 1,
+    "python_hash_seed": "0",
+    "production_algorithm_modified": false,
+    "multi_round_fix_and_optimize_executed": false
+  },
+  "interpretation_limit": "The audit proves that pruning removes known better feasible supports and is sufficient to explain the observed regression. It does not prove that every omitted oracle column is individually necessary or unique.",
+  "cases": [
+    {
+      "case_id": "pilot_l_301",
+      "groups": 24,
+      "oracle": {
+        "upper_bound": 0.13715061251574973,
+        "archived_phase1_1_upper_bound": 0.13371394428479183,
+        "zone_count": 57
+      },
+      "phase2_audit_run": {
+        "upper_bound": 0.13864872126056085,
+        "phase2_ub_worse_than_oracle_fraction": 0.010923091901168913,
+        "base_pool_zone_count": 975,
+        "primal_pool_zone_count": 994,
+        "final_master_zone_count": 1006
+      },
+      "coverage": {
+        "base_pool": {"covered": 27, "fraction": 0.47368421052631576},
+        "after_mandatory": {"covered": 28, "fraction": 0.49122807017543857},
+        "final_master": {"covered": 28, "fraction": 0.49122807017543857},
+        "fully_covered_groups": 9,
+        "zero_covered_groups": 7,
+        "missing_zone_count": 29,
+        "missing_group_count": 15,
+        "missing_groups_inside_single_round_fo": 7,
+        "missing_groups_outside_single_round_fo": 8,
+        "phase2_final_selected_overlap": 7
+      },
+      "oracle_addback": {
+        "status": "optimal",
+        "added_missing_zone_count": 29,
+        "combined_master_zone_count": 1035,
+        "objective": 0.13715061251574978,
+        "absolute_difference_from_oracle": 5.551115123125783e-17,
+        "seconds": 0.040052834010566585
+      }
+    },
+    {
+      "case_id": "scale_g048_s601",
+      "groups": 48,
+      "oracle": {
+        "upper_bound": 0.13928921742826503,
+        "archived_phase1_1_upper_bound": 0.13931046747007203,
+        "zone_count": 107
+      },
+      "phase2_audit_run": {
+        "upper_bound": 0.14182407472464809,
+        "phase2_ub_worse_than_oracle_fraction": 0.018198517754531407,
+        "base_pool_zone_count": 1947,
+        "primal_pool_zone_count": 2111,
+        "final_master_zone_count": 2145
+      },
+      "coverage": {
+        "base_pool": {"covered": 35, "fraction": 0.32710280373831774},
+        "after_mandatory": {"covered": 42, "fraction": 0.3925233644859813},
+        "final_master": {"covered": 43, "fraction": 0.40186915887850466},
+        "fully_covered_groups": 10,
+        "zero_covered_groups": 17,
+        "missing_zone_count": 64,
+        "missing_group_count": 38,
+        "missing_groups_inside_single_round_fo": 13,
+        "missing_groups_outside_single_round_fo": 25,
+        "phase2_final_selected_overlap": 10
+      },
+      "oracle_addback": {
+        "status": "optimal",
+        "added_missing_zone_count": 64,
+        "combined_master_zone_count": 2209,
+        "objective": 0.13928921742826497,
+        "absolute_difference_from_oracle": 5.551115123125783e-17,
+        "seconds": 0.07683220799663104
+      }
+    },
+    {
+      "case_id": "scale_g096_s801",
+      "groups": 96,
+      "oracle": {
+        "upper_bound": 0.16968086460781448,
+        "archived_phase1_1_upper_bound": 0.168837081630008,
+        "zone_count": 266
+      },
+      "phase2_audit_run": {
+        "upper_bound": 0.17032165576584077,
+        "phase2_ub_worse_than_oracle_fraction": 0.0037764491565230873,
+        "base_pool_zone_count": 3894,
+        "primal_pool_zone_count": 4620,
+        "final_master_zone_count": 4696
+      },
+      "coverage": {
+        "base_pool": {"covered": 69, "fraction": 0.2593984962406015},
+        "after_mandatory": {"covered": 125, "fraction": 0.4699248120300752},
+        "final_master": {"covered": 126, "fraction": 0.47368421052631576},
+        "fully_covered_groups": 33,
+        "zero_covered_groups": 15,
+        "missing_zone_count": 140,
+        "missing_group_count": 63,
+        "missing_groups_inside_single_round_fo": 24,
+        "missing_groups_outside_single_round_fo": 39,
+        "phase2_final_selected_overlap": 49
+      },
+      "oracle_addback": {
+        "status": "optimal",
+        "added_missing_zone_count": 140,
+        "combined_master_zone_count": 4836,
+        "objective": 0.1696808646078147,
+        "absolute_difference_from_oracle": 2.220446049250313e-16,
+        "seconds": 0.14510374999372289
+      }
+    }
+  ],
+  "conclusion": {
+    "known_better_support_pruned": true,
+    "search_variation_alone_rejected": true,
+    "phase2_pool_coverage_is_primary_explanation": true,
+    "phase2_disposition": "closed",
+    "continue_with_conflict_aware_multi_round_fix_and_optimize": false,
+    "further_phase2_tuning": false
+  }
+}

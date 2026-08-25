@@ -217,12 +217,11 @@ V5-pool 相对 V5-start 的 UB 分别恶化 3.69%、2.61%、0.88%；相对 V4，
 
 ## 13. 下一步建议
 
-建议下一轮在独立分支中实现并评估总设计已规划的 **conflict-aware multi-round F&O**，但应把它当作针对当前 regression 的受控验证，而不是默认它一定有效：
+后续 oracle/coverage audit 已确认：Phase 2 final master 只覆盖三个已知更优 oracle support 的 49.12%、40.19%、47.37%；只补回缺失的 29、64、140 个 signatures 后，当前同一数学模型精确恢复 oracle objective，误差不超过 `2.23e-16`。详细证据见 `ORACLE_COVERAGE_AUDIT.md`。
 
-1. 保留本阶段 proof/primal separation 和完整 diagnostics，固定 objective、manifest、总时限与 Complete MIP baseline。
-2. 先增加 `V5-start vs diversified base pool vs mandatory-overflow pool vs single-round F&O` 的轨迹/来源消融，确认 UB 损失发生在静态裁池、start 注入还是整数求解阶段。
-3. 再让 conflict graph 选择真正竞争相同排区资源的 group，逐轮扩大 neighborhood；每轮必须记录候选列、接受/拒绝原因、耗时和 UB 改善。
-4. 先在 development seeds 上复核 24/48/96 regression；通过后再运行 16/72 和多种子 suite，最后才解锁正式 holdout。
-5. 继续禁止提前加入 Dual Stabilization、Valid Inequalities 和 Branch-and-Price；它们不能解决当前已经观察到的 primal UB 退化证据。
+因此本阶段结论更新为：**Phase 2 的结构、正确性和 pool scalability 已完成，但当前 diversified pool 会裁掉已知更优整数组合所需的关键 support，足以解释 UB regression，Stage Gate 未通过。Phase 2 到此关闭。**
 
-本阶段结论是：**Phase 2 的结构、正确性和 pool scalability 已完成，但当前 diversified primal pool 尚未带来预期 UB/gap 优势，Stage Gate 未通过。**
+- 当前不进入 conflict-aware multi-round F&O；
+- 当前不继续调整 `K_g`、channel 顺序或 pool 参数；
+- 不实施 Dual Stabilization、Valid Inequalities 或 Branch-and-Price；
+- 保留当前实现和负面审计结果，等待是否另行授权重新设计 primal-pool policy。
