@@ -199,6 +199,137 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             ContiguousZoneConfig(
                 fix_optimize_round_zone_fractions=(0.2, 0.1, 0.3),
             ).validate()
+        ContiguousZoneConfig(
+            fix_optimize_policy="hybrid_multi_round"
+        ).validate()
+
+    def test_hybrid_multiround_uses_objective_then_conflict(self) -> None:
+        planner = ContiguousZoneGenerationPlanner(
+            make_three_group_conflict_problem(),
+            ColumnGenerationConfig(verbose=False),
+            ContiguousZoneConfig(fix_optimize_policy="hybrid_multi_round"),
+        )
+        planner._prepare_zones()
+        observed: list[tuple[int, str, float]] = []
+
+        def objective_selection(*_args, **kwargs):
+            return {"G1"}, {
+                "policy": "objective_test",
+                "selected_groups": ["G1"],
+                "candidate_zone_budget": 1,
+                "selected_candidate_zone_count": 1,
+                "candidate_zone_fraction_limit": kwargs[
+                    "candidate_zone_fraction"
+                ],
+            }
+
+        def conflict_selection(*_args, **kwargs):
+            return {"G2"}, {
+                "policy": "conflict_test",
+                "seed_group": "G2",
+                "selected_groups": ["G2"],
+                "candidate_zone_budget": 1,
+                "selected_candidate_zone_count": 1,
+                "candidate_zone_fraction": kwargs[
+                    "candidate_zone_fraction"
+                ],
+            }
+
+        def controlled_round(
+            _model,
+            _variables,
+            zones,
+            flow,
+            imports,
+            objective,
+            **kwargs,
+        ):
+            selection = kwargs["neighborhood_selection"]
+            fraction = selection.get(
+                "candidate_zone_fraction_limit",
+                selection.get("candidate_zone_fraction"),
+            )
+            observed.append(
+                (
+                    kwargs["round_id"],
+                    selection["selection_family"],
+                    fraction,
+                )
+            )
+            return set(zones), dict(flow), dict(imports), {
+                "round_id": kwargs["round_id"],
+                "seed_group": selection.get("seed_group"),
+                "selected_groups": selection["selected_groups"],
+                "neighborhood_group_count": len(kwargs["neighborhood"]),
+                "candidate_zone_budget": selection["candidate_zone_budget"],
+                "candidate_zone_count": selection[
+                    "selected_candidate_zone_count"
+                ],
+                "objective_before": objective,
+                "local_objective": objective,
+                "master_reoptimized_objective": objective,
+                "objective_after": objective,
+                "absolute_improvement": 0.0,
+                "relative_improvement": 0.0,
+                "selection_seconds": 0.0,
+                "build_seconds": 0.0,
+                "local_mip_seconds": 0.0,
+                "master_reoptimization_seconds": 0.0,
+                "local_nodes": 0.0,
+                "local_time_to_first": 0.0,
+                "local_time_to_best": 0.0,
+                "added_zone_count": 0,
+                "added_zone_indices": [],
+                "improved": False,
+                "neighborhood_selection": selection,
+                "local": {},
+                "master_reoptimization": {},
+                "seconds": 0.0,
+            }
+
+        with (
+            patch.object(
+                planner,
+                "_zone_objective_certificate",
+                return_value={"objective": 1.0},
+            ),
+            patch.object(planner, "_gurobi_objective_value", return_value=1.0),
+            patch.object(
+                planner,
+                "_objective_fix_optimize_neighborhood",
+                side_effect=objective_selection,
+            ),
+            patch.object(
+                planner,
+                "_select_conflict_fix_optimize_neighborhood",
+                side_effect=conflict_selection,
+            ),
+            patch.object(
+                planner,
+                "_run_fix_optimize_round",
+                side_effect=controlled_round,
+            ),
+        ):
+            _zones, _flow, _imports, diagnostics = (
+                planner._run_objective_fix_optimize(
+                    object(),
+                    {},
+                    set(),
+                    {},
+                    {},
+                    perf_counter() + 5.0,
+                )
+            )
+
+        self.assertEqual(3, diagnostics["round_count"])
+        self.assertEqual(
+            [
+                (1, "objective", 0.12),
+                (2, "conflict", 0.22),
+                (3, "conflict", 0.35),
+            ],
+            observed,
+        )
 
     def test_conflict_graph_prioritizes_shared_physical_resources(self) -> None:
         planner = ContiguousZoneGenerationPlanner(
@@ -803,7 +934,7 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             diagnostics["zone_root_proof_cuts_retained_in_primal_search"]
         )
         self.assertEqual(
-            "integrated_zone_v5_conflict_multiround_phase3",
+            "integrated_zone_v5_neighborhood_ablation_phase3_1",
             diagnostics["algorithm_version"],
         )
         mip_start = diagnostics["mip_start_diagnostics"]

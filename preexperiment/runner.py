@@ -29,6 +29,13 @@ def run_suite(
     paper_time_limit: float = 0.0,
     threads: int = 1,
     disable_unused_capacity_objective: bool = False,
+    fix_optimize_policy: str = "conflict_multi_round",
+    fix_optimize_max_rounds: int = 3,
+    fix_optimize_round_zone_fractions: Sequence[float] = (
+        0.12,
+        0.22,
+        0.35,
+    ),
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     base_path, all_specs = load_suite(suite_path)
@@ -58,6 +65,11 @@ def run_suite(
                 threads=threads,
                 disable_unused_capacity_objective=(
                     disable_unused_capacity_objective
+                ),
+                fix_optimize_policy=fix_optimize_policy,
+                fix_optimize_max_rounds=fix_optimize_max_rounds,
+                fix_optimize_round_zone_fractions=(
+                    fix_optimize_round_zone_fractions
                 ),
             )
         except Exception as exc:
@@ -93,6 +105,14 @@ def run_suite(
             ),
         },
         "python_hash_seed": os.environ.get("PYTHONHASHSEED"),
+        "fix_optimize_experiment_config": {
+            "policy": fix_optimize_policy,
+            "max_rounds": int(fix_optimize_max_rounds),
+            "round_zone_fractions": [
+                float(value)
+                for value in fix_optimize_round_zone_fractions
+            ],
+        },
         "cases": case_summaries,
     }
     _write_json(output_root / "suite_summary.json", suite_summary)
@@ -113,6 +133,9 @@ def validate_case(
     paper_time_limit: float,
     threads: int,
     disable_unused_capacity_objective: bool,
+    fix_optimize_policy: str,
+    fix_optimize_max_rounds: int,
+    fix_optimize_round_zone_fractions: Sequence[float],
 ) -> dict[str, Any]:
     case_dir = Path(case_dir)
     adapter, generation_manifest = materialize_scenario(base, spec)
@@ -185,7 +208,13 @@ def validate_case(
             ContiguousZoneConfig(
                 unused_capacity_objective_enabled=(
                     not disable_unused_capacity_objective
-                )
+                ),
+                fix_optimize_policy=fix_optimize_policy,
+                fix_optimize_max_rounds=int(fix_optimize_max_rounds),
+                fix_optimize_round_zone_fractions=tuple(
+                    float(value)
+                    for value in fix_optimize_round_zone_fractions
+                ),
             ),
         ).solve()
         export_path = case_dir / "paper_export_rows.csv"

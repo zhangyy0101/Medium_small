@@ -29,6 +29,23 @@ def parse_args() -> argparse.Namespace:
             "renormalize the retained objective weights."
         ),
     )
+    parser.add_argument(
+        "--fix-optimize-policy",
+        choices=(
+            "disabled",
+            "objective",
+            "conflict_multi_round",
+            "hybrid_multi_round",
+        ),
+        default="conflict_multi_round",
+    )
+    parser.add_argument("--fix-optimize-max-rounds", type=int, default=3)
+    parser.add_argument(
+        "--fix-optimize-round-zone-fractions",
+        type=float,
+        nargs="+",
+        default=(0.12, 0.22, 0.35),
+    )
     parser.add_argument("--threads", type=int, default=1)
     return parser.parse_args()
 
@@ -43,6 +60,11 @@ def main() -> None:
         threads=args.threads,
         disable_unused_capacity_objective=(
             args.disable_unused_capacity_objective
+        ),
+        fix_optimize_policy=args.fix_optimize_policy,
+        fix_optimize_max_rounds=args.fix_optimize_max_rounds,
+        fix_optimize_round_zone_fractions=tuple(
+            args.fix_optimize_round_zone_fractions
         ),
         progress=lambda message: print(message, flush=True),
     )

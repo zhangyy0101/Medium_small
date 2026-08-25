@@ -79,7 +79,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fix-optimize-zone-fraction", type=float, default=0.35)
     parser.add_argument(
         "--fix-optimize-policy",
-        choices=("disabled", "objective", "conflict_multi_round"),
+        choices=(
+            "disabled",
+            "objective",
+            "conflict_multi_round",
+            "hybrid_multi_round",
+        ),
         default="conflict_multi_round",
     )
     parser.add_argument("--fix-optimize-max-rounds", type=int, default=3)

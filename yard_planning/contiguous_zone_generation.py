@@ -27,7 +27,7 @@ from .planner import ColumnGenerationConfig, ColumnGenerationResult
 
 Resource = tuple[str, str]
 StripKey = tuple[str, str, str]
-ALGORITHM_VERSION = "integrated_zone_v5_conflict_multiround_phase3"
+ALGORITHM_VERSION = "integrated_zone_v5_neighborhood_ablation_phase3_1"
 V5_MULTI_START_POLICY = "v5_multi_start"
 COMPLETE_MIP_BASELINE_POLICY = "complete_mip_baseline"
 
@@ -145,10 +145,11 @@ class ContiguousZoneConfig:
             "disabled",
             "objective",
             "conflict_multi_round",
+            "hybrid_multi_round",
         }:
             raise ValueError(
-                "fix_optimize_policy must be disabled, objective, or "
-                "conflict_multi_round: "
+                "fix_optimize_policy must be disabled, objective, "
+                "conflict_multi_round, or hybrid_multi_round: "
                 f"{self.fix_optimize_policy!r}"
             )
         if int(self.fix_optimize_max_rounds) <= 0:
@@ -4596,6 +4597,8 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         self,
         selected_zone_indices: set[int],
         export_flow: dict[tuple[str, str], int],
+        *,
+        candidate_zone_fraction: float | None = None,
     ) -> tuple[set[str], dict[str, object]]:
         """Legacy objective-only neighborhood retained only for ablation."""
 
@@ -4615,11 +4618,16 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             float(self.zone_config.fix_optimize_objective_mass)
             * total_contribution
         )
+        zone_fraction = float(
+            self.zone_config.fix_optimize_zone_fraction
+            if candidate_zone_fraction is None
+            else candidate_zone_fraction
+        )
         candidate_budget = max(
             1,
             int(
                 math.ceil(
-                    float(self.zone_config.fix_optimize_zone_fraction)
+                    zone_fraction
                     * max(1, int(self._possible_zone_count))
                 )
             ),
@@ -4681,9 +4689,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             ),
             "attributable_objective_total": total_contribution,
             "selected_attributable_objective": selected_contribution,
-            "candidate_zone_fraction_limit": float(
-                self.zone_config.fix_optimize_zone_fraction
-            ),
+            "candidate_zone_fraction_limit": zone_fraction,
             "candidate_zone_budget": candidate_budget,
             "selected_candidate_zone_count": selected_candidate_count,
             "selected_candidate_zone_fraction": (
@@ -4919,7 +4925,8 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         unsuccessful_seeds: set[str] = set()
         attempted_seeds: list[str] = []
         rounds: list[dict[str, object]] = []
-        if self.zone_config.fix_optimize_policy == "objective":
+        policy = self.zone_config.fix_optimize_policy
+        if policy == "objective":
             max_rounds = 1
             round_fractions = (float(self.zone_config.fix_optimize_zone_fraction),)
         else:
@@ -4943,11 +4950,19 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 perf_counter() + remaining / remaining_rounds,
             )
             selection_started = perf_counter()
-            if self.zone_config.fix_optimize_policy == "objective":
+            objective_round = policy == "objective" or (
+                policy == "hybrid_multi_round" and round_offset == 0
+            )
+            if objective_round:
                 neighborhood, selection = (
                     self._objective_fix_optimize_neighborhood(
                         current_zones,
                         current_flow,
+                        candidate_zone_fraction=(
+                            round_fractions[round_offset]
+                            if policy == "hybrid_multi_round"
+                            else None
+                        ),
                     )
                 )
                 selection = {
@@ -4958,6 +4973,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                         if selection.get("selected_groups")
                         else None
                     ),
+                    "selection_family": "objective",
                 }
             else:
                 neighborhood, selection = (
@@ -4970,6 +4986,10 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                         excluded_seed_groups=unsuccessful_seeds,
                     )
                 )
+                selection = {
+                    **selection,
+                    "selection_family": "conflict",
+                }
             selection_seconds = perf_counter() - selection_started
             seed_group = selection.get("seed_group")
             if seed_group is not None:
@@ -5014,7 +5034,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "status": (
                 "completed" if stop_reason == "max_rounds" else stop_reason
             ),
-            "policy": self.zone_config.fix_optimize_policy,
+            "policy": policy,
             "initial_objective": initial_objective,
             "final_objective": current_objective,
             "rounds": rounds,
@@ -5868,15 +5888,16 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         diagnostics = {
             "algorithm": (
                 "exact_proof_cg_diversified_primal_pool_"
-                "conflict_aware_multiround_fix_optimize_with_exact_recourse"
+                f"{self.zone_config.fix_optimize_policy}_"
+                "fix_optimize_with_exact_recourse"
             ),
             "algorithm_version": ALGORITHM_VERSION,
             "model_scope": "actual_quantity_flow_on_dedicated_contiguous_row_zones",
             "formulation": "zone_flow_master_plus_flow_fixed_exact_row_recourse",
             "decomposition": (
                 "exact_rmq_proof_master_snapshot_diversified_primal_"
-                "master_conflict_aware_multiround_fix_optimize_then_"
-                "certified_row_realization"
+                f"master_{self.zone_config.fix_optimize_policy}_"
+                "fix_optimize_then_certified_row_realization"
             ),
             "planned_group_count": len(self.groups),
             "planned_box_count": sum(group.demand for group in self.groups),
