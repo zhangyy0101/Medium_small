@@ -2769,7 +2769,10 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         candidate_summaries: list[dict[str, object]] = []
         seen_supports: set[tuple] = set()
         repaired: list[dict[str, object]] = []
+        pending_start_pairs: list[tuple[dict[str, object], dict[object, float]]] = []
         repair_summaries: list[dict[str, object]] = []
+        added_seed_zone_count = 0
+        solver_submission: dict[str, object] | None = None
         generation_seconds = 0.0
         repair_seconds = 0.0
         generation_completed_count = 0
@@ -2863,49 +2866,63 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             if result["feasible"]:
                 result["candidate"] = summary
                 repaired.append(result)
-                if len(repaired) >= int(self.zone_config.max_mip_starts):
+                preparation_interrupted = False
+                new_zone_variables = []
+                for zone_index in sorted(result["selected_zone_indices"]):
+                    if perf_counter() >= start_deadline:
+                        preparation_interrupted = True
+                        break
+                    if zone_index not in variables["active_zone_indices"]:
+                        zone_variable = self._add_zone_variable(
+                            model,
+                            variables,
+                            zone_index,
+                        )
+                        new_zone_variables.append(zone_variable)
+                        added_seed_zone_count += 1
+                if preparation_interrupted:
+                    termination_reason = "budget_exhausted"
+                    break
+                if new_zone_variables:
+                    model.update()
+                    for zone_variable in new_zone_variables:
+                        for _prior_result, prior_start in pending_start_pairs:
+                            prior_start[zone_variable] = 0.0
+                start_values = self._repaired_start_values(result, variables)
+                pending_start_pairs.append((result, start_values))
+                pending_start_pairs.sort(
+                    key=lambda pair: (
+                        float(pair[0]["objective"]),
+                        tuple(sorted(pair[0]["selected_zone_indices"])),
+                    )
+                )
+                solver_submission = model.apply_mip_starts(
+                    [pair[1] for pair in pending_start_pairs],
+                    deadline=start_deadline,
+                )
+                submitted_count = int(
+                    solver_submission["provided_mip_start_count"]
+                )
+                pending_start_pairs = pending_start_pairs[:submitted_count]
+                if solver_submission.get("deadline_exhausted"):
+                    termination_reason = "budget_exhausted"
+                    break
+                if (
+                    len(pending_start_pairs)
+                    >= int(self.zone_config.max_mip_starts)
+                ):
                     termination_reason = "max_starts_reached"
                     break
 
-        repaired.sort(
-            key=lambda result: (
-                float(result["objective"]),
-                tuple(sorted(result["selected_zone_indices"])),
+        pending_start_pairs.sort(
+            key=lambda pair: (
+                float(pair[0]["objective"]),
+                tuple(sorted(pair[0]["selected_zone_indices"])),
             )
         )
-        provided = repaired[: int(self.zone_config.max_mip_starts)]
-        added_seed_zone_count = 0
-        preparation_interrupted = False
-        for result in provided:
-            for zone_index in sorted(result["selected_zone_indices"]):
-                if perf_counter() >= start_deadline:
-                    preparation_interrupted = True
-                    break
-                if zone_index not in variables["active_zone_indices"]:
-                    self._add_zone_variable(model, variables, zone_index)
-                    added_seed_zone_count += 1
-            if preparation_interrupted:
-                break
-        if added_seed_zone_count:
-            model.update()
-        active_zone_indices = set(variables["active_zone_indices"])
-        pending_starts = []
-        pending_results = []
-        for result in provided:
-            if perf_counter() >= start_deadline:
-                preparation_interrupted = True
-                break
-            if not set(result["selected_zone_indices"]).issubset(
-                active_zone_indices
-            ):
-                continue
-            pending_starts.append(
-                self._repaired_start_values(result, variables)
-            )
-            pending_results.append(result)
-        variables["pending_repaired_mip_starts"] = pending_starts
-        if preparation_interrupted:
-            termination_reason = "budget_exhausted"
+        pending_results = [pair[0] for pair in pending_start_pairs]
+        pending_starts = [pair[1] for pair in pending_start_pairs]
+        variables["pending_repaired_mip_starts"] = []
 
         actual_seconds = perf_counter() - started
         budget_seconds = max(0.0, float(start_budget_seconds))
@@ -2959,7 +2976,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 }
             ),
             "repair_summaries": repair_summaries,
-            "solver_submission": None,
+            "solver_submission": solver_submission,
         }
 
     def _solve_complete_zone_lp(self, deadline: float) -> dict[str, object]:
@@ -3562,10 +3579,12 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         model.update()
         if start_policy == V5_MULTI_START_POLICY:
             pending_starts = variables.pop("pending_repaired_mip_starts", [])
-            submission = model.apply_mip_starts(
-                pending_starts,
-                deadline=start_deadline,
-            )
+            submission = mip_start.get("solver_submission")
+            if submission is None:
+                submission = model.apply_mip_starts(
+                    pending_starts,
+                    deadline=start_deadline,
+                )
             mip_start["solver_submission"] = submission
             submitted_count = int(submission["provided_mip_start_count"])
             mip_start["provided_mip_start_count"] = submitted_count

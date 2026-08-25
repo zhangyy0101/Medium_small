@@ -688,6 +688,20 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
         clock = MutableClock()
         calls = {"candidate": 0, "repair": 0}
 
+        class FakeModel:
+            def update(self) -> None:
+                return None
+
+            def apply_mip_starts(self, starts, *, deadline=None):
+                materialized = list(starts)
+                return {
+                    "requested_mip_start_count": len(materialized),
+                    "provided_mip_start_count": len(materialized),
+                    "assigned_value_counts": [len(start) for start in materialized],
+                    "deadline_exhausted": False,
+                    "solver_acceptance_observed": False,
+                }
+
         def generate_candidate(*_args, deadline: float, **_kwargs):
             calls["candidate"] += 1
             if calls["candidate"] == 1:
@@ -723,12 +737,23 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             calls["repair"] += 1
             clock.now = deadline
             return {
-                "status": "timelimit",
-                "feasible": False,
+                "status": "optimal",
+                "feasible": True,
+                "selected_zone_indices": set(_selected),
+                "export_flow": {},
+                "import_reserve": {},
+                "objective": 1.0,
                 "seconds": 0.5,
             }
 
-        variables = {"active_zone_indices": set()}
+        variables = {"active_zone_indices": set(), "zone": {}}
+
+        def add_zone(_model, local_variables, zone_index):
+            variable = ("zone", zone_index)
+            local_variables["zone"][zone_index] = variable
+            local_variables["active_zone_indices"].add(zone_index)
+            return variable
+
         with (
             patch(
                 "yard_planning.contiguous_zone_generation.perf_counter",
@@ -752,9 +777,19 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
                 "_repair_zone_support",
                 side_effect=repair_support,
             ),
+            patch.object(
+                planner,
+                "_add_zone_variable",
+                side_effect=add_zone,
+            ),
+            patch.object(
+                planner,
+                "_repaired_start_values",
+                return_value={"certified": 1.0},
+            ),
         ):
             diagnostics = planner._greedy_zone_mip_start(
-                object(),
+                FakeModel(),
                 variables,
                 start_deadline=6.0,
                 start_budget_seconds=6.0,
@@ -774,6 +809,7 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
         )
         self.assertEqual("budget_exhausted", diagnostics["start_termination_reason"])
         self.assertEqual(1, diagnostics["candidate_generation_interrupted_count"])
+        self.assertEqual(1, diagnostics["provided_mip_start_count"])
 
     @unittest.skipUnless(
         importlib.util.find_spec("gurobipy"),
