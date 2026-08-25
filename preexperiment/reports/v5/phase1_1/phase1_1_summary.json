@@ -1,0 +1,161 @@
+{
+  "phase": "v5_phase1_1",
+  "status": "complete",
+  "recommendation": "proceed_to_phase2",
+  "scope": {
+    "implemented": [
+      "complete_mip_baseline_isolation",
+      "unified_start_preparation_budget",
+      "deadline_interruptible_lazy_multi_start",
+      "phase1_1_diagnostics"
+    ],
+    "not_implemented": [
+      "proof_primal_pool_separation",
+      "integrality_aware_primal_pool",
+      "multi_round_fix_and_optimize",
+      "dual_stabilization",
+      "valid_inequalities",
+      "local_branching",
+      "branch_and_price"
+    ]
+  },
+  "git": {
+    "branch": "feat/v5-phase1-1-budget-baseline-fix",
+    "phase1_base_commit": "0a3b02ade7f9130384e4429e7f88444cd3612ff3",
+    "phase1_1_code_commit": "dfb68df0d4b43d8f1536496f47273a3a755d2cfe"
+  },
+  "versions": {
+    "model_schema": "integrated_zone_v4",
+    "algorithm": "integrated_zone_v5_start_phase1_1",
+    "python": "3.13.15",
+    "gurobi": "13.0.2"
+  },
+  "tests": {
+    "passed": 34,
+    "failed": 0,
+    "skipped": 0,
+    "internal_validation_all_cases": true,
+    "external_validation_all_cases": true
+  },
+  "acceptance_gates": {
+    "baseline_isolation": "PASS",
+    "baseline_explanation": "PASS",
+    "start_hard_cap": "PASS",
+    "correctness": "PASS",
+    "diagnostics": "PASS"
+  },
+  "experiments": [
+    {
+      "case": "pilot_l_301",
+      "groups": 24,
+      "scenario_seed": 301,
+      "total_time_limit_seconds": 60,
+      "manifest_sha1": "3f29840d61575f75ae0647dddd82e2e41c54e7f5",
+      "v5_phase1_1": {
+        "upper_bound": 0.13371394428479183,
+        "lower_bound": 0.1156267164519525,
+        "gap": 0.13526807491607676,
+        "root_seconds": 1.23958025,
+        "candidate_generation_seconds": 4.012051876,
+        "repair_seconds": 0.793892667,
+        "total_start_preparation_seconds": 4.871123625,
+        "start_budget_seconds": 6.0,
+        "submitted_starts": 4,
+        "generated_candidates": 20,
+        "interrupted_candidates": 0,
+        "time_to_first_seconds": 7.762908376,
+        "time_to_best_seconds": 54.936884379,
+        "initial_mip_upper_bound": 0.13940335159155404,
+        "initial_mip_seconds": 42.85539375,
+        "fix_and_optimize_seconds": 11.261414958,
+        "termination_reason": "all_strategies_exhausted"
+      },
+      "complete_mip_phase1_1": {
+        "upper_bound": 0.13152150491960696,
+        "lower_bound": 0.120199014911,
+        "gap": 0.0860885071,
+        "time_to_first_seconds": 3.00394,
+        "time_to_best_seconds": 49.603,
+        "integer_search_policy": "complete_mip_baseline",
+        "submitted_starts": 1,
+        "v5_candidate_generation_executed": false,
+        "v5_repair_executed": false
+      }
+    },
+    {
+      "case": "scale_g048_s601",
+      "groups": 48,
+      "scenario_seed": 601,
+      "total_time_limit_seconds": 120,
+      "manifest_sha1": "b04b34d1fd51e7267c3b22bc63fe3d455d876c8a",
+      "v5_phase1_1": {
+        "upper_bound": 0.13931046747007203,
+        "lower_bound": 0.11830479121927327,
+        "gap": 0.1507831868794166,
+        "root_seconds": 4.059223708,
+        "candidate_generation_seconds": 3.40490875,
+        "repair_seconds": 1.872898082,
+        "total_start_preparation_seconds": 5.434468334,
+        "start_budget_seconds": 12.0,
+        "submitted_starts": 6,
+        "generated_candidates": 6,
+        "interrupted_candidates": 0,
+        "time_to_first_seconds": 12.76104983,
+        "time_to_best_seconds": 112.852060361,
+        "initial_mip_upper_bound": 0.14212600112685733,
+        "initial_mip_seconds": 84.519801709,
+        "fix_and_optimize_seconds": 22.176439,
+        "termination_reason": "max_starts_reached"
+      },
+      "complete_mip_phase1_1": {
+        "upper_bound": 0.14282644845755862,
+        "lower_bound": 0.119838051946,
+        "gap": 0.1609533581,
+        "time_to_first_seconds": 6.36028,
+        "time_to_best_seconds": 114.002,
+        "integer_search_policy": "complete_mip_baseline",
+        "submitted_starts": 1,
+        "v5_candidate_generation_executed": false,
+        "v5_repair_executed": false
+      }
+    },
+    {
+      "case": "scale_g096_s801",
+      "groups": 96,
+      "scenario_seed": 801,
+      "total_time_limit_seconds": 120,
+      "manifest_sha1": "7d20bab411ab58baf0ed1f1a439fa56c3d3e00ab",
+      "v5_phase1_1": {
+        "upper_bound": 0.168837081630008,
+        "lower_bound": 0.13988910192782317,
+        "gap": 0.17145510584944748,
+        "root_seconds": 25.043633209,
+        "candidate_generation_seconds": 8.640988458,
+        "repair_seconds": 2.792134583,
+        "total_start_preparation_seconds": 12.063787834,
+        "start_budget_seconds": 12.0,
+        "submitted_starts": 5,
+        "generated_candidates": 7,
+        "interrupted_candidates": 1,
+        "infeasible_candidates": 2,
+        "time_to_first_seconds": 43.794068278,
+        "time_to_best_seconds": 106.043720887,
+        "initial_mip_upper_bound": 0.17880545383176122,
+        "initial_mip_seconds": 66.230372041,
+        "fix_and_optimize_seconds": 16.067282916,
+        "termination_reason": "budget_exhausted"
+      },
+      "complete_mip_phase1_1": {
+        "upper_bound": 0.17110328931331037,
+        "lower_bound": 0.140273366965,
+        "gap": 0.1801831074,
+        "time_to_first_seconds": 32.29,
+        "time_to_best_seconds": 110.57597,
+        "integer_search_policy": "complete_mip_baseline",
+        "submitted_starts": 1,
+        "v5_candidate_generation_executed": false,
+        "v5_repair_executed": false
+      }
+    }
+  ]
+}

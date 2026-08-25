@@ -1,0 +1,46 @@
+{
+  "model_schema_version": "integrated_zone_v4",
+  "algorithm_version": "integrated_zone_v5_start_phase1_1",
+  "integer_search_policies": {
+    "v5": "v5_multi_start",
+    "complete_mip": "complete_mip_baseline"
+  },
+  "mip_start_total_time_fraction": 0.10,
+  "mip_start_repair_total_fraction": 0.08,
+  "max_repaired_start_candidates": 8,
+  "max_mip_starts": 6,
+  "greedy_orderings": [
+    "candidate_scarcity",
+    "demand_descending",
+    "group_id",
+    "voyage_clustered"
+  ],
+  "import_protection_fractions": [1.0, 0.75, 0.5, 0.25, 0.0],
+  "objective_weights": {
+    "voyage_area_dispersion": 0.15,
+    "zone_dispersion": 0.35,
+    "existing_group_proximity": 0.125,
+    "unused_capacity": 0.2125,
+    "berth_distance": 0.1625
+  },
+  "peak_utilization_headroom_fraction": 0.5,
+  "root_time_fraction": 0.5,
+  "zone_mip_time_fraction": 0.75,
+  "fix_optimize_local_fraction": 0.85,
+  "fill_time_fraction": 0.05,
+  "implemented_scope": [
+    "complete_mip_baseline_isolation",
+    "unified_start_preparation_budget",
+    "deadline_interruptible_lazy_multi_start",
+    "phase1_1_diagnostics"
+  ],
+  "explicitly_not_implemented": [
+    "proof_primal_pool_separation",
+    "integrality_aware_primal_pool",
+    "multi_round_fix_and_optimize",
+    "dual_stabilization",
+    "valid_inequalities",
+    "local_branching",
+    "branch_and_price"
+  ]
+}
