@@ -220,6 +220,9 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
         ContiguousZoneConfig(
             fix_optimize_policy="directed_conflict_multi_round"
         ).validate()
+        ContiguousZoneConfig(
+            fix_optimize_policy="rotating_conflict_multi_round"
+        ).validate()
 
     def test_initial_mip_stagnation_requires_feasible_incumbent(self) -> None:
         recorder = StagnationStoppingMipProgressRecorder(
@@ -594,6 +597,116 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
         self.assertLessEqual(observed[0][2], observed[1][2])
         self.assertLessEqual(observed[1][2], observed[2][2])
         self.assertLess(observed[0][2], observed[2][2])
+
+    def test_meaningful_seed_rotation_excludes_successful_prior_seeds(
+        self,
+    ) -> None:
+        planner = ContiguousZoneGenerationPlanner(
+            make_three_group_conflict_problem(),
+            ColumnGenerationConfig(verbose=False),
+            ContiguousZoneConfig(
+                fix_optimize_policy="rotating_conflict_multi_round"
+            ),
+        )
+        planner._prepare_zones()
+        observed_exclusions: list[set[str]] = []
+
+        def rotating_selection(*_args, **kwargs):
+            excluded = set(kwargs["excluded_seed_groups"])
+            observed_exclusions.append(excluded)
+            seed = next(
+                group_id
+                for group_id in ("G1", "G2", "G3")
+                if group_id not in excluded
+            )
+            return {seed}, {
+                "policy": "rotation_test",
+                "seed_group": seed,
+                "selected_groups": [seed],
+                "selected_group_count": 1,
+                "candidate_zone_budget": 1,
+                "selected_candidate_zone_count": 1,
+                "candidate_zone_fraction": kwargs[
+                    "candidate_zone_fraction"
+                ],
+            }
+
+        def improving_round(
+            _model,
+            _variables,
+            zones,
+            flow,
+            imports,
+            objective,
+            **kwargs,
+        ):
+            after = objective - 0.1
+            selection = kwargs["neighborhood_selection"]
+            return set(zones), dict(flow), dict(imports), {
+                "round_id": kwargs["round_id"],
+                "seed_group": selection["seed_group"],
+                "selected_groups": selection["selected_groups"],
+                "neighborhood_group_count": 1,
+                "candidate_zone_budget": 1,
+                "candidate_zone_count": 1,
+                "objective_before": objective,
+                "local_objective": after,
+                "master_reoptimized_objective": after,
+                "objective_after": after,
+                "absolute_improvement": 0.1,
+                "relative_improvement": 0.1 / objective,
+                "selection_seconds": 0.0,
+                "build_seconds": 0.0,
+                "local_mip_seconds": 0.0,
+                "master_reoptimization_seconds": 0.0,
+                "local_nodes": 0.0,
+                "local_time_to_first": 0.0,
+                "local_time_to_best": 0.0,
+                "added_zone_count": 0,
+                "added_zone_indices": [],
+                "improved": True,
+                "neighborhood_selection": selection,
+                "local": {},
+                "master_reoptimization": {},
+                "seconds": 0.0,
+            }
+
+        with (
+            patch.object(
+                planner,
+                "_zone_objective_certificate",
+                return_value={"objective": 1.0},
+            ),
+            patch.object(planner, "_gurobi_objective_value", return_value=1.0),
+            patch.object(
+                planner,
+                "_select_conflict_fix_optimize_neighborhood",
+                side_effect=rotating_selection,
+            ),
+            patch.object(
+                planner,
+                "_run_fix_optimize_round",
+                side_effect=improving_round,
+            ),
+        ):
+            _zones, _flow, _imports, diagnostics = (
+                planner._run_objective_fix_optimize(
+                    object(),
+                    {},
+                    set(),
+                    {},
+                    {},
+                    perf_counter() + 5.0,
+                )
+            )
+
+        self.assertEqual([set(), {"G1"}, {"G1", "G2"}], observed_exclusions)
+        self.assertEqual(["G1", "G2", "G3"], diagnostics["attempted_seed_groups"])
+        self.assertEqual(3, diagnostics["distinct_attempted_seed_group_count"])
+        self.assertEqual(
+            "exclude_all_previously_attempted_seeds",
+            diagnostics["seed_rotation_policy"],
+        )
 
     def test_integrated_objective_has_no_large_plan_term(self) -> None:
         planner = ContiguousZoneGenerationPlanner(
@@ -1068,7 +1181,7 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             {"stagnation", "time_limit", "optimal"},
         )
         self.assertEqual(
-            "integrated_zone_v5_directed_conflict_phase3_2",
+            "integrated_zone_v5_seed_rotation_phase3_3",
             diagnostics["algorithm_version"],
         )
         mip_start = diagnostics["mip_start_diagnostics"]

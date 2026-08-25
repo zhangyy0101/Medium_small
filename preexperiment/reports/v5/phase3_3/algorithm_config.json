@@ -1,0 +1,11 @@
+{
+  "algorithm_version": "integrated_zone_v5_seed_rotation_phase3_3",
+  "production_default_policy": "conflict_multi_round",
+  "experimental_policy": "rotating_conflict_multi_round",
+  "seed_rotation_policy": "exclude_all_previously_attempted_seeds",
+  "seed_cycle_reset": "only_after_all_ranked_seeds_are_exhausted",
+  "conflict_graph": "legacy_equal_weight_four_component_group_conflict_graph",
+  "dynamic_initial_mip_stopping_enabled": false,
+  "max_rounds": 3,
+  "round_zone_fractions": [0.12, 0.22, 0.35]
+}

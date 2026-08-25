@@ -31,7 +31,7 @@ from .planner import ColumnGenerationConfig, ColumnGenerationResult
 
 Resource = tuple[str, str]
 StripKey = tuple[str, str, str]
-ALGORITHM_VERSION = "integrated_zone_v5_directed_conflict_phase3_2"
+ALGORITHM_VERSION = "integrated_zone_v5_seed_rotation_phase3_3"
 V5_MULTI_START_POLICY = "v5_multi_start"
 COMPLETE_MIP_BASELINE_POLICY = "complete_mip_baseline"
 
@@ -175,12 +175,13 @@ class ContiguousZoneConfig:
             "objective",
             "conflict_multi_round",
             "directed_conflict_multi_round",
+            "rotating_conflict_multi_round",
             "hybrid_multi_round",
         }:
             raise ValueError(
                 "fix_optimize_policy must be disabled, objective, "
                 "conflict_multi_round, directed_conflict_multi_round, "
-                "or hybrid_multi_round: "
+                "rotating_conflict_multi_round, or hybrid_multi_round: "
                 f"{self.fix_optimize_policy!r}"
             )
         if int(self.fix_optimize_max_rounds) <= 0:
@@ -5359,6 +5360,9 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                     "selection_family": "objective",
                 }
             else:
+                rotating_seed_policy = (
+                    policy == "rotating_conflict_multi_round"
+                )
                 neighborhood, selection = (
                     self._select_conflict_fix_optimize_neighborhood(
                         current_zones,
@@ -5366,7 +5370,11 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                         current_import,
                         round_id=round_id,
                         candidate_zone_fraction=round_fractions[round_offset],
-                        excluded_seed_groups=unsuccessful_seeds,
+                        excluded_seed_groups=(
+                            set(attempted_seeds)
+                            if rotating_seed_policy
+                            else unsuccessful_seeds
+                        ),
                         directed=(
                             policy == "directed_conflict_multi_round"
                         ),
@@ -5378,6 +5386,11 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                         "directed_conflict"
                         if policy == "directed_conflict_multi_round"
                         else "conflict"
+                    ),
+                    "seed_rotation_policy": (
+                        "exclude_all_previously_attempted_seeds"
+                        if rotating_seed_policy
+                        else "exclude_only_unsuccessful_seeds"
                     ),
                 }
             selection_seconds = perf_counter() - selection_started
@@ -5433,6 +5446,14 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 bool(values.get("improved")) for values in rounds
             ),
             "attempted_seed_groups": attempted_seeds,
+            "distinct_attempted_seed_group_count": len(
+                set(attempted_seeds)
+            ),
+            "seed_rotation_policy": (
+                "exclude_all_previously_attempted_seeds"
+                if policy == "rotating_conflict_multi_round"
+                else "exclude_only_unsuccessful_seeds"
+            ),
             "unsuccessful_seed_groups_at_end": sorted(unsuccessful_seeds),
             "round_zone_fractions": list(round_fractions),
             "stop_reason": stop_reason,
