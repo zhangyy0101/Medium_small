@@ -1,0 +1,18 @@
+{
+  "algorithm_version": "integrated_zone_v5_directed_conflict_phase3_2",
+  "production_default_policy": "conflict_multi_round",
+  "experimental_policy": "directed_conflict_multi_round",
+  "dynamic_initial_mip_stopping_enabled": false,
+  "max_rounds": 3,
+  "round_zone_fractions": [0.12, 0.22, 0.35],
+  "component_weights": {
+    "same_voyage": 0.25,
+    "shared_area": 0.25,
+    "resource_conflict": 0.25,
+    "peak_exchange": 0.25
+  },
+  "candidate_frontier": "lowest_business_cost_sqrt_area_frontier",
+  "arc_policy": "mover_to_incumbent_owner",
+  "resource_rarity": "normalized_inverse_group_frequency",
+  "outgoing_arc_limit": "ceil(sqrt(group_count - 1))"
+}

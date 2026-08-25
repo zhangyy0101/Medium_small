@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
             "disabled",
             "objective",
             "conflict_multi_round",
+            "directed_conflict_multi_round",
             "hybrid_multi_round",
         ),
         default="conflict_multi_round",

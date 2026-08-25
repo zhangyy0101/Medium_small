@@ -217,6 +217,9 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
         ContiguousZoneConfig(
             fix_optimize_policy="hybrid_multi_round"
         ).validate()
+        ContiguousZoneConfig(
+            fix_optimize_policy="directed_conflict_multi_round"
+        ).validate()
 
     def test_initial_mip_stagnation_requires_feasible_incumbent(self) -> None:
         recorder = StagnationStoppingMipProgressRecorder(
@@ -458,6 +461,44 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             diagnostics["component_weights"],
         )
         self.assertFalse(diagnostics["full_zone_pair_materialization_used"])
+
+    def test_directed_conflict_graph_targets_current_resource_owner(self) -> None:
+        planner = ContiguousZoneGenerationPlanner(
+            make_three_group_conflict_problem(),
+            ColumnGenerationConfig(verbose=False),
+        )
+        planner._prepare_zones()
+        strip_key, signature = next(planner._iter_zone_signatures("G2"))
+        g2_zone = planner._register_zone(strip_key, signature)
+
+        scores, diagnostics = planner._build_directed_group_conflict_scores(
+            {g2_zone},
+            {
+                ("G1", "A|03"): 2,
+                ("G2", "A|01"): 2,
+                ("G3", "B|01"): 2,
+            },
+            {},
+        )
+
+        release_owner = scores[("G1", "G2")]
+        unrelated_owner = scores[("G1", "G3")]
+        self.assertGreater(release_owner["score"], unrelated_owner["score"])
+        self.assertEqual("G1->G2", release_owner["direction"])
+        self.assertTrue(release_owner["retained"])
+        self.assertEqual(1.0, release_owner["same_voyage"])
+        self.assertEqual(1.0, release_owner["shared_area"])
+        self.assertGreater(release_owner["resource_conflict"], 0.0)
+        self.assertGreater(release_owner["peak_exchange"], 0.0)
+        self.assertEqual(6, diagnostics["arc_count"])
+        self.assertLessEqual(
+            diagnostics["retained_arc_count"],
+            len(planner.groups) * diagnostics["outgoing_arc_limit"],
+        )
+        self.assertEqual(
+            "lowest_business_cost_sqrt_area_frontier",
+            diagnostics["candidate_frontier"]["policy"],
+        )
 
     def test_multiround_rotates_seed_and_accepts_later_improvement(self) -> None:
         planner = ContiguousZoneGenerationPlanner(
@@ -1027,7 +1068,7 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             {"stagnation", "time_limit", "optimal"},
         )
         self.assertEqual(
-            "integrated_zone_v5_dynamic_initial_stopping_phase4",
+            "integrated_zone_v5_directed_conflict_phase3_2",
             diagnostics["algorithm_version"],
         )
         mip_start = diagnostics["mip_start_diagnostics"]

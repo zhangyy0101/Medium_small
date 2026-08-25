@@ -31,7 +31,7 @@ from .planner import ColumnGenerationConfig, ColumnGenerationResult
 
 Resource = tuple[str, str]
 StripKey = tuple[str, str, str]
-ALGORITHM_VERSION = "integrated_zone_v5_dynamic_initial_stopping_phase4"
+ALGORITHM_VERSION = "integrated_zone_v5_directed_conflict_phase3_2"
 V5_MULTI_START_POLICY = "v5_multi_start"
 COMPLETE_MIP_BASELINE_POLICY = "complete_mip_baseline"
 
@@ -174,11 +174,13 @@ class ContiguousZoneConfig:
             "disabled",
             "objective",
             "conflict_multi_round",
+            "directed_conflict_multi_round",
             "hybrid_multi_round",
         }:
             raise ValueError(
                 "fix_optimize_policy must be disabled, objective, "
-                "conflict_multi_round, or hybrid_multi_round: "
+                "conflict_multi_round, directed_conflict_multi_round, "
+                "or hybrid_multi_round: "
                 f"{self.fix_optimize_policy!r}"
             )
         if int(self.fix_optimize_max_rounds) <= 0:
@@ -4527,6 +4529,267 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "full_zone_pair_materialization_used": False,
         }
 
+    def _promising_candidate_state_by_group(
+        self,
+    ) -> tuple[
+        dict[str, frozenset[str]],
+        dict[str, frozenset[Resource]],
+        dict[str, object],
+    ]:
+        """Build a deterministic, sublinear destination frontier per group.
+
+        The legacy graph compares every reachable area and row.  Here each
+        group keeps only its lowest business-cost sqrt(number of areas)
+        destinations.  Complete zones are still opened by F&O; this frontier
+        is used only to decide which incumbent owners should move together.
+        """
+
+        area_costs: defaultdict[str, dict[str, float]] = defaultdict(dict)
+        resources_by_group_area: defaultdict[
+            tuple[str, str], set[Resource]
+        ] = defaultdict(set)
+        for index, column in enumerate(self._columns):
+            group_id = str(column.group_id)
+            area_no = str(column.area_no)
+            unit_cost = float(
+                self._zone_flow_unit_cost(group_id, column.bay_key)
+            )
+            prior = area_costs[group_id].get(area_no)
+            if prior is None or unit_cost < prior:
+                area_costs[group_id][area_no] = unit_cost
+            resources_by_group_area[(group_id, area_no)].update(
+                self._atomic_resources[index]
+            )
+
+        promising_areas: dict[str, frozenset[str]] = {}
+        promising_resources: dict[str, frozenset[Resource]] = {}
+        group_diagnostics: dict[str, dict[str, object]] = {}
+        for group in self.groups:
+            group_id = group.group_id
+            ranked_areas = sorted(
+                area_costs[group_id],
+                key=lambda area_no: (
+                    area_costs[group_id][area_no],
+                    area_no,
+                ),
+            )
+            area_limit = (
+                int(math.ceil(math.sqrt(len(ranked_areas))))
+                if ranked_areas
+                else 0
+            )
+            selected_areas = frozenset(ranked_areas[:area_limit])
+            selected_resources = frozenset(
+                resource
+                for area_no in selected_areas
+                for resource in resources_by_group_area[(group_id, area_no)]
+            )
+            promising_areas[group_id] = selected_areas
+            promising_resources[group_id] = selected_resources
+            group_diagnostics[group_id] = {
+                "reachable_area_count": len(ranked_areas),
+                "promising_area_count": len(selected_areas),
+                "reachable_resource_count": len(
+                    self._candidate_resources_by_group[group_id]
+                ),
+                "promising_resource_count": len(selected_resources),
+                "promising_areas": sorted(selected_areas),
+            }
+        return promising_areas, promising_resources, {
+            "policy": "lowest_business_cost_sqrt_area_frontier",
+            "group_diagnostics": group_diagnostics,
+        }
+
+    def _build_directed_group_conflict_scores(
+        self,
+        selected_zone_indices: set[int],
+        export_flow: dict[tuple[str, str], int],
+        import_reserve: dict[tuple[str, str, str], int],
+    ) -> tuple[
+        dict[tuple[str, str], dict[str, float | bool | str]],
+        dict[str, object],
+    ]:
+        """Build sparse mover-to-incumbent-owner coupling scores.
+
+        An arc ``mover -> owner`` means that promising destinations of the
+        mover intersect areas or physical rows currently occupied by the
+        owner.  Ubiquitous rows receive zero inverse-frequency weight, and
+        only the strongest sqrt(number of other groups) outgoing arcs survive.
+        """
+
+        incumbent_resources: defaultdict[str, set[Resource]] = defaultdict(set)
+        for zone_index in selected_zone_indices:
+            zone = self._zones[zone_index]
+            incumbent_resources[zone.group_id].update(zone.resources)
+        used_areas, utilization, pressure = self._incumbent_area_state(
+            export_flow,
+            import_reserve,
+        )
+        (
+            promising_areas,
+            promising_resources,
+            frontier_diagnostics,
+        ) = self._promising_candidate_state_by_group()
+        group_ids = sorted(group.group_id for group in self.groups)
+        group_count = len(group_ids)
+        resource_frequency: Counter[Resource] = Counter(
+            resource
+            for group_id in group_ids
+            for resource in promising_resources[group_id]
+        )
+        logarithmic_scale = math.log(group_count + 1.0)
+
+        def resource_rarity(resource: Resource) -> float:
+            if logarithmic_scale <= 1e-12:
+                return 0.0
+            frequency = int(resource_frequency.get(resource, 0))
+            return max(
+                0.0,
+                math.log((group_count + 1.0) / (frequency + 1.0))
+                / logarithmic_scale,
+            )
+
+        scores: dict[
+            tuple[str, str], dict[str, float | bool | str]
+        ] = {}
+        component_totals: Counter[str] = Counter()
+        raw_nonzero_arc_count = 0
+        for mover_id in group_ids:
+            mover_group = self.groups_by_id[mover_id]
+            mover_areas = promising_areas[mover_id]
+            mover_resources = promising_resources[mover_id]
+            for owner_id in group_ids:
+                if owner_id == mover_id:
+                    continue
+                owner_group = self.groups_by_id[owner_id]
+                owner_areas = used_areas[owner_id]
+                owner_resources = frozenset(incumbent_resources[owner_id])
+                exchange_areas = mover_areas & owner_areas
+                resource_intersection = mover_resources & owner_resources
+                owner_resource_weight = sum(
+                    resource_rarity(resource)
+                    for resource in owner_resources
+                )
+                resource_conflict = (
+                    sum(
+                        resource_rarity(resource)
+                        for resource in resource_intersection
+                    )
+                    / owner_resource_weight
+                    if owner_resource_weight > 1e-12
+                    else 0.0
+                )
+                components = {
+                    "same_voyage": float(
+                        mover_group.voyage_id == owner_group.voyage_id
+                    ),
+                    "shared_area": (
+                        len(exchange_areas) / len(owner_areas)
+                        if owner_areas
+                        else 0.0
+                    ),
+                    "resource_conflict": float(resource_conflict),
+                    "peak_exchange": max(
+                        (
+                            pressure.get(area_no, 0.0)
+                            for area_no in exchange_areas
+                        ),
+                        default=0.0,
+                    ),
+                }
+                raw_score = sum(components.values()) / len(components)
+                scores[(mover_id, owner_id)] = {
+                    **components,
+                    "raw_score": float(raw_score),
+                    "score": float(raw_score),
+                    "retained": False,
+                    "direction": f"{mover_id}->{owner_id}",
+                }
+                for name, value in components.items():
+                    component_totals[name] += float(value)
+                if raw_score > 1e-12:
+                    raw_nonzero_arc_count += 1
+
+        outgoing_limit = (
+            int(math.ceil(math.sqrt(group_count - 1)))
+            if group_count > 1
+            else 0
+        )
+        retained_arcs: set[tuple[str, str]] = set()
+        for mover_id in group_ids:
+            outgoing = sorted(
+                (
+                    (owner_id, scores[(mover_id, owner_id)])
+                    for owner_id in group_ids
+                    if owner_id != mover_id
+                    and float(scores[(mover_id, owner_id)]["raw_score"])
+                    > 1e-12
+                ),
+                key=lambda item: (
+                    -float(item[1]["raw_score"]),
+                    item[0],
+                ),
+            )
+            retained_arcs.update(
+                (mover_id, owner_id)
+                for owner_id, _values in outgoing[:outgoing_limit]
+            )
+        maximum_score = 0.0
+        for arc, values in scores.items():
+            retained = arc in retained_arcs
+            values["retained"] = retained
+            if not retained:
+                values["score"] = 0.0
+            maximum_score = max(maximum_score, float(values["score"]))
+
+        arc_count = len(scores)
+        retained_arc_count = len(retained_arcs)
+        return scores, {
+            "policy": "sparse_directed_incumbent_release_conflict_graph",
+            "component_names": [
+                "same_voyage",
+                "shared_area",
+                "resource_conflict",
+                "peak_exchange",
+            ],
+            "component_weights": {
+                "same_voyage": 0.25,
+                "shared_area": 0.25,
+                "resource_conflict": 0.25,
+                "peak_exchange": 0.25,
+            },
+            "arc_count": arc_count,
+            "raw_nonzero_arc_count": raw_nonzero_arc_count,
+            "retained_arc_count": retained_arc_count,
+            "retained_arc_density": (
+                retained_arc_count / arc_count if arc_count else 0.0
+            ),
+            "outgoing_arc_limit": outgoing_limit,
+            "maximum_score": float(maximum_score),
+            "mean_retained_score": (
+                sum(float(values["score"]) for values in scores.values())
+                / retained_arc_count
+                if retained_arc_count
+                else 0.0
+            ),
+            "mean_raw_components": {
+                name: float(component_totals[name]) / arc_count
+                if arc_count
+                else 0.0
+                for name in (
+                    "same_voyage",
+                    "shared_area",
+                    "resource_conflict",
+                    "peak_exchange",
+                )
+            },
+            "resource_rarity_policy": "normalized_inverse_group_frequency",
+            "candidate_frontier": frontier_diagnostics,
+            "incumbent_utilization_by_area": utilization,
+            "incumbent_pressure_by_area": pressure,
+            "full_zone_pair_materialization_used": False,
+        }
+
     @staticmethod
     def _conflict_pair_key(left_id: str, right_id: str) -> tuple[str, str]:
         return tuple(sorted((left_id, right_id)))
@@ -4540,6 +4803,7 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         round_id: int,
         candidate_zone_fraction: float,
         excluded_seed_groups: set[str] | None = None,
+        directed: bool = False,
     ) -> tuple[set[str], dict[str, object]]:
         """Select one seed and its strongest incumbent-aware conflicts."""
 
@@ -4547,11 +4811,20 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             selected_zone_indices,
             export_flow,
         )
-        conflict_scores, graph = self._build_group_conflict_scores(
-            selected_zone_indices,
-            export_flow,
-            import_reserve,
-        )
+        if directed:
+            conflict_scores, graph = (
+                self._build_directed_group_conflict_scores(
+                    selected_zone_indices,
+                    export_flow,
+                    import_reserve,
+                )
+            )
+        else:
+            conflict_scores, graph = self._build_group_conflict_scores(
+                selected_zone_indices,
+                export_flow,
+                import_reserve,
+            )
         candidate_count_by_group = {
             group.group_id: int(
                 self._possible_zone_count_by_group[group.group_id]
@@ -4585,7 +4858,11 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         )
         if seed_group is None:
             return set(), {
-                "policy": "conflict_aware_objective_seed_under_zone_budget",
+                "policy": (
+                    "directed_conflict_objective_seed_under_zone_budget"
+                    if directed
+                    else "conflict_aware_objective_seed_under_zone_budget"
+                ),
                 "round_id": int(round_id),
                 "seed_group": None,
                 "selected_groups": [],
@@ -4614,9 +4891,23 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 best_score = -1.0
                 best_components = None
                 for anchor in selected:
-                    values = conflict_scores[
-                        self._conflict_pair_key(group_id, anchor)
-                    ]
+                    if directed:
+                        directed_values = [
+                            conflict_scores[(anchor, group_id)],
+                            conflict_scores[(group_id, anchor)],
+                        ]
+                        values = max(
+                            directed_values,
+                            key=lambda item: (
+                                float(item["score"]),
+                                str(item["direction"])
+                                == f"{anchor}->{group_id}",
+                            ),
+                        )
+                    else:
+                        values = conflict_scores[
+                            self._conflict_pair_key(group_id, anchor)
+                        ]
                     if (
                         values["score"] > best_score + 1e-12
                         or (
@@ -4627,6 +4918,8 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                         best_anchor = anchor
                         best_score = float(values["score"])
                         best_components = values
+                if directed and best_score <= 1e-12:
+                    continue
                 ranked_candidates.append(
                     (
                         -best_score,
@@ -4658,7 +4951,11 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 }
             )
         return selected_set, {
-            "policy": "conflict_aware_objective_seed_under_zone_budget",
+            "policy": (
+                "directed_conflict_objective_seed_under_zone_budget"
+                if directed
+                else "conflict_aware_objective_seed_under_zone_budget"
+            ),
             "round_id": int(round_id),
             "seed_group": seed_group,
             "seed_contribution": float(contribution_by_group[seed_group]),
@@ -5070,11 +5367,18 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                         round_id=round_id,
                         candidate_zone_fraction=round_fractions[round_offset],
                         excluded_seed_groups=unsuccessful_seeds,
+                        directed=(
+                            policy == "directed_conflict_multi_round"
+                        ),
                     )
                 )
                 selection = {
                     **selection,
-                    "selection_family": "conflict",
+                    "selection_family": (
+                        "directed_conflict"
+                        if policy == "directed_conflict_multi_round"
+                        else "conflict"
+                    ),
                 }
             selection_seconds = perf_counter() - selection_started
             seed_group = selection.get("seed_group")
