@@ -1,0 +1,14 @@
+{
+  "recorded_at": "2026-08-25",
+  "branch": "feat/v5-integrality-aware-primal-search",
+  "base_commit": "c97d7c3615921d438ac2a5305609c7085486eb21",
+  "model_schema_version": "integrated_zone_v4",
+  "algorithm_version": "integrated_zone_v5_start_phase1",
+  "python": "3.13.15",
+  "gurobi": "13.0.2",
+  "os": "macOS (Darwin 25.5.0, arm64)",
+  "cpu": "Apple M5, 10 cores",
+  "memory_gb": 24,
+  "threads": 1,
+  "python_hash_seed": "0"
+}

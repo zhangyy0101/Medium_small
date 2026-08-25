@@ -1,0 +1,40 @@
+{
+  "model_schema_version": "integrated_zone_v4",
+  "algorithm_version": "integrated_zone_v5_start_phase1",
+  "tests": {"passed": 31, "failed": 0, "skipped": 0},
+  "cases": [
+    {
+      "case_id": "pilot_l_301",
+      "groups": 24,
+      "time_limit_seconds": 60,
+      "v4": {"ub": 0.1350163332986197, "lb": 0.1156267164519525, "gap": 0.14360941652727752},
+      "v5_start": {"ub": 0.13371394428479183, "lb": 0.1156267164519525, "gap": 0.13526807491607676, "time_to_first": 8.004280389242922, "time_to_best": 55.13535172803677},
+      "complete_mip": {"ub": 0.13169011117160878, "lb": 0.12015354112223996, "gap": 0.08760392064925226, "time_to_first": 7.640821059350856, "time_to_best": 48.95119102776516},
+      "multi_start": {"generated": 20, "deduplicated": 4, "repaired": 4, "feasible": 4, "submitted": 4, "best_start_ub": 0.2127605507569324},
+      "pool": {"implicit": 40054, "proof": 1065, "primal": 2074, "separated": false},
+      "valid": true
+    },
+    {
+      "case_id": "scale_g048_s601",
+      "groups": 48,
+      "time_limit_seconds": 120,
+      "v4": {"ub": 0.13906313081226643, "lb": 0.11830479121927327, "gap": 0.14927277612508716},
+      "v5_start": {"ub": 0.13825033894934421, "lb": 0.11830479121927327, "gap": 0.1442712392725425, "time_to_first": 19.04609687338234, "time_to_best": 105.870917707216},
+      "complete_mip": {"ub": 0.14039530303344278, "lb": 0.11980198465908712, "gap": 0.1466809638884446, "time_to_first": 15.701369249567506, "time_to_best": 111.90563818191004},
+      "multi_start": {"generated": 20, "deduplicated": 17, "repaired": 8, "feasible": 8, "submitted": 6, "best_start_ub": 0.22751646522882946},
+      "pool": {"implicit": 79892, "proof": 4487, "primal": 6528, "separated": false},
+      "valid": true
+    },
+    {
+      "case_id": "scale_g096_s801",
+      "groups": 96,
+      "time_limit_seconds": 120,
+      "v4": {"ub": 0.16600057920002734, "lb": 0.13988910192782317, "gap": 0.15729750702098677},
+      "v5_start": {"ub": 0.16999280490820132, "lb": 0.13988910192782317, "gap": 0.17708810085600155, "time_to_first": 59.33815330713696, "time_to_best": 111.15409515843203},
+      "complete_mip": {"ub": 0.17910629935323163, "lb": 0.14027318677981176, "gap": 0.21681600654834365, "time_to_first": 37.4305568322452, "time_to_best": 110.93531972019991},
+      "multi_start": {"generated": 20, "deduplicated": 19, "repaired": 8, "feasible": 8, "submitted": 6, "best_start_ub": 0.2483241868192371},
+      "pool": {"implicit": 159907, "proof": 19801, "primal": 23850, "separated": false},
+      "valid": true
+    }
+  ]
+}
