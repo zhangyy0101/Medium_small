@@ -206,6 +206,110 @@ class MipProgressRecorder:
         }
 
 
+class StagnationStoppingMipProgressRecorder(MipProgressRecorder):
+    """Record MIP progress and stop after meaningful-incumbent stagnation."""
+
+    def __init__(
+        self,
+        *,
+        phase: str,
+        minimum_run_seconds: float,
+        stagnation_seconds: float,
+        minimum_relative_improvement: float,
+    ) -> None:
+        super().__init__(phase=phase)
+        self.minimum_run_seconds = max(0.0, float(minimum_run_seconds))
+        self.stagnation_seconds = max(0.0, float(stagnation_seconds))
+        self.minimum_relative_improvement = max(
+            0.0,
+            float(minimum_relative_improvement),
+        )
+        self.termination_reason: str | None = None
+        self._meaningful_incumbent: float | None = None
+        self._last_meaningful_improvement_seconds: float | None = None
+        self._meaningful_improvement_count = 0
+
+    def observe_stopping_state(
+        self,
+        *,
+        elapsed_seconds: float,
+        incumbent: float | None,
+    ) -> bool:
+        """Update the stagnation clock; return true when solve should stop."""
+
+        if self.termination_reason is not None or incumbent is None:
+            return self.termination_reason is not None
+        elapsed = max(0.0, float(elapsed_seconds))
+        value = float(incumbent)
+        if self._meaningful_incumbent is None:
+            self._meaningful_incumbent = value
+            self._last_meaningful_improvement_seconds = elapsed
+            self._meaningful_improvement_count = 1
+        elif value < self._meaningful_incumbent - 1e-12:
+            relative_improvement = (
+                self._meaningful_incumbent - value
+            ) / max(abs(self._meaningful_incumbent), 1e-12)
+            if relative_improvement + 1e-15 >= self.minimum_relative_improvement:
+                self._meaningful_incumbent = value
+                self._last_meaningful_improvement_seconds = elapsed
+                self._meaningful_improvement_count += 1
+        if elapsed + 1e-12 < self.minimum_run_seconds:
+            return False
+        last_meaningful = self._last_meaningful_improvement_seconds
+        if last_meaningful is None:
+            return False
+        if elapsed - last_meaningful + 1e-12 < self.stagnation_seconds:
+            return False
+        self.termination_reason = "stagnation"
+        return True
+
+    def __call__(self, model, where: int) -> None:
+        """Record progress, then terminate only after feasible stagnation."""
+
+        super().__call__(model, where)
+        gp = model._gp if hasattr(model, "_gp") else None
+        if gp is None:
+            import gurobipy as gp
+
+        callback = gp.GRB.Callback
+        try:
+            if where == callback.MIPSOL:
+                elapsed = float(model.cbGet(callback.RUNTIME))
+                incumbent = self._finite(model.cbGet(callback.MIPSOL_OBJ))
+            elif where == callback.MIP:
+                elapsed = float(model.cbGet(callback.RUNTIME))
+                incumbent = self._finite(model.cbGet(callback.MIP_OBJBST))
+            else:
+                return
+            if self.observe_stopping_state(
+                elapsed_seconds=elapsed,
+                incumbent=incumbent,
+            ):
+                model.terminate()
+        except Exception:
+            # Stopping is an optional primal-search policy. Callback failures
+            # must fall back to the hard TimeLimit, never abort correctness.
+            return
+
+    def stopping_diagnostics(self) -> dict[str, object]:
+        return {
+            "enabled": True,
+            "minimum_run_seconds": self.minimum_run_seconds,
+            "stagnation_seconds": self.stagnation_seconds,
+            "minimum_relative_improvement": (
+                self.minimum_relative_improvement
+            ),
+            "callback_termination_reason": self.termination_reason,
+            "meaningful_improvement_count": (
+                self._meaningful_improvement_count
+            ),
+            "last_meaningful_improvement_seconds": (
+                self._last_meaningful_improvement_seconds
+            ),
+            "last_meaningful_incumbent": self._meaningful_incumbent,
+        }
+
+
 class GurobiModel:
     """Small, typed façade over the native Gurobi model used by all solvers."""
 
@@ -450,4 +554,8 @@ class GurobiModel:
         self._model.dispose()
 
 
-__all__ = ["GurobiModel", "MipProgressRecorder"]
+__all__ = [
+    "GurobiModel",
+    "MipProgressRecorder",
+    "StagnationStoppingMipProgressRecorder",
+]

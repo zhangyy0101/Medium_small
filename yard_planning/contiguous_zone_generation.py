@@ -22,12 +22,16 @@ from heapq import heappop, heappush
 from time import perf_counter
 
 from .direct_milp import DirectMilpPlanner
-from .gurobi_backend import GurobiModel, MipProgressRecorder
+from .gurobi_backend import (
+    GurobiModel,
+    MipProgressRecorder,
+    StagnationStoppingMipProgressRecorder,
+)
 from .planner import ColumnGenerationConfig, ColumnGenerationResult
 
 Resource = tuple[str, str]
 StripKey = tuple[str, str, str]
-ALGORITHM_VERSION = "integrated_zone_v5_neighborhood_ablation_phase3_1"
+ALGORITHM_VERSION = "integrated_zone_v5_dynamic_initial_stopping_phase4"
 V5_MULTI_START_POLICY = "v5_multi_start"
 COMPLETE_MIP_BASELINE_POLICY = "complete_mip_baseline"
 
@@ -79,6 +83,11 @@ class ContiguousZoneConfig:
     integer_pool_columns_per_group: int = 100
     root_time_fraction: float = 0.50
     zone_mip_time_fraction: float = 0.75
+    initial_mip_dynamic_stopping_enabled: bool = True
+    initial_mip_max_remaining_fraction: float = 0.50
+    initial_mip_min_total_fraction: float = 0.05
+    initial_mip_stagnation_total_fraction: float = 0.10
+    initial_mip_min_relative_improvement: float = 1e-4
     fix_optimize_local_fraction: float = 0.85
     fix_optimize_objective_mass: float = 0.60
     fix_optimize_zone_fraction: float = 0.35
@@ -128,6 +137,26 @@ class ContiguousZoneConfig:
         if not 0.0 < float(self.zone_mip_time_fraction) < 1.0:
             raise ValueError(
                 "zone_mip_time_fraction must lie strictly between 0 and 1"
+            )
+        if not isinstance(self.initial_mip_dynamic_stopping_enabled, bool):
+            raise ValueError(
+                "initial_mip_dynamic_stopping_enabled must be boolean"
+            )
+        if not 0.0 < float(self.initial_mip_max_remaining_fraction) <= 1.0:
+            raise ValueError(
+                "initial_mip_max_remaining_fraction must lie in (0, 1]"
+            )
+        if not 0.0 <= float(self.initial_mip_min_total_fraction) < 1.0:
+            raise ValueError(
+                "initial_mip_min_total_fraction must lie in [0, 1)"
+            )
+        if not 0.0 < float(self.initial_mip_stagnation_total_fraction) < 1.0:
+            raise ValueError(
+                "initial_mip_stagnation_total_fraction must lie in (0, 1)"
+            )
+        if float(self.initial_mip_min_relative_improvement) <= 0.0:
+            raise ValueError(
+                "initial_mip_min_relative_improvement must be positive"
             )
         if not 0.0 < float(self.fix_optimize_local_fraction) < 1.0:
             raise ValueError(
@@ -4136,17 +4165,72 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
         self._set_gurobi_param(model, "MIPGap", 0.0)
         self._set_gurobi_param(model, "MIPFocus", 1)
         self._set_gurobi_param(model, "Heuristics", 0.20)
-        progress_recorder = MipProgressRecorder(phase=progress_phase)
+        dynamic_stopping = bool(
+            start_policy == V5_MULTI_START_POLICY
+            and self.zone_config.initial_mip_dynamic_stopping_enabled
+        )
+        if dynamic_stopping:
+            total_time_limit = max(
+                0.0,
+                float(self.config.total_time_limit),
+            )
+            progress_recorder = StagnationStoppingMipProgressRecorder(
+                phase=progress_phase,
+                minimum_run_seconds=(
+                    total_time_limit
+                    * float(self.zone_config.initial_mip_min_total_fraction)
+                ),
+                stagnation_seconds=(
+                    total_time_limit
+                    * float(
+                        self.zone_config.initial_mip_stagnation_total_fraction
+                    )
+                ),
+                minimum_relative_improvement=float(
+                    self.zone_config.initial_mip_min_relative_improvement
+                ),
+            )
+        else:
+            progress_recorder = MipProgressRecorder(phase=progress_phase)
         model.optimize(progress_recorder)
         progress = self._finalize_mip_progress(progress_recorder, model)
         status = self._gurobi_status_name(model)
-        if self._gurobi_solution_count(model) <= 0:
+        stopping_diagnostics = (
+            progress_recorder.stopping_diagnostics()
+            if isinstance(
+                progress_recorder,
+                StagnationStoppingMipProgressRecorder,
+            )
+            else {
+                "enabled": False,
+                "callback_termination_reason": None,
+            }
+        )
+        has_solution = self._gurobi_solution_count(model) > 0
+        if stopping_diagnostics.get("callback_termination_reason"):
+            termination_reason = str(
+                stopping_diagnostics["callback_termination_reason"]
+            )
+        elif status == "optimal":
+            termination_reason = "optimal"
+        elif not has_solution:
+            termination_reason = "no_solution"
+        else:
+            termination_reason = "time_limit"
+        stopping_diagnostics["termination_reason"] = termination_reason
+        stopping_diagnostics["hard_deadline_seconds"] = max(
+            0.0,
+            float(remaining),
+        )
+        if not has_solution:
             return set(), {}, {}, {
                 "status": status,
                 "has_solution": False,
                 "lp_start": lp_start,
                 "mip_start": mip_start,
                 "mip_progress": progress,
+                "termination_reason": termination_reason,
+                "initial_mip_stopping": stopping_diagnostics,
                 **policy_diagnostics,
                 "seconds": perf_counter() - started,
             }
@@ -4195,6 +4279,8 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             "lp_start": lp_start,
             "mip_start": mip_start,
             "mip_progress": progress,
+            "termination_reason": termination_reason,
+            "initial_mip_stopping": stopping_diagnostics,
             **policy_diagnostics,
             "seconds": perf_counter() - started,
         }
@@ -5733,6 +5819,13 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
             )
             if self.zone_config.fix_optimize_policy == "disabled":
                 zone_mip_deadline = deadline - fill_reserve
+            elif self.zone_config.initial_mip_dynamic_stopping_enabled:
+                zone_mip_deadline = perf_counter() + max(
+                    0.0,
+                    deadline - fill_reserve - perf_counter(),
+                ) * float(
+                    self.zone_config.initial_mip_max_remaining_fraction
+                )
             else:
                 zone_mip_deadline = perf_counter() + max(
                     0.0, deadline - perf_counter()
@@ -5969,6 +6062,21 @@ class ContiguousZoneGenerationPlanner(DirectMilpPlanner):
                 ),
                 "initial_mip_remaining_fraction": float(
                     self.zone_config.zone_mip_time_fraction
+                ),
+                "initial_mip_dynamic_stopping_enabled": bool(
+                    self.zone_config.initial_mip_dynamic_stopping_enabled
+                ),
+                "initial_mip_max_remaining_fraction": float(
+                    self.zone_config.initial_mip_max_remaining_fraction
+                ),
+                "initial_mip_min_total_fraction": float(
+                    self.zone_config.initial_mip_min_total_fraction
+                ),
+                "initial_mip_stagnation_total_fraction": float(
+                    self.zone_config.initial_mip_stagnation_total_fraction
+                ),
+                "initial_mip_min_relative_improvement": float(
+                    self.zone_config.initial_mip_min_relative_improvement
                 ),
                 "fix_optimize_local_remaining_fraction": float(
                     self.zone_config.fix_optimize_local_fraction

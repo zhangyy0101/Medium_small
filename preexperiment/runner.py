@@ -36,6 +36,7 @@ def run_suite(
         0.22,
         0.35,
     ),
+    initial_mip_dynamic_stopping_enabled: bool = True,
     progress: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     base_path, all_specs = load_suite(suite_path)
@@ -70,6 +71,9 @@ def run_suite(
                 fix_optimize_max_rounds=fix_optimize_max_rounds,
                 fix_optimize_round_zone_fractions=(
                     fix_optimize_round_zone_fractions
+                ),
+                initial_mip_dynamic_stopping_enabled=(
+                    initial_mip_dynamic_stopping_enabled
                 ),
             )
         except Exception as exc:
@@ -113,6 +117,11 @@ def run_suite(
                 for value in fix_optimize_round_zone_fractions
             ],
         },
+        "initial_mip_experiment_config": {
+            "dynamic_stopping_enabled": bool(
+                initial_mip_dynamic_stopping_enabled
+            )
+        },
         "cases": case_summaries,
     }
     _write_json(output_root / "suite_summary.json", suite_summary)
@@ -136,6 +145,7 @@ def validate_case(
     fix_optimize_policy: str,
     fix_optimize_max_rounds: int,
     fix_optimize_round_zone_fractions: Sequence[float],
+    initial_mip_dynamic_stopping_enabled: bool,
 ) -> dict[str, Any]:
     case_dir = Path(case_dir)
     adapter, generation_manifest = materialize_scenario(base, spec)
@@ -214,6 +224,9 @@ def validate_case(
                 fix_optimize_round_zone_fractions=tuple(
                     float(value)
                     for value in fix_optimize_round_zone_fractions
+                ),
+                initial_mip_dynamic_stopping_enabled=bool(
+                    initial_mip_dynamic_stopping_enabled
                 ),
             ),
         ).solve()
@@ -301,6 +314,12 @@ def validate_case(
             "initial_mip_seconds": zone_mip.get("seconds"),
             "initial_mip_nodes": mip_progress.get("node_count"),
             "initial_mip_solution_count": mip_progress.get("solution_count"),
+            "initial_mip_termination_reason": zone_mip.get(
+                "termination_reason"
+            ),
+            "initial_mip_stopping": zone_mip.get(
+                "initial_mip_stopping", {}
+            ),
             "generated_candidate_count": mip_start.get(
                 "generated_candidate_count"
             ),

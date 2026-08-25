@@ -13,6 +13,9 @@ from yard_planning.contiguous_zone_generation import (
     ContiguousZoneGenerationPlanner,
     RootSnapshot,
 )
+from yard_planning.gurobi_backend import (
+    StagnationStoppingMipProgressRecorder,
+)
 from yard_planning.models import Bay, ExportGroup, ProblemData
 from yard_planning.planner import ColumnGenerationConfig
 
@@ -199,9 +202,89 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
             ContiguousZoneConfig(
                 fix_optimize_round_zone_fractions=(0.2, 0.1, 0.3),
             ).validate()
+        with self.assertRaises(ValueError):
+            ContiguousZoneConfig(
+                initial_mip_max_remaining_fraction=0.0
+            ).validate()
+        with self.assertRaises(ValueError):
+            ContiguousZoneConfig(
+                initial_mip_stagnation_total_fraction=0.0
+            ).validate()
+        with self.assertRaises(ValueError):
+            ContiguousZoneConfig(
+                initial_mip_min_relative_improvement=0.0
+            ).validate()
         ContiguousZoneConfig(
             fix_optimize_policy="hybrid_multi_round"
         ).validate()
+
+    def test_initial_mip_stagnation_requires_feasible_incumbent(self) -> None:
+        recorder = StagnationStoppingMipProgressRecorder(
+            phase="test",
+            minimum_run_seconds=6.0,
+            stagnation_seconds=12.0,
+            minimum_relative_improvement=1e-4,
+        )
+        self.assertFalse(
+            recorder.observe_stopping_state(
+                elapsed_seconds=100.0,
+                incumbent=None,
+            )
+        )
+        self.assertIsNone(recorder.termination_reason)
+
+    def test_initial_mip_stagnation_resets_only_on_meaningful_gain(self) -> None:
+        recorder = StagnationStoppingMipProgressRecorder(
+            phase="test",
+            minimum_run_seconds=6.0,
+            stagnation_seconds=12.0,
+            minimum_relative_improvement=1e-4,
+        )
+        self.assertFalse(
+            recorder.observe_stopping_state(
+                elapsed_seconds=1.0,
+                incumbent=1.0,
+            )
+        )
+        self.assertFalse(
+            recorder.observe_stopping_state(
+                elapsed_seconds=8.0,
+                incumbent=0.99995,
+            )
+        )
+        self.assertTrue(
+            recorder.observe_stopping_state(
+                elapsed_seconds=13.0,
+                incumbent=0.99995,
+            )
+        )
+        self.assertEqual("stagnation", recorder.termination_reason)
+
+        reset = StagnationStoppingMipProgressRecorder(
+            phase="test",
+            minimum_run_seconds=6.0,
+            stagnation_seconds=12.0,
+            minimum_relative_improvement=1e-4,
+        )
+        reset.observe_stopping_state(elapsed_seconds=1.0, incumbent=1.0)
+        self.assertFalse(
+            reset.observe_stopping_state(
+                elapsed_seconds=10.0,
+                incumbent=0.9998,
+            )
+        )
+        self.assertFalse(
+            reset.observe_stopping_state(
+                elapsed_seconds=21.9,
+                incumbent=0.9998,
+            )
+        )
+        self.assertTrue(
+            reset.observe_stopping_state(
+                elapsed_seconds=22.0,
+                incumbent=0.9998,
+            )
+        )
 
     def test_hybrid_multiround_uses_objective_then_conflict(self) -> None:
         planner = ContiguousZoneGenerationPlanner(
@@ -933,8 +1016,15 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
         self.assertFalse(
             diagnostics["zone_root_proof_cuts_retained_in_primal_search"]
         )
+        self.assertTrue(
+            diagnostics["zone_mip"]["initial_mip_stopping"]["enabled"]
+        )
+        self.assertIn(
+            diagnostics["zone_mip"]["termination_reason"],
+            {"stagnation", "time_limit", "optimal"},
+        )
         self.assertEqual(
-            "integrated_zone_v5_neighborhood_ablation_phase3_1",
+            "integrated_zone_v5_dynamic_initial_stopping_phase4",
             diagnostics["algorithm_version"],
         )
         mip_start = diagnostics["mip_start_diagnostics"]

@@ -74,6 +74,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--columns-per-group", type=int, default=3)
     parser.add_argument("--integer-pool-per-group", type=int, default=100)
     parser.add_argument("--zone-mip-time-fraction", type=float, default=0.75)
+    parser.add_argument(
+        "--disable-dynamic-initial-mip-stopping",
+        action="store_true",
+    )
+    parser.add_argument(
+        "--initial-mip-max-remaining-fraction",
+        type=float,
+        default=0.50,
+    )
+    parser.add_argument(
+        "--initial-mip-min-total-fraction",
+        type=float,
+        default=0.05,
+    )
+    parser.add_argument(
+        "--initial-mip-stagnation-total-fraction",
+        type=float,
+        default=0.10,
+    )
+    parser.add_argument(
+        "--initial-mip-min-relative-improvement",
+        type=float,
+        default=1e-4,
+    )
     parser.add_argument("--fix-optimize-local-fraction", type=float, default=0.85)
     parser.add_argument("--fix-optimize-objective-mass", type=float, default=0.60)
     parser.add_argument("--fix-optimize-zone-fraction", type=float, default=0.35)
@@ -153,6 +177,21 @@ def main() -> None:
         columns_per_group_per_round=args.columns_per_group,
         integer_pool_columns_per_group=args.integer_pool_per_group,
         zone_mip_time_fraction=args.zone_mip_time_fraction,
+        initial_mip_dynamic_stopping_enabled=(
+            not args.disable_dynamic_initial_mip_stopping
+        ),
+        initial_mip_max_remaining_fraction=(
+            args.initial_mip_max_remaining_fraction
+        ),
+        initial_mip_min_total_fraction=(
+            args.initial_mip_min_total_fraction
+        ),
+        initial_mip_stagnation_total_fraction=(
+            args.initial_mip_stagnation_total_fraction
+        ),
+        initial_mip_min_relative_improvement=(
+            args.initial_mip_min_relative_improvement
+        ),
         fix_optimize_local_fraction=args.fix_optimize_local_fraction,
         fix_optimize_objective_mass=args.fix_optimize_objective_mass,
         fix_optimize_zone_fraction=args.fix_optimize_zone_fraction,
