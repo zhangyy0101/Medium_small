@@ -2,7 +2,208 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable
+from time import perf_counter
+
+
+class MipProgressRecorder:
+    """Collect a compact, solver-independent anytime trace from Gurobi."""
+
+    def __init__(
+        self,
+        *,
+        phase: str,
+        meaningful_bound_relative_change: float = 1e-4,
+    ) -> None:
+        self.phase = str(phase)
+        self.meaningful_bound_relative_change = float(
+            meaningful_bound_relative_change
+        )
+        self.started_at = perf_counter()
+        self.events: list[dict[str, object]] = []
+        self._first_incumbent: float | None = None
+        self._best_incumbent: float | None = None
+        self._time_to_first_solution: float | None = None
+        self._time_to_best_solution: float | None = None
+        self._last_bound: float | None = None
+        self._last_node_count = 0.0
+        self._last_solution_count = 0
+
+    @staticmethod
+    def _finite(value: object) -> float | None:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) and abs(number) < 1e99 else None
+
+    def _append(
+        self,
+        *,
+        elapsed_seconds: float,
+        incumbent: float | None,
+        best_bound: float | None,
+        node_count: float,
+        solution_count: int,
+        event_type: str,
+    ) -> None:
+        self._last_node_count = max(self._last_node_count, float(node_count))
+        self._last_solution_count = max(self._last_solution_count, int(solution_count))
+        self.events.append(
+            {
+                "elapsed_seconds": max(0.0, float(elapsed_seconds)),
+                "incumbent": incumbent,
+                "best_bound": best_bound,
+                "node_count": float(node_count),
+                "solution_count": int(solution_count),
+                "event_type": str(event_type),
+            }
+        )
+
+    def _record_incumbent(
+        self,
+        *,
+        elapsed_seconds: float,
+        incumbent: float | None,
+        best_bound: float | None,
+        node_count: float,
+        solution_count: int,
+    ) -> None:
+        if incumbent is None:
+            return
+        if self._first_incumbent is None:
+            self._first_incumbent = incumbent
+            self._best_incumbent = incumbent
+            self._time_to_first_solution = elapsed_seconds
+            self._time_to_best_solution = elapsed_seconds
+            event_type = "first_incumbent"
+        elif self._best_incumbent is None or incumbent < self._best_incumbent - 1e-9:
+            self._best_incumbent = incumbent
+            self._time_to_best_solution = elapsed_seconds
+            event_type = "new_incumbent"
+        else:
+            return
+        self._append(
+            elapsed_seconds=elapsed_seconds,
+            incumbent=incumbent,
+            best_bound=best_bound,
+            node_count=node_count,
+            solution_count=solution_count,
+            event_type=event_type,
+        )
+
+    def _record_bound(
+        self,
+        *,
+        elapsed_seconds: float,
+        incumbent: float | None,
+        best_bound: float | None,
+        node_count: float,
+        solution_count: int,
+    ) -> None:
+        if best_bound is None:
+            return
+        threshold = max(
+            1e-8,
+            self.meaningful_bound_relative_change
+            * max(1.0, abs(self._last_bound or 0.0)),
+        )
+        if self._last_bound is not None and abs(best_bound - self._last_bound) < threshold:
+            return
+        self._last_bound = best_bound
+        self._append(
+            elapsed_seconds=elapsed_seconds,
+            incumbent=incumbent,
+            best_bound=best_bound,
+            node_count=node_count,
+            solution_count=solution_count,
+            event_type="bound_change",
+        )
+
+    def __call__(self, model, where: int) -> None:
+        """Native Gurobi callback entry point."""
+
+        gp = model._gp if hasattr(model, "_gp") else None
+        if gp is None:
+            import gurobipy as gp
+
+        callback = gp.GRB.Callback
+        try:
+            if where == callback.MIPSOL:
+                elapsed = float(model.cbGet(callback.RUNTIME))
+                incumbent = self._finite(model.cbGet(callback.MIPSOL_OBJ))
+                bound = self._finite(model.cbGet(callback.MIPSOL_OBJBND))
+                nodes = float(model.cbGet(callback.MIPSOL_NODCNT))
+                self._record_incumbent(
+                    elapsed_seconds=elapsed,
+                    incumbent=incumbent,
+                    best_bound=bound,
+                    node_count=nodes,
+                    solution_count=self._last_solution_count + 1,
+                )
+            elif where == callback.MIP:
+                elapsed = float(model.cbGet(callback.RUNTIME))
+                incumbent = self._finite(model.cbGet(callback.MIP_OBJBST))
+                bound = self._finite(model.cbGet(callback.MIP_OBJBND))
+                nodes = float(model.cbGet(callback.MIP_NODCNT))
+                solutions = int(model.cbGet(callback.MIP_SOLCNT))
+                self._record_incumbent(
+                    elapsed_seconds=elapsed,
+                    incumbent=incumbent,
+                    best_bound=bound,
+                    node_count=nodes,
+                    solution_count=solutions,
+                )
+                self._record_bound(
+                    elapsed_seconds=elapsed,
+                    incumbent=incumbent,
+                    best_bound=bound,
+                    node_count=nodes,
+                    solution_count=solutions,
+                )
+        except Exception:
+            # Progress tracing is diagnostic only and must never interrupt a solve.
+            return
+
+    def finalize(self, model: "GurobiModel") -> dict[str, object]:
+        """Append the terminal solver state and return a JSON-safe summary."""
+
+        elapsed = model.getRuntime()
+        solver_solution_count = model.getSolutionCount()
+        solution_count = max(self._last_solution_count, solver_solution_count)
+        incumbent = (
+            self._finite(model.getObjectiveValue())
+            if solver_solution_count > 0
+            else None
+        )
+        bound = self._finite(model.getBestBound())
+        self._record_incumbent(
+            elapsed_seconds=elapsed,
+            incumbent=incumbent,
+            best_bound=bound,
+            node_count=model.getNodeCount(),
+            solution_count=solution_count,
+        )
+        self._append(
+            elapsed_seconds=elapsed,
+            incumbent=incumbent,
+            best_bound=bound,
+            node_count=model.getNodeCount(),
+            solution_count=solution_count,
+            event_type="final",
+        )
+        return {
+            "phase": self.phase,
+            "time_to_first_solution": self._time_to_first_solution,
+            "time_to_best_solution": self._time_to_best_solution,
+            "first_incumbent": self._first_incumbent,
+            "best_incumbent": self._best_incumbent,
+            "node_count": float(model.getNodeCount()),
+            "solution_count": int(solution_count),
+            "incumbent_trajectory": list(self.events),
+            "wall_seconds": max(0.0, perf_counter() - self.started_at),
+        }
 
 
 class GurobiModel:
@@ -119,8 +320,50 @@ class GurobiModel:
     def hideOutput(self) -> None:
         self._model.Params.OutputFlag = 0
 
-    def optimize(self) -> None:
-        self._model.optimize()
+    def optimize(self, callback=None) -> None:
+        if callback is None:
+            self._model.optimize()
+        else:
+            self._model.optimize(callback)
+
+    def terminate(self) -> None:
+        self._model.terminate()
+
+    def apply_mip_starts(
+        self,
+        starts: Iterable[dict[object, float]],
+    ) -> dict[str, object]:
+        """Submit distinct complete/partial starts without claiming acceptance."""
+
+        materialized = list(starts)
+        self._model.update()
+        self._model.NumStart = len(materialized)
+        assigned_value_counts = []
+        variables = self._model.getVars()
+        for start_number, start in enumerate(materialized):
+            self._model.Params.StartNumber = int(start_number)
+            for variable in variables:
+                variable.Start = self._gp.GRB.UNDEFINED
+            assigned = 0
+            for variable, value in start.items():
+                variable.Start = float(value)
+                assigned += 1
+            assigned_value_counts.append(assigned)
+        if materialized:
+            self._model.Params.StartNumber = 0
+        return {
+            "provided_mip_start_count": len(materialized),
+            "assigned_value_counts": assigned_value_counts,
+            "solver_acceptance_observed": False,
+        }
+
+    def applyMipStarts(
+        self,
+        starts: Iterable[dict[object, float]],
+    ) -> dict[str, object]:
+        """Backward-compatible alias for the snake-case façade method."""
+
+        return self.apply_mip_starts(starts)
 
     def getStatusName(self) -> str:
         status_names = {
@@ -157,6 +400,12 @@ class GurobiModel:
     def getBestBound(self) -> float:
         return float(self._model.ObjBound)
 
+    def getNodeCount(self) -> float:
+        return float(self._model.NodeCount)
+
+    def getRuntime(self) -> float:
+        return float(self._model.Runtime)
+
     @staticmethod
     def getValue(variable) -> float:
         return float(variable.X)
@@ -169,4 +418,4 @@ class GurobiModel:
         self._model.dispose()
 
 
-__all__ = ["GurobiModel"]
+__all__ = ["GurobiModel", "MipProgressRecorder"]

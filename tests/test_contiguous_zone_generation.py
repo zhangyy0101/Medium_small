@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 import unittest
 from collections import defaultdict
+from time import perf_counter
+from unittest.mock import patch
 
 from yard_planning.contiguous_zone_generation import (
     ContiguousZoneConfig,
@@ -66,6 +68,37 @@ def make_small_problem() -> ProblemData:
         target_voyages=["V1"],
         export_voyages={"V1"},
         berth_distances={("A", "Q1"): 1.0, ("B", "Q1"): 2.0},
+        berth_by_voyage={"V1": "Q1"},
+    )
+
+
+def make_two_bay_single_group_problem(*, import_boxes: int = 0) -> ProblemData:
+    group = ExportGroup(
+        group_id="G1",
+        voyage_id="V1",
+        status="OF",
+        port="P1",
+        size="20",
+        height="96",
+        demand=2,
+    )
+    bays = {
+        bay.bay_key: bay
+        for bay in (make_bay("A", "01"), make_bay("A", "03"))
+    }
+    functions = {"OF"}
+    if import_boxes:
+        functions.add("IF")
+    return ProblemData(
+        export_groups=[group],
+        bays=bays,
+        area_functions={"A": functions},
+        target_voyages=["V1"],
+        export_voyages={"V1"},
+        import_demand_by_flow_size=(
+            {("IF", "20"): import_boxes} if import_boxes else {}
+        ),
+        berth_distances={("A", "Q1"): 1.0},
         berth_by_voyage={"V1": "Q1"},
     )
 
@@ -144,6 +177,128 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
                 problem,
                 ColumnGenerationConfig(verbose=False),
             )
+
+    def test_greedy_generation_evaluates_all_policies_before_selecting(self) -> None:
+        planner = ContiguousZoneGenerationPlanner(
+            make_small_problem(),
+            ColumnGenerationConfig(verbose=False),
+        )
+        planner._prepare_zones()
+
+        candidates, diagnostics = planner._generate_greedy_support_candidates({})
+        selected, covered, protection = planner._on_demand_greedy_support({})
+
+        self.assertEqual(20, diagnostics["generated_candidate_count"])
+        generated = diagnostics["generated_candidate_summaries"]
+        self.assertEqual(
+            {
+                "candidate_scarcity",
+                "demand_descending",
+                "group_id",
+                "voyage_clustered",
+            },
+            {item["ordering_policy"] for item in generated},
+        )
+        self.assertEqual(
+            {0.0, 0.25, 0.5, 0.75, 1.0},
+            {item["import_protection"] for item in generated},
+        )
+        self.assertEqual(list(candidates[0]["support"]), selected)
+        self.assertEqual(dict(candidates[0]["covered"]), covered)
+        self.assertEqual(candidates[0]["import_protection"], protection)
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("gurobipy"),
+        "gurobipy is unavailable",
+    )
+    def test_joint_repair_rejects_export_only_feasible_support(self) -> None:
+        planner = ContiguousZoneGenerationPlanner(
+            make_two_bay_single_group_problem(import_boxes=2),
+            ColumnGenerationConfig(
+                total_time_limit=5.0,
+                solver_threads=1,
+                verbose=False,
+            ),
+        )
+        planner._prepare_zones()
+        planner._materialize_all_zones()
+        oversized_support = {
+            zone.zone_id for zone in planner._zones if zone.capacity == 4
+        }
+        self.assertEqual(1, len(oversized_support))
+
+        repaired = planner._repair_zone_support(
+            oversized_support,
+            perf_counter() + 2.0,
+        )
+
+        self.assertFalse(repaired["feasible"])
+        self.assertIn(repaired["status"], {"infeasible", "inforunbd"})
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("gurobipy"),
+        "gurobipy is unavailable",
+    )
+    def test_two_repaired_starts_are_submitted_and_bound_final_incumbent(self) -> None:
+        planner = ContiguousZoneGenerationPlanner(
+            make_two_bay_single_group_problem(),
+            ColumnGenerationConfig(
+                total_time_limit=10.0,
+                mip_gap=0.0,
+                solver_threads=1,
+                verbose=False,
+            ),
+        )
+        planner._prepare_zones()
+        one_bay_supports = [
+            [(strip_key, signature)]
+            for strip_key, signature in planner._iter_zone_signatures("G1")
+            if sum(planner._atomic_capacity[index] for index in signature) == 2
+        ]
+        self.assertGreaterEqual(len(one_bay_supports), 2)
+        candidates = [
+            {
+                "support": support,
+                "ordering_policy": f"test_{index}",
+                "import_protection": 0.0,
+                "complete_export_cover": True,
+            }
+            for index, support in enumerate(one_bay_supports[:2])
+        ]
+        generation = {
+            "generated_candidate_count": 2,
+            "deduplicated_candidate_count": 2,
+            "complete_candidate_count": 2,
+            "candidate_summaries": [],
+            "generated_candidate_summaries": [],
+        }
+        model, variables = planner._build_zone_master()
+        try:
+            planner._remove_proof_only_area_rows(model, variables)
+            with patch.object(
+                planner,
+                "_generate_greedy_support_candidates",
+                return_value=(candidates, generation),
+            ):
+                _zones, _flow, _imports, stats = planner._integerize_zone_master(
+                    model,
+                    variables,
+                    perf_counter() + 5.0,
+                )
+        finally:
+            planner._free_gurobi_model(model)
+
+        start = stats["mip_start"]
+        self.assertGreaterEqual(start["feasible_repaired_count"], 2)
+        self.assertGreaterEqual(start["provided_mip_start_count"], 2)
+        self.assertEqual(
+            start["provided_mip_start_count"],
+            start["solver_submission"]["provided_mip_start_count"],
+        )
+        self.assertLessEqual(
+            stats["objective"],
+            start["best_repaired_start_objective"] + 1e-9,
+        )
 
     @unittest.skipUnless(
         importlib.util.find_spec("gurobipy"),
@@ -362,6 +517,31 @@ class ContiguousZoneGenerationTests(unittest.TestCase):
         )
         self.assertFalse(
             diagnostics["zone_root_proof_cuts_retained_in_primal_search"]
+        )
+        self.assertEqual(
+            "integrated_zone_v5_start_phase1",
+            diagnostics["algorithm_version"],
+        )
+        self.assertFalse(diagnostics["proof_primal_pool_separated"])
+        self.assertGreaterEqual(diagnostics["proof_pool_zone_count"], 1)
+        self.assertGreaterEqual(
+            diagnostics["primal_pool_zone_count"],
+            diagnostics["proof_pool_zone_count"],
+        )
+        anytime = diagnostics["mip_anytime"]
+        self.assertIsNotNone(anytime["time_to_first_solution"])
+        self.assertIsNotNone(anytime["time_to_best_solution"])
+        self.assertTrue(
+            any(
+                event["event_type"] == "first_incumbent"
+                for event in anytime["incumbent_trajectory"]
+            )
+        )
+        self.assertTrue(
+            any(
+                event["event_type"] == "final"
+                for event in anytime["incumbent_trajectory"]
+            )
         )
         self.assertNotIn("area_summary_big_plan_inheritance", diagnostics)
         self.assertFalse(

@@ -379,6 +379,7 @@ def _run_complete_mip(
         raise AssertionError("Complete-MIP objective certificate mismatch.")
     return {
         "algorithm": diagnostics.get("algorithm"),
+        "algorithm_version": diagnostics.get("algorithm_version"),
         "status": zone_mip.get("status"),
         "has_solution": bool(zone_mip.get("has_solution")),
         "objective": objective,
@@ -391,6 +392,9 @@ def _run_complete_mip(
             "zone_selected_candidate_count"
         ),
         "total_seconds": diagnostics.get("total_seconds"),
+        "mip_progress": zone_mip.get("mip_progress", {}),
+        "mip_anytime": diagnostics.get("mip_anytime", {}),
+        "mip_start_diagnostics": zone_mip.get("mip_start", {}),
         "objective_certificate": certificate,
         "row_recourse": diagnostics.get("zone_fill"),
         "internal_validation": internal,

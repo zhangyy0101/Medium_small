@@ -203,10 +203,15 @@ def validate_case(
         preparation = result.diagnostics.get("zone_preparation", {})
         root = result.diagnostics.get("zone_root", {})
         zone_mip = result.diagnostics.get("zone_mip", {})
+        mip_start = result.diagnostics.get("mip_start_diagnostics", {})
+        mip_progress = zone_mip.get("mip_progress", {})
+        anytime = result.diagnostics.get("mip_anytime", {})
+        fix_optimize = result.diagnostics.get("zone_fix_optimize", {})
         certificate = result.diagnostics.get("zone_objective_certificate", {})
         summary["paper_algorithm"] = {
             "executed": True,
             "algorithm": result.diagnostics.get("algorithm"),
+            "algorithm_version": result.diagnostics.get("algorithm_version"),
             "total_seconds": result.diagnostics.get("total_seconds"),
             "upper_bound": result.diagnostics.get("zone_model_upper_bound"),
             "lower_bound": result.diagnostics.get("zone_model_global_lower_bound"),
@@ -219,7 +224,73 @@ def validate_case(
             "root_round_count": len(root.get("rounds", [])),
             "root_seconds": root.get("seconds"),
             "root_active_zone_count": root.get("active_zone_count"),
+            "proof_primal_pool_separated": result.diagnostics.get(
+                "proof_primal_pool_separated"
+            ),
+            "proof_pool_zone_count": result.diagnostics.get(
+                "proof_pool_zone_count"
+            ),
+            "primal_pool_zone_count": result.diagnostics.get(
+                "primal_pool_zone_count"
+            ),
             "zone_mip_status": zone_mip.get("status"),
+            "time_to_first_solution": anytime.get("time_to_first_solution"),
+            "time_to_best_solution": anytime.get("time_to_best_solution"),
+            "first_incumbent": anytime.get("first_incumbent"),
+            "best_incumbent": anytime.get("best_incumbent"),
+            "incumbent_trajectory": anytime.get("incumbent_trajectory", []),
+            "initial_mip_seconds": zone_mip.get("seconds"),
+            "initial_mip_nodes": mip_progress.get("node_count"),
+            "initial_mip_solution_count": mip_progress.get("solution_count"),
+            "generated_candidate_count": mip_start.get(
+                "generated_candidate_count"
+            ),
+            "deduplicated_candidate_count": mip_start.get(
+                "deduplicated_candidate_count"
+            ),
+            "repaired_candidate_count": mip_start.get(
+                "repaired_candidate_count"
+            ),
+            "feasible_repaired_count": mip_start.get(
+                "feasible_repaired_count"
+            ),
+            "provided_mip_start_count": mip_start.get(
+                "provided_mip_start_count"
+            ),
+            "candidate_generation_seconds": mip_start.get(
+                "candidate_generation_seconds"
+            ),
+            "repair_time_limit_seconds": mip_start.get(
+                "repair_time_limit_seconds"
+            ),
+            "repair_seconds": mip_start.get("repair_seconds"),
+            "total_mip_start_seconds": mip_start.get(
+                "total_mip_start_seconds"
+            ),
+            "best_repaired_start_objective": mip_start.get(
+                "best_repaired_start_objective"
+            ),
+            "greedy_candidate_summaries": mip_start.get(
+                "generated_candidate_summaries", []
+            ),
+            "deduplicated_candidate_summaries": mip_start.get(
+                "candidate_summaries", []
+            ),
+            "repair_summaries": mip_start.get("repair_summaries", []),
+            "mip_start_solver_submission": mip_start.get("solver_submission"),
+            "fix_optimize_round_count": result.diagnostics.get(
+                "fix_optimize_round_count"
+            ),
+            "fix_optimize_success_count": result.diagnostics.get(
+                "fix_optimize_success_count"
+            ),
+            "fix_optimize_total_improvement": result.diagnostics.get(
+                "fix_optimize_total_improvement"
+            ),
+            "fix_optimize_diagnostics": fix_optimize,
+            "selected_zone_origin_counts": result.diagnostics.get(
+                "zone_selected_origin_counts", {}
+            ),
             "selected_candidate_count": result.diagnostics.get("zone_selected_candidate_count"),
             "candidate_reduction": result.diagnostics.get("zone_candidate_reduction"),
             "objective_components_raw": certificate.get("raw", {}),
@@ -273,6 +344,13 @@ def _flat_case_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "root_rounds": paper.get("root_round_count"),
         "root_seconds": paper.get("root_seconds"),
         "zone_mip_status": paper.get("zone_mip_status"),
+        "algorithm_version": paper.get("algorithm_version"),
+        "time_to_first_solution": paper.get("time_to_first_solution"),
+        "time_to_best_solution": paper.get("time_to_best_solution"),
+        "first_incumbent": paper.get("first_incumbent"),
+        "best_incumbent": paper.get("best_incumbent"),
+        "provided_mip_start_count": paper.get("provided_mip_start_count"),
+        "feasible_repaired_count": paper.get("feasible_repaired_count"),
         "selected_candidates": paper.get("selected_candidate_count"),
         "candidate_reduction": paper.get("candidate_reduction"),
     }
