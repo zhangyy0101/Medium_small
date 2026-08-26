@@ -1,0 +1,48 @@
+{
+  "case_id": "scale_g024_s401",
+  "complete_mip_rerun": false,
+  "configuration": {
+    "algorithm_time_limit": 120.0,
+    "stage1_additional_candidate_area_cap": 5,
+    "stage1_maximum_pool_candidate_areas": 1,
+    "root_time_limit": 60.0,
+    "solver_threads": 1,
+    "solver_seed": 0
+  },
+  "v7": {
+    "upper_bound": 0.04507977512427532,
+    "restricted_lp_bound": 0.038496320649176796,
+    "restricted_mip_gap": 0.02919861666778125,
+    "total_seconds": 120.2052188749949,
+    "stage1_seconds": 10.054389416996855,
+    "stage1_objective": 0.01810389897131638,
+    "stage1_pool_solution_count": 8,
+    "restricted_group_area_edges": 157,
+    "restricted_group_bay_edges": 762,
+    "root_closed": true,
+    "root_rounds": 23,
+    "root_seconds": 9.366488792002201,
+    "root_pattern_count": 1636,
+    "integer_seconds": 97.54202104097931,
+    "integer_status": "timelimit"
+  },
+  "saved_complete_mip": {
+    "upper_bound": 0.045754036252225815,
+    "runtime_seconds": 120.01587104797363
+  },
+  "saved_oracle_support_coverage": {
+    "covered_pair_count": 22,
+    "oracle_pair_count": 28,
+    "pair_fraction": 0.7857142857142857,
+    "covered_quantity": 534,
+    "oracle_quantity": 640,
+    "quantity_fraction": 0.834375,
+    "fully_covered_group_count": 18,
+    "group_count": 24
+  },
+  "comparison": {
+    "ub_delta_vs_saved_mip": -0.0006742611279504929,
+    "ub_relative_vs_saved_mip": -0.014736648024526788,
+    "ub_relative_vs_prior_v7": -0.253515892701493
+  }
+}

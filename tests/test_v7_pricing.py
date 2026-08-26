@@ -13,6 +13,30 @@ GUROBI_AVAILABLE = importlib.util.find_spec("gurobipy") is not None
 
 class V7PricingTests(unittest.TestCase):
     @unittest.skipUnless(GUROBI_AVAILABLE, "gurobipy is unavailable")
+    def test_exact_pricing_safely_screens_nonnegative_state(self) -> None:
+        problem = make_problem(
+            [make_group("G1", port="P1"), make_group("G2", port="P2")],
+            [make_bay("01", rows=("1", "2"))],
+        )
+        atoms, _limits = build_v7_row_atoms(problem)
+        pricing = V7ExactBayPricing(problem, atoms, columns_per_bay=3)
+
+        result = pricing.price_bay_exact_mip(
+            "A|01",
+            lambda _atom: 0.1,
+            lambda _anchor: 0.5,
+            lambda _anchor, _size, _height, _group, _physical: 0.1,
+        )
+
+        self.assertIsNone(result.minimum_reduced_cost)
+        self.assertEqual((), result.returned_patterns)
+        self.assertEqual(
+            result.diagnostics["pricing_state_total"],
+            result.diagnostics["pricing_state_screened_by_lower_bound"],
+        )
+        self.assertEqual(0, result.diagnostics["pricing_state_count"])
+
+    @unittest.skipUnless(GUROBI_AVAILABLE, "gurobipy is unavailable")
     def test_exact_pricing_mip_matches_exhaustive_pricing(self) -> None:
         problem = make_problem(
             [
@@ -60,6 +84,55 @@ class V7PricingTests(unittest.TestCase):
             "exact_support_cardinality_row_assignment_mip",
             mip.diagnostics["method"],
         )
+
+    @unittest.skipUnless(GUROBI_AVAILABLE, "gurobipy is unavailable")
+    def test_persistent_exact_pricing_updates_dual_objective(self) -> None:
+        problem = make_problem(
+            [make_group("G1", port="P1"), make_group("G2", port="P2")],
+            [make_bay("01", rows=("1", "2", "3"))],
+        )
+        atoms, _limits = build_v7_row_atoms(problem)
+        pricing = V7ExactBayPricing(problem, atoms, columns_per_bay=3)
+
+        def run(multiplier: float):
+            def atom_cost(atom):
+                return -0.2 * atom.capacity + multiplier * atom.candidate_index
+
+            def reduced_cost(pattern):
+                return (
+                    0.1
+                    - 0.25 * len(pattern.active_groups)
+                    + sum(
+                        atom_cost(atoms[index])
+                        for index in pattern.candidate_indices
+                    )
+                )
+
+            exact = pricing.price_bay_exact_mip(
+                "A|01",
+                atom_cost,
+                lambda _anchor: 0.1,
+                lambda _anchor, _size, _height, _group, _physical: -0.25,
+                verify_reduced_cost=reduced_cost,
+                excluded_signatures_are_dual_feasible=True,
+            )
+            exhaustive = pricing.price_bay(
+                "A|01", reduced_cost, exhaustive=True
+            )
+            self.assertAlmostEqual(
+                exhaustive.minimum_reduced_cost,
+                exact.minimum_reduced_cost,
+                places=10,
+            )
+            return exact
+
+        first = run(0.011)
+        second = run(-0.013)
+        self.assertGreater(first.diagnostics["persistent_pricing_state_build_count"], 0)
+        self.assertEqual(0, first.diagnostics["persistent_pricing_state_reuse_count"])
+        self.assertEqual(0, second.diagnostics["persistent_pricing_state_build_count"])
+        self.assertGreater(second.diagnostics["persistent_pricing_state_reuse_count"], 0)
+        pricing.dispose()
 
     def test_additive_row_dp_matches_exhaustive_pricing(self) -> None:
         problem = make_problem(

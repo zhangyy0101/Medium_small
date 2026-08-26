@@ -120,19 +120,24 @@ def candidate_areas_by_group(
     return dict(output)
 
 
-def filter_atoms_by_active_areas(
+def filter_atoms_by_restricted_areas(
     atoms: Sequence[V7RowAtom],
-    active_areas_by_group: Mapping[str, Iterable[str]],
+    restricted_areas_by_group: Mapping[str, Iterable[str]],
 ) -> tuple[V7RowAtom, ...]:
-    active = {
+    restricted = {
         str(group_id): {str(area) for area in areas}
-        for group_id, areas in active_areas_by_group.items()
+        for group_id, areas in restricted_areas_by_group.items()
     }
     return tuple(
         atom
         for atom in atoms
-        if atom.area_no in active.get(atom.group_id, set())
+        if atom.area_no in restricted.get(atom.group_id, set())
     )
+
+
+# Compatibility alias for pre-V7.1 callers.  Production V7.1 code uses the
+# restricted-domain name and never mutates the supplied mapping.
+filter_atoms_by_active_areas = filter_atoms_by_restricted_areas
 
 
 __all__ = [
@@ -143,4 +148,5 @@ __all__ = [
     "candidate_areas_by_group",
     "candidate_bays_by_group",
     "filter_atoms_by_active_areas",
+    "filter_atoms_by_restricted_areas",
 ]

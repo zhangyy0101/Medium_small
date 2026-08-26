@@ -5,15 +5,17 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from time import perf_counter
-from typing import Mapping, Sequence
+from typing import Iterable, Mapping, Sequence
 
 from .models import ProblemData
 from .v7_atoms import V7RowAtom, build_v7_row_atoms
 from .v7_bay_patterns import V7BayPattern
 from .v7_column_generation import (
+    V7_1_ALGORITHM_VERSION,
     V7GlobalPatternMaster,
     V7MasterSolution,
     normalize_v7_pattern_ids,
+    validate_patterns_in_restricted_domain,
 )
 from .v7_model import (
     V7_MODEL_SCHEMA_VERSION,
@@ -26,6 +28,7 @@ from .v7_model import (
 @dataclass(frozen=True)
 class V7IntegerConfig:
     time_limit: float = 30.0
+    wall_clock_deadline: float | None = None
     mip_gap: float = 0.0
     solver_threads: int = 1
     solver_seed: int = 0
@@ -35,6 +38,10 @@ class V7IntegerConfig:
     def validate(self) -> None:
         if not math.isfinite(float(self.time_limit)) or float(self.time_limit) <= 0:
             raise ValueError("V7 integer time limit must be positive")
+        if self.wall_clock_deadline is not None and not math.isfinite(
+            float(self.wall_clock_deadline)
+        ):
+            raise ValueError("V7 integer wall-clock deadline must be finite")
         if not math.isfinite(float(self.mip_gap)) or not 0 <= float(self.mip_gap) <= 1:
             raise ValueError("V7 integer MIP gap must lie in [0, 1]")
         if int(self.solver_threads) < 0:
@@ -50,6 +57,7 @@ class V7IntegerResult:
     import_reservation: Mapping[tuple[str, str, str], int]
     patterns: tuple[V7BayPattern, ...]
     peak_policy: V7PeakUtilizationPolicy
+    restricted_areas_by_group: Mapping[str, frozenset[str]]
     certificate: Mapping[str, object]
     diagnostics: Mapping[str, object]
 
@@ -67,6 +75,8 @@ class V7RestrictedIntegerSolver:
         config: V7IntegerConfig | None = None,
         *,
         atoms: Sequence[V7RowAtom] | None = None,
+        restricted_areas_by_group: Mapping[str, Iterable[str]],
+        feasibility_proof_patterns: Sequence[V7BayPattern] = (),
     ) -> None:
         self.problem = problem
         self.peak_policy = peak_policy
@@ -78,6 +88,34 @@ class V7RestrictedIntegerSolver:
         self.patterns = normalize_v7_pattern_ids(patterns)
         if not self.patterns:
             raise ValueError("V7 integer master requires an explicit pattern pool")
+        from .v7_stage1_area import freeze_restricted_areas
+
+        self.restricted_areas_by_group = freeze_restricted_areas(
+            restricted_areas_by_group
+        )
+        self.feasibility_proof_pattern_signatures = frozenset(
+            pattern.signature
+            for pattern in normalize_v7_pattern_ids(feasibility_proof_patterns)
+        )
+        missing_proof_patterns = self.feasibility_proof_pattern_signatures - {
+            pattern.signature for pattern in self.patterns
+        }
+        if missing_proof_patterns:
+            raise ValueError(
+                "V7 integer feasibility-proof patterns must be present in the "
+                f"pattern pool: {sorted(missing_proof_patterns)[:3]}"
+            )
+        validate_patterns_in_restricted_domain(
+            problem,
+            [
+                pattern
+                for pattern in self.patterns
+                if pattern.signature
+                not in self.feasibility_proof_pattern_signatures
+            ],
+            self.restricted_areas_by_group,
+            source="V7.1 restricted integer master",
+        )
         self.evaluator = V7ModelEvaluator(
             problem, self.atoms, self.config.objective
         )
@@ -90,6 +128,10 @@ class V7RestrictedIntegerSolver:
             self.patterns,
             self.peak_policy,
             self.config.objective,
+            restricted_areas_by_group=self.restricted_areas_by_group,
+            restricted_domain_exempt_pattern_signatures=(
+                self.feasibility_proof_pattern_signatures
+            ),
             integral=True,
             time_limit=self.config.time_limit,
             mip_gap=self.config.mip_gap,
@@ -98,6 +140,19 @@ class V7RestrictedIntegerSolver:
             verbose=self.config.verbose,
         )
         try:
+            master.build()
+            effective_solver_time_limit = float(self.config.time_limit)
+            if self.config.wall_clock_deadline is not None:
+                effective_solver_time_limit = min(
+                    effective_solver_time_limit,
+                    float(self.config.wall_clock_deadline) - perf_counter(),
+                )
+            if effective_solver_time_limit <= 0:
+                raise RuntimeError(
+                    "V7 shared time budget expired while building the integer master"
+                )
+            assert master.model is not None
+            master.model.setParam("TimeLimit", effective_solver_time_limit)
             solution: V7MasterSolution = master.solve()
             selected_pattern_ids = tuple(
                 sorted(
@@ -133,21 +188,32 @@ class V7RestrictedIntegerSolver:
             progress = solution.diagnostics.get("progress") or {}
             best_bound = solution.diagnostics.get("solver_bound")
             diagnostics = {
-                "algorithm": "v7_restricted_global_bay_pattern_integer_master",
+                "algorithm": f"{V7_1_ALGORITHM_VERSION}_integer_master",
                 "model_schema_version": V7_MODEL_SCHEMA_VERSION,
                 "status": solution.diagnostics["status"],
                 "time_to_first_incumbent": progress.get("time_to_first_solution"),
                 "first_ub": progress.get("first_incumbent"),
-                "best_ub": certified_objective,
-                "best_bound": best_bound,
-                "gap": (
+                "restricted_integer_ub": certified_objective,
+                "restricted_master_bound": best_bound,
+                "restricted_mip_gap": (
                     max(0.0, certified_objective - float(best_bound))
                     / max(abs(certified_objective), 1e-12)
                     if best_bound is not None
                     else None
                 ),
+                "global_feasible_ub": certified_objective,
+                "global_lower_bound": None,
+                "global_gap": None,
+                "restricted_areas_by_group": {
+                    group_id: sorted(areas)
+                    for group_id, areas in self.restricted_areas_by_group.items()
+                },
                 "patterns_used": len(selected_pattern_ids),
                 "pattern_pool_size": len(self.patterns),
+                "feasibility_proof_pattern_count": len(
+                    self.feasibility_proof_pattern_signatures
+                ),
+                "proof_columns_expand_pricing_domain": False,
                 "groups_per_physical_bay_distribution": dict(
                     sorted(certificate["groups_per_physical_bay"].items())
                 ),
@@ -160,6 +226,11 @@ class V7RestrictedIntegerSolver:
                 ),
                 "independent_validation_passed": True,
                 "runtime_seconds": solution.diagnostics["runtime_seconds"],
+                "declared_stage_time_limit": float(self.config.time_limit),
+                "effective_solver_time_limit": effective_solver_time_limit,
+                "shared_wall_clock_deadline_used": (
+                    self.config.wall_clock_deadline is not None
+                ),
                 "total_seconds": perf_counter() - started,
             }
             return V7IntegerResult(
@@ -169,6 +240,7 @@ class V7RestrictedIntegerSolver:
                 import_reservation=imports,
                 patterns=master.patterns,
                 peak_policy=self.peak_policy,
+                restricted_areas_by_group=self.restricted_areas_by_group,
                 certificate=certificate,
                 diagnostics=diagnostics,
             )

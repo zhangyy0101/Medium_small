@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import json
 import platform
+from collections import defaultdict
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,8 +18,10 @@ from adapters.input_adapter_gd import InputAdapterGd
 from adapters.planning_input import load_planning_inputs
 from yard_planning.v7_atoms import build_v7_row_atoms
 from yard_planning.v7_column_generation import (
+    V7_1_ALGORITHM_VERSION,
     V7RootCgConfig,
     V7RootColumnGeneration,
+    audit_full_domain_pricing,
     normalize_v7_pattern_ids,
     patterns_from_atom_solution,
 )
@@ -32,7 +35,11 @@ from yard_planning.v7_model import (
     V7ObjectiveConfig,
     derive_v7_analytic_peak_policy,
 )
-from yard_planning.v7_pipeline import build_v7_stage1_guided_patterns
+from yard_planning.v7_pipeline import (
+    V7AlgorithmTimeBudget,
+    build_v7_deterministic_one_group_patterns,
+    build_v7_stage1_guided_patterns,
+)
 from yard_planning.v7_stage1_area import V7Stage1AreaSolver, V7Stage1Config
 
 from .scenario_generator import ScenarioSpec, load_suite, materialize_scenario
@@ -110,23 +117,66 @@ def _problem_summary(problem, atoms, manifest: Mapping[str, Any]) -> dict[str, A
     }
 
 
+def _solve_complete_mip_baseline(
+    problem,
+    peak_policy,
+    *,
+    objective: V7ObjectiveConfig,
+    time_limit: float,
+    mip_gap: float,
+    solver_threads: int,
+    solver_seed: int,
+    verbose_solver: bool,
+) -> tuple[Any | None, dict[str, Any]]:
+    """Run the independent baseline even when the production algorithm fails."""
+
+    started = perf_counter()
+    try:
+        complete = V7CompleteMipSolver(
+            problem,
+            V7CompleteMipConfig(
+                time_limit=time_limit,
+                mip_gap=mip_gap,
+                solver_threads=solver_threads,
+                solver_seed=solver_seed,
+                verbose=verbose_solver,
+                require_business_optimality=False,
+                objective=objective,
+            ),
+        ).solve(peak_policy)
+        return complete, {
+            "state": "completed",
+            "wall_seconds": perf_counter() - started,
+            "upper_bound": complete.objective,
+            "lower_bound": complete.diagnostics.get("solver_bound"),
+            "gap": complete.diagnostics.get("certified_gap"),
+            "diagnostics": dict(complete.diagnostics),
+        }
+    except Exception as error:
+        return None, _stage_error(error, started)
+
+
 def run_v7_case(
     base: InputAdapterGd,
     spec: ScenarioSpec,
     *,
     objective: V7ObjectiveConfig,
+    algorithm_time_limit: float,
+    minimum_integer_time: float,
     peak_feasibility_time_limit: float,
     stage1_time_limit: float,
     stage1_pool_solutions: int,
     stage1_pool_gap: float,
-    initial_candidate_area_cap: int,
+    additional_candidate_area_cap: int,
+    maximum_pool_candidate_areas: int,
     root_time_limit: float,
     root_maximum_iterations: int,
     columns_per_bay_per_round: int,
-    integer_time_limit: float,
+    integer_time_limit: float | None,
     integer_mip_gap: float,
     complete_mip_time_limit: float,
     complete_mip_gap: float,
+    enable_global_pricing_audit: bool,
     solver_threads: int,
     solver_seed: int,
     verbose_solver: bool,
@@ -139,7 +189,7 @@ def run_v7_case(
         "seed": int(spec.seed),
         "generation_spec": asdict(spec),
         "model_schema_version": V7_MODEL_SCHEMA_VERSION,
-        "algorithm": "v7_stage1_exact_bay_pricing_rim",
+        "algorithm": V7_1_ALGORITHM_VERSION,
         "status": "running",
         "passed": False,
         "stages": {},
@@ -173,17 +223,47 @@ def run_v7_case(
         checkpoint(result)
         return result
 
+    budget = V7AlgorithmTimeBudget(
+        total_time_limit=algorithm_time_limit,
+        minimum_integer_time=minimum_integer_time,
+    )
+    budget.validate()
+    budget_started = perf_counter()
+    algorithm_deadline = budget_started + float(algorithm_time_limit)
+    allocated_time_limits: dict[str, float] = {}
+    result["algorithm_time_budget"] = {
+        "policy": "shared_total_with_soft_phase_caps",
+        "total_time_limit": float(algorithm_time_limit),
+        "minimum_integer_time": float(minimum_integer_time),
+        "integer_optional_ceiling": (
+            None if integer_time_limit is None else float(integer_time_limit)
+        ),
+        "allocated_time_limits": allocated_time_limits,
+        "global_pricing_audit_included": False,
+        "complete_mip_included": False,
+    }
+
     stage_started = perf_counter()
     progress(f"[{spec.case_id}] deriving and certifying the peak cap")
+    peak_policy = None
     try:
         peak_policy, peak_diagnostics = derive_v7_analytic_peak_policy(
             problem, objective, atoms=atoms
         )
+        allocated_time_limits["peak_witness"] = budget.soft_stage_limit(
+            "peak witness",
+            elapsed_seconds=perf_counter() - budget_started,
+            soft_limit=peak_feasibility_time_limit,
+            future_reserve=(
+                minimum_integer_time
+                + 2.0 * budget.minimum_phase_launch_seconds
+            ),
+        )
         witness_solver = V7CompleteMipSolver(
             problem,
             V7CompleteMipConfig(
-                time_limit=peak_feasibility_time_limit,
-                mip_gap=1.0,
+                time_limit=allocated_time_limits["peak_witness"],
+                mip_gap=0.0,
                 solver_threads=solver_threads,
                 solver_seed=solver_seed,
                 verbose=verbose_solver,
@@ -202,6 +282,7 @@ def run_v7_case(
             "epsilon_cap": peak_policy.epsilon_cap,
             "witness_peak_utilization": witness.certificate["peak_utilization"]["maximum"],
             "witness_pattern_count": len(witness_patterns),
+            "allocated_time_limit": allocated_time_limits["peak_witness"],
             "diagnostics": {
                 "analytic": peak_diagnostics,
                 "witness": dict(witness.diagnostics),
@@ -212,6 +293,66 @@ def run_v7_case(
         result["stages"]["peak_witness"] = _stage_error(error, stage_started)
         result["status"] = "failed"
         result["failure_stage"] = "peak_witness"
+        production_wall_seconds = perf_counter() - budget_started
+        result["algorithm_time_budget"].update(
+            {
+                "allocated_time_limits": dict(allocated_time_limits),
+                "production_wall_seconds": production_wall_seconds,
+                "remaining_seconds": budget.remaining(production_wall_seconds),
+                "budget_exhausted": production_wall_seconds
+                >= float(algorithm_time_limit),
+            }
+        )
+        complete = None
+        if peak_policy is not None:
+            progress(
+                f"[{spec.case_id}] production failed; running the independent "
+                "Complete Compact MIP baseline"
+            )
+            complete, complete_stage = _solve_complete_mip_baseline(
+                problem,
+                peak_policy,
+                objective=objective,
+                time_limit=complete_mip_time_limit,
+                mip_gap=complete_mip_gap,
+                solver_threads=solver_threads,
+                solver_seed=solver_seed,
+                verbose_solver=verbose_solver,
+            )
+            result["stages"]["complete_mip"] = complete_stage
+            if complete is None:
+                result["baseline_failure_stage"] = "complete_mip"
+        result["algorithm_completed"] = False
+        result["complete_mip_completed"] = complete is not None
+        result["global_pricing_audit_completed"] = False
+        result["metrics"] = {
+            "analytic_load_lower_bound": (
+                None
+                if peak_policy is None
+                else peak_policy.reference_utilization
+            ),
+            "epsilon_cap": (
+                None if peak_policy is None else peak_policy.epsilon_cap
+            ),
+            "complete_mip_upper_bound": (
+                None if complete is None else complete.objective
+            ),
+            "complete_mip_lower_bound": (
+                None
+                if complete is None
+                else complete.diagnostics.get("solver_bound")
+            ),
+            "complete_mip_gap": (
+                None
+                if complete is None
+                else complete.diagnostics.get("certified_gap")
+            ),
+            "complete_mip_status": (
+                None
+                if complete is None
+                else complete.diagnostics.get("status")
+            ),
+        }
         result["total_wall_seconds"] = perf_counter() - case_started
         checkpoint(result)
         return result
@@ -220,19 +361,31 @@ def run_v7_case(
     stage1 = None
     root = None
     integer = None
+    global_audit = None
 
     stage_started = perf_counter()
     progress(f"[{spec.case_id}] solving Stage 1 area model")
     try:
+        allocated_time_limits["stage1"] = budget.soft_stage_limit(
+            "Stage 1",
+            elapsed_seconds=perf_counter() - budget_started,
+            soft_limit=stage1_time_limit,
+            future_reserve=(
+                minimum_integer_time + budget.minimum_phase_launch_seconds
+            ),
+        )
         stage1 = V7Stage1AreaSolver(
             problem,
             peak_policy,
             atoms,
             V7Stage1Config(
-                time_limit=stage1_time_limit,
+                time_limit=allocated_time_limits["stage1"],
                 maximum_pool_solutions=stage1_pool_solutions,
                 pool_gap=stage1_pool_gap,
-                initial_candidate_area_cap=initial_candidate_area_cap,
+                additional_candidate_area_cap=additional_candidate_area_cap,
+                maximum_pool_candidate_areas=(
+                    maximum_pool_candidate_areas
+                ),
                 solver_threads=solver_threads,
                 solver_seed=solver_seed,
                 verbose=verbose_solver,
@@ -240,14 +393,19 @@ def run_v7_case(
             ),
         ).solve()
         guided_patterns = build_v7_stage1_guided_patterns(problem, atoms, stage1)
-        initial_patterns = normalize_v7_pattern_ids(
-            [*witness_patterns, *guided_patterns]
+        deterministic_patterns = build_v7_deterministic_one_group_patterns(
+            problem, atoms, stage1.restricted_areas_by_group
+        )
+        initial_search_patterns = normalize_v7_pattern_ids(
+            [*guided_patterns, *deterministic_patterns]
         )
         result["stages"]["stage1"] = {
             "state": "completed",
             "wall_seconds": perf_counter() - stage_started,
             "guided_pattern_count": len(guided_patterns),
-            "initial_pattern_count": len(initial_patterns),
+            "initial_search_pattern_count": len(initial_search_patterns),
+            "feasibility_proof_pattern_count": len(witness_patterns),
+            "allocated_time_limit": allocated_time_limits["stage1"],
             "diagnostics": dict(stage1.diagnostics),
         }
         checkpoint(result)
@@ -258,15 +416,21 @@ def run_v7_case(
 
     if stage1 is not None:
         stage_started = perf_counter()
-        progress(f"[{spec.case_id}] closing the V7 exact root")
+        progress(f"[{spec.case_id}] closing the V7.1 restricted exact root")
         try:
+            allocated_time_limits["root_cg"] = budget.soft_stage_limit(
+                "restricted root CG",
+                elapsed_seconds=perf_counter() - budget_started,
+                soft_limit=root_time_limit,
+                future_reserve=minimum_integer_time,
+            )
             root = V7RootColumnGeneration(
                 problem,
                 peak_policy,
-                stage1.active_areas_by_group,
-                initial_patterns,
+                stage1.restricted_areas_by_group,
+                initial_search_patterns,
                 V7RootCgConfig(
-                    root_time_limit=root_time_limit,
+                    root_time_limit=allocated_time_limits["root_cg"],
                     maximum_iterations=root_maximum_iterations,
                     columns_per_bay_per_round=columns_per_bay_per_round,
                     solver_threads=solver_threads,
@@ -275,12 +439,14 @@ def run_v7_case(
                     objective=objective,
                 ),
                 atoms=atoms,
+                feasibility_proof_patterns=witness_patterns,
             ).solve()
             result["stages"]["root_cg"] = {
                 "state": "completed",
                 "wall_seconds": perf_counter() - stage_started,
-                "lower_bound": root.objective,
+                "restricted_lp_bound": root.restricted_lp_bound,
                 "pattern_count": len(root.patterns),
+                "allocated_time_limit": allocated_time_limits["root_cg"],
                 "diagnostics": dict(root.diagnostics),
             }
             checkpoint(result)
@@ -293,15 +459,25 @@ def run_v7_case(
         stage_started = perf_counter()
         progress(f"[{spec.case_id}] solving the restricted integer master")
         try:
+            allocated_time_limits["integer"] = budget.integer_stage_limit(
+                elapsed_seconds=perf_counter() - budget_started,
+                optional_ceiling=integer_time_limit,
+            )
             integer_pool = normalize_v7_pattern_ids(
-                [*root.patterns, *witness_patterns, *guided_patterns]
+                [
+                    *root.patterns,
+                    *witness_patterns,
+                    *guided_patterns,
+                    *deterministic_patterns,
+                ]
             )
             integer = V7RestrictedIntegerSolver(
                 problem,
                 peak_policy,
                 integer_pool,
                 V7IntegerConfig(
-                    time_limit=integer_time_limit,
+                    time_limit=allocated_time_limits["integer"],
+                    wall_clock_deadline=algorithm_deadline,
                     mip_gap=integer_mip_gap,
                     solver_threads=solver_threads,
                     solver_seed=solver_seed,
@@ -309,11 +485,15 @@ def run_v7_case(
                     objective=objective,
                 ),
                 atoms=atoms,
+                restricted_areas_by_group=stage1.restricted_areas_by_group,
+                feasibility_proof_patterns=witness_patterns,
             ).solve()
             result["stages"]["integer"] = {
                 "state": "completed",
                 "wall_seconds": perf_counter() - stage_started,
-                "upper_bound": integer.objective,
+                "restricted_integer_ub": integer.objective,
+                "global_feasible_ub": integer.objective,
+                "allocated_time_limit": allocated_time_limits["integer"],
                 "diagnostics": dict(integer.diagnostics),
             }
             algorithm_completed = True
@@ -323,32 +503,76 @@ def run_v7_case(
             result["algorithm_failure_stage"] = "integer"
             checkpoint(result)
 
+    production_wall_seconds = perf_counter() - budget_started
+    result["algorithm_time_budget"].update(
+        {
+            "allocated_time_limits": dict(allocated_time_limits),
+            "production_wall_seconds": production_wall_seconds,
+            "remaining_seconds": budget.remaining(production_wall_seconds),
+            "budget_exhausted": production_wall_seconds
+            >= float(algorithm_time_limit),
+        }
+    )
+    checkpoint(result)
+
+    if root is not None and enable_global_pricing_audit:
+        stage_started = perf_counter()
+        progress(f"[{spec.case_id}] auditing the full V7 pricing domain")
+        try:
+            global_audit = audit_full_domain_pricing(
+                problem,
+                peak_policy,
+                root,
+                V7RootCgConfig(
+                    root_time_limit=root_time_limit,
+                    maximum_iterations=root_maximum_iterations,
+                    columns_per_bay_per_round=columns_per_bay_per_round,
+                    solver_threads=solver_threads,
+                    solver_seed=solver_seed,
+                    verbose=verbose_solver,
+                    objective=objective,
+                ),
+                atoms=atoms,
+            )
+            result["stages"]["global_pricing_audit"] = {
+                "state": "completed",
+                "wall_seconds": perf_counter() - stage_started,
+                "executed": global_audit.executed,
+                "minimum_reduced_cost": global_audit.minimum_reduced_cost,
+                "negative_pattern_count": global_audit.negative_pattern_count,
+                "affected_groups": list(global_audit.affected_groups),
+                "affected_areas": list(global_audit.affected_areas),
+                "affected_group_area_pairs": [
+                    list(pair)
+                    for pair in global_audit.affected_group_area_pairs
+                ],
+                "globally_root_certified": (
+                    global_audit.globally_root_certified
+                ),
+                "diagnostics": dict(global_audit.diagnostics),
+            }
+            checkpoint(result)
+        except Exception as error:
+            result["stages"]["global_pricing_audit"] = _stage_error(
+                error, stage_started
+            )
+            result["audit_failure_stage"] = "global_pricing_audit"
+            checkpoint(result)
+
     stage_started = perf_counter()
     progress(f"[{spec.case_id}] solving the same-model Complete Compact MIP")
-    complete = None
-    try:
-        complete = V7CompleteMipSolver(
-            problem,
-            V7CompleteMipConfig(
-                time_limit=complete_mip_time_limit,
-                mip_gap=complete_mip_gap,
-                solver_threads=solver_threads,
-                solver_seed=solver_seed,
-                verbose=verbose_solver,
-                require_business_optimality=False,
-                objective=objective,
-            ),
-        ).solve(peak_policy)
-        result["stages"]["complete_mip"] = {
-            "state": "completed",
-            "wall_seconds": perf_counter() - stage_started,
-            "upper_bound": complete.objective,
-            "lower_bound": complete.diagnostics.get("solver_bound"),
-            "gap": complete.diagnostics.get("certified_gap"),
-            "diagnostics": dict(complete.diagnostics),
-        }
-    except Exception as error:
-        result["stages"]["complete_mip"] = _stage_error(error, stage_started)
+    complete, complete_stage = _solve_complete_mip_baseline(
+        problem,
+        peak_policy,
+        objective=objective,
+        time_limit=complete_mip_time_limit,
+        mip_gap=complete_mip_gap,
+        solver_threads=solver_threads,
+        solver_seed=solver_seed,
+        verbose_solver=verbose_solver,
+    )
+    result["stages"]["complete_mip"] = complete_stage
+    if complete is None:
         result["baseline_failure_stage"] = "complete_mip"
         checkpoint(result)
 
@@ -361,11 +585,14 @@ def run_v7_case(
         absolute_gap = max(0.0, integer.objective - root.objective)
         metrics.update(
             {
-                "root_lp_lower_bound": root.objective,
-                "v7_integer_upper_bound": integer.objective,
-                "v7_absolute_root_gap": absolute_gap,
-                "v7_relative_root_gap": absolute_gap
+                "restricted_lp_bound": root.restricted_lp_bound,
+                "restricted_integer_ub": integer.objective,
+                "restricted_absolute_gap": absolute_gap,
+                "restricted_relative_gap": absolute_gap
                 / max(abs(integer.objective), 1e-12),
+                "global_feasible_ub": integer.objective,
+                "global_lower_bound": None,
+                "global_gap": None,
                 "v7_root_pattern_count": len(root.patterns),
                 "v7_independent_validation_passed": bool(
                     integer.certificate["validation"]["passed"]
@@ -376,6 +603,34 @@ def run_v7_case(
                 "v7_raw_objective_components": dict(integer.certificate["raw"]),
             }
         )
+    if global_audit is not None:
+        metrics.update(
+            {
+                "global_pricing_audit_executed": global_audit.executed,
+                "global_pricing_minimum_reduced_cost": (
+                    global_audit.minimum_reduced_cost
+                ),
+                "global_pricing_negative_pattern_count": (
+                    global_audit.negative_pattern_count
+                ),
+                "global_pricing_affected_group_area_pair_count": len(
+                    global_audit.affected_group_area_pairs
+                ),
+                "globally_root_certified": (
+                    global_audit.globally_root_certified
+                ),
+            }
+        )
+        if (
+            global_audit.globally_root_certified
+            and root is not None
+            and integer is not None
+        ):
+            global_gap = max(0.0, integer.objective - root.restricted_lp_bound)
+            metrics["global_lower_bound"] = root.restricted_lp_bound
+            metrics["global_gap"] = global_gap / max(
+                abs(integer.objective), 1e-12
+            )
     if complete is not None:
         metrics.update(
             {
@@ -396,7 +651,11 @@ def run_v7_case(
     result["metrics"] = metrics
     result["algorithm_completed"] = algorithm_completed
     result["complete_mip_completed"] = complete is not None
-    result["passed"] = algorithm_completed and complete is not None
+    audit_completed = not enable_global_pricing_audit or global_audit is not None
+    result["global_pricing_audit_completed"] = audit_completed
+    result["passed"] = (
+        algorithm_completed and complete is not None and audit_completed
+    )
     result["status"] = "completed" if result["passed"] else "partial"
     result["total_wall_seconds"] = perf_counter() - case_started
     checkpoint(result)
@@ -429,9 +688,21 @@ def _flat_case(result: Mapping[str, Any]) -> dict[str, Any]:
         "anonymous_import_boxes": problem.get("anonymous_import_boxes"),
         "row_atom_count": problem.get("row_atom_count"),
         "group_bay_edge_count": problem.get("group_bay_edge_count"),
-        "root_lp_lower_bound": metrics.get("root_lp_lower_bound"),
-        "v7_integer_upper_bound": metrics.get("v7_integer_upper_bound"),
-        "v7_relative_root_gap": metrics.get("v7_relative_root_gap"),
+        "restricted_lp_bound": metrics.get("restricted_lp_bound"),
+        "restricted_integer_ub": metrics.get("restricted_integer_ub"),
+        "restricted_relative_gap": metrics.get("restricted_relative_gap"),
+        "global_lower_bound": metrics.get("global_lower_bound"),
+        "global_gap": metrics.get("global_gap"),
+        "global_pricing_minimum_reduced_cost": metrics.get(
+            "global_pricing_minimum_reduced_cost"
+        ),
+        "global_pricing_negative_pattern_count": metrics.get(
+            "global_pricing_negative_pattern_count"
+        ),
+        "global_pricing_affected_group_area_pair_count": metrics.get(
+            "global_pricing_affected_group_area_pair_count"
+        ),
+        "globally_root_certified": metrics.get("globally_root_certified"),
         "complete_mip_upper_bound": metrics.get("complete_mip_upper_bound"),
         "complete_mip_lower_bound": metrics.get("complete_mip_lower_bound"),
         "complete_mip_gap": metrics.get("complete_mip_gap"),
@@ -439,6 +710,15 @@ def _flat_case(result: Mapping[str, Any]) -> dict[str, Any]:
             "v7_ub_improvement_vs_complete_mip_percent"
         ),
         "root_pattern_count": metrics.get("v7_root_pattern_count"),
+        "algorithm_time_limit": result.get("algorithm_time_budget", {}).get(
+            "total_time_limit"
+        ),
+        "algorithm_production_seconds": result.get(
+            "algorithm_time_budget", {}
+        ).get("production_wall_seconds"),
+        "integer_allocated_time_limit": result.get("algorithm_time_budget", {})
+        .get("allocated_time_limits", {})
+        .get("integer"),
         "total_wall_seconds": result.get("total_wall_seconds"),
     }
     for stage_name in (
@@ -446,6 +726,7 @@ def _flat_case(result: Mapping[str, Any]) -> dict[str, Any]:
         "peak_witness",
         "stage1",
         "root_cg",
+        "global_pricing_audit",
         "integer",
         "complete_mip",
     ):
@@ -460,18 +741,22 @@ def run_v7_suite(
     output_root: str | Path,
     *,
     case_ids: Sequence[str] | None = None,
+    algorithm_time_limit: float = 120.0,
+    minimum_integer_time: float = 5.0,
     peak_feasibility_time_limit: float = 10.0,
     stage1_time_limit: float = 10.0,
     stage1_pool_solutions: int = 8,
     stage1_pool_gap: float = 0.10,
-    initial_candidate_area_cap: int = 4,
+    additional_candidate_area_cap: int = 5,
+    maximum_pool_candidate_areas: int = 1,
     root_time_limit: float = 60.0,
     root_maximum_iterations: int = 100,
     columns_per_bay_per_round: int = 3,
-    integer_time_limit: float = 40.0,
+    integer_time_limit: float | None = None,
     integer_mip_gap: float = 0.0,
     complete_mip_time_limit: float = 120.0,
     complete_mip_gap: float = 0.0,
+    enable_global_pricing_audit: bool = False,
     solver_threads: int = 1,
     solver_seed: int = 0,
     peak_utilization_headroom_fraction: float = 0.50,
@@ -502,18 +787,22 @@ def run_v7_suite(
     suite: dict[str, Any] = {
         "report_schema_version": 1,
         "model_schema_version": V7_MODEL_SCHEMA_VERSION,
-        "algorithm": "v7_stage1_exact_bay_pricing_rim",
+        "algorithm": V7_1_ALGORITHM_VERSION,
         "created_at_utc": datetime.now(timezone.utc).isoformat(),
         "suite_path": str(suite_path),
         "base_input": str(base_path),
         "python_version": platform.python_version(),
         "configuration": {
             "objective": objective.as_dict(),
+            "algorithm_time_limit": algorithm_time_limit,
+            "minimum_integer_time": minimum_integer_time,
             "peak_feasibility_time_limit": peak_feasibility_time_limit,
+            "peak_witness_objective_mode": "feasibility",
             "stage1_time_limit": stage1_time_limit,
             "stage1_pool_solutions": stage1_pool_solutions,
             "stage1_pool_gap": stage1_pool_gap,
-            "initial_candidate_area_cap": initial_candidate_area_cap,
+            "additional_candidate_area_cap": additional_candidate_area_cap,
+            "maximum_pool_candidate_areas": maximum_pool_candidate_areas,
             "root_time_limit": root_time_limit,
             "root_maximum_iterations": root_maximum_iterations,
             "columns_per_bay_per_round": columns_per_bay_per_round,
@@ -521,6 +810,7 @@ def run_v7_suite(
             "integer_mip_gap": integer_mip_gap,
             "complete_mip_time_limit": complete_mip_time_limit,
             "complete_mip_gap": complete_mip_gap,
+            "enable_global_pricing_audit": enable_global_pricing_audit,
             "solver_threads": solver_threads,
             "solver_seed": solver_seed,
             "verbose_solver": verbose_solver,
@@ -547,11 +837,14 @@ def run_v7_suite(
             base,
             spec,
             objective=objective,
+            algorithm_time_limit=algorithm_time_limit,
+            minimum_integer_time=minimum_integer_time,
             peak_feasibility_time_limit=peak_feasibility_time_limit,
             stage1_time_limit=stage1_time_limit,
             stage1_pool_solutions=stage1_pool_solutions,
             stage1_pool_gap=stage1_pool_gap,
-            initial_candidate_area_cap=initial_candidate_area_cap,
+            additional_candidate_area_cap=additional_candidate_area_cap,
+            maximum_pool_candidate_areas=maximum_pool_candidate_areas,
             root_time_limit=root_time_limit,
             root_maximum_iterations=root_maximum_iterations,
             columns_per_bay_per_round=columns_per_bay_per_round,
@@ -559,6 +852,7 @@ def run_v7_suite(
             integer_mip_gap=integer_mip_gap,
             complete_mip_time_limit=complete_mip_time_limit,
             complete_mip_gap=complete_mip_gap,
+            enable_global_pricing_audit=enable_global_pricing_audit,
             solver_threads=solver_threads,
             solver_seed=solver_seed,
             verbose_solver=verbose_solver,

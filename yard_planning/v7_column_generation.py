@@ -1,4 +1,4 @@
-"""Global V7 bay-pattern RMP and exact active-set column generation."""
+"""V7.1 restricted bay-pattern RMP, exact CG, and read-only global audit."""
 
 from __future__ import annotations
 
@@ -11,7 +11,12 @@ from typing import Iterable, Mapping, Sequence
 from .gurobi_backend import GurobiModel, MipProgressRecorder
 from .models import ProblemData
 from .row_aware_zones import v6_footprint
-from .v7_atoms import V7RowAtom, atoms_by_group_bay, build_v7_row_atoms
+from .v7_atoms import (
+    V7RowAtom,
+    atoms_by_group_bay,
+    build_v7_row_atoms,
+    filter_atoms_by_restricted_areas,
+)
 from .v7_bay_patterns import (
     V7BayPattern,
     V7ExactBayPricing,
@@ -24,6 +29,10 @@ from .v7_model import (
     V7ObjectiveConfig,
     V7PeakUtilizationPolicy,
 )
+from .v7_stage1_area import freeze_restricted_areas
+
+
+V7_1_ALGORITHM_VERSION = "hierarchical_v7_1_restricted_area_bay_cg"
 
 
 class V7RootCgIncompleteError(RuntimeError):
@@ -69,11 +78,64 @@ class V7MasterSolution:
 
 @dataclass(frozen=True)
 class V7RootCgResult:
-    objective: float
+    restricted_lp_bound: float
     patterns: tuple[V7BayPattern, ...]
+    feasibility_proof_pattern_signatures: frozenset[tuple[int, ...]]
     solution: V7MasterSolution
-    active_areas_by_group: Mapping[str, frozenset[str]]
+    restricted_areas_by_group: Mapping[str, frozenset[str]]
     diagnostics: Mapping[str, object]
+
+    @property
+    def objective(self) -> float:
+        """Compatibility alias; this is only a restricted-domain LP bound."""
+
+        return float(self.restricted_lp_bound)
+
+
+@dataclass(frozen=True)
+class V7GlobalPricingAudit:
+    executed: bool
+    minimum_reduced_cost: float | None
+    negative_pattern_count: int
+    affected_groups: tuple[str, ...]
+    affected_areas: tuple[str, ...]
+    affected_group_area_pairs: tuple[tuple[str, str], ...]
+    globally_root_certified: bool
+    diagnostics: Mapping[str, object]
+
+
+def pattern_is_in_restricted_domain(
+    problem: ProblemData,
+    pattern: V7BayPattern,
+    restricted_areas_by_group: Mapping[str, Iterable[str]],
+) -> bool:
+    area = str(problem.bays[pattern.anchor_bay_key].area_no)
+    restricted = {
+        str(group_id): {str(value) for value in areas}
+        for group_id, areas in restricted_areas_by_group.items()
+    }
+    return all(area in restricted.get(group_id, set()) for group_id in pattern.active_groups)
+
+
+def validate_patterns_in_restricted_domain(
+    problem: ProblemData,
+    patterns: Sequence[V7BayPattern],
+    restricted_areas_by_group: Mapping[str, Iterable[str]],
+    *,
+    source: str,
+) -> None:
+    excluded = [
+        pattern.pattern_id
+        for pattern in patterns
+        if not pattern_is_in_restricted_domain(
+            problem, pattern, restricted_areas_by_group
+        )
+    ]
+    if excluded:
+        raise ValueError(
+            f"{source} contains patterns outside the frozen V7.1 restricted "
+            f"area domain: {excluded[:10]}"
+        )
 
 
 def patterns_from_atom_solution(
@@ -126,6 +188,10 @@ class V7GlobalPatternMaster:
         peak_policy: V7PeakUtilizationPolicy,
         objective: V7ObjectiveConfig | None = None,
         *,
+        restricted_areas_by_group: Mapping[str, Iterable[str]] | None = None,
+        restricted_domain_exempt_pattern_signatures: Iterable[
+            tuple[int, ...]
+        ] = (),
         integral: bool = False,
         time_limit: float = 30.0,
         mip_gap: float = 0.0,
@@ -146,6 +212,15 @@ class V7GlobalPatternMaster:
         self.solver_threads = int(solver_threads)
         self.solver_seed = int(solver_seed)
         self.verbose = bool(verbose)
+        self.restricted_areas_by_group = (
+            None
+            if restricted_areas_by_group is None
+            else freeze_restricted_areas(restricted_areas_by_group)
+        )
+        self.restricted_domain_exempt_pattern_signatures = frozenset(
+            tuple(int(index) for index in signature)
+            for signature in restricted_domain_exempt_pattern_signatures
+        )
         self.evaluator = V7ModelEvaluator(problem, self.atoms, self.objective)
         self.groups = self.evaluator.groups
         self.groups_by_id = self.evaluator.groups_by_id
@@ -158,6 +233,28 @@ class V7GlobalPatternMaster:
         self.constraints: defaultdict[str, dict[object, object]] = defaultdict(dict)
 
     def _validate_patterns(self) -> None:
+        supplied_signatures = {pattern.signature for pattern in self.patterns}
+        unknown_exemptions = (
+            self.restricted_domain_exempt_pattern_signatures
+            - supplied_signatures
+        )
+        if unknown_exemptions:
+            raise ValueError(
+                "V7 pattern-master domain exemptions must identify supplied "
+                f"patterns: {sorted(unknown_exemptions)[:3]}"
+            )
+        if self.restricted_areas_by_group is not None:
+            validate_patterns_in_restricted_domain(
+                self.problem,
+                [
+                    pattern
+                    for pattern in self.patterns
+                    if pattern.signature
+                    not in self.restricted_domain_exempt_pattern_signatures
+                ],
+                self.restricted_areas_by_group,
+                source="V7.1 pattern master",
+            )
         atoms_by_index = {atom.candidate_index: atom for atom in self.atoms}
         for pattern in self.patterns:
             self._validate_pattern(pattern, atoms_by_index)
@@ -219,10 +316,13 @@ class V7GlobalPatternMaster:
         binary = "B" if self.integral else "C"
         integer = "I" if self.integral else "C"
 
+        # The per-anchor choice row already implies lambda <= 1.  Leaving the
+        # redundant LP upper bound off keeps every existing column structurally
+        # dual-feasible, so exact pricing does not need growing no-good rows.
+        # Binary variables retain their implicit unit upper bound in the RIM.
         self.pattern_variables = {
             pattern.pattern_id: model.addVar(
                 lb=0.0,
-                ub=1.0,
                 vtype=binary,
                 name=f"lambda_pattern_{pattern.pattern_id}",
             )
@@ -676,6 +776,9 @@ class V7GlobalPatternMaster:
                 "runtime_seconds": model.getRuntime(),
                 "wall_seconds": perf_counter() - started,
                 "pattern_count": len(self.patterns),
+                "restricted_domain_exempt_pattern_count": len(
+                    self.restricted_domain_exempt_pattern_signatures
+                ),
                 "constraint_count_by_family": {
                     family: len(rows) for family, rows in sorted(self.constraints.items())
                 },
@@ -698,6 +801,9 @@ class V7GlobalPatternMaster:
         model = self.model
         assert model is not None
         existing = {pattern.signature for pattern in self.patterns}
+        existing_master_columns = {
+            pattern.master_column_signature for pattern in self.patterns
+        }
         next_id = max(self.patterns_by_id, default=-1) + 1
         added: list[V7BayPattern] = []
         atoms_by_index = {atom.candidate_index: atom for atom in self.atoms}
@@ -706,8 +812,17 @@ class V7GlobalPatternMaster:
         ):
             if raw.signature in existing:
                 continue
+            if raw.master_column_signature in existing_master_columns:
+                continue
             pattern = replace(raw, pattern_id=next_id)
             self._validate_pattern(pattern, atoms_by_index)
+            if self.restricted_areas_by_group is not None:
+                validate_patterns_in_restricted_domain(
+                    self.problem,
+                    [pattern],
+                    self.restricted_areas_by_group,
+                    source="V7.1 priced columns",
+                )
             total_capacity = sum(dict(pattern.group_capacities).values())
             terms: list[tuple[float, object]] = [
                 (
@@ -769,7 +884,6 @@ class V7GlobalPatternMaster:
             variable = model.addPricedVar(
                 terms,
                 lb=0.0,
-                ub=1.0,
                 vtype="C",
                 name=f"lambda_pattern_{pattern.pattern_id}",
             )
@@ -777,6 +891,7 @@ class V7GlobalPatternMaster:
             self.patterns_by_id[pattern.pattern_id] = pattern
             added.append(pattern)
             existing.add(pattern.signature)
+            existing_master_columns.add(pattern.master_column_signature)
             next_id += 1
         if added:
             self.patterns = (*self.patterns, *added)
@@ -991,18 +1106,54 @@ def solve_full_pattern_oracle(
         master.dispose()
 
 
+def solve_restricted_pattern_oracle(
+    problem: ProblemData,
+    peak_policy: V7PeakUtilizationPolicy,
+    restricted_areas_by_group: Mapping[str, Iterable[str]],
+    *,
+    atoms: Sequence[V7RowAtom] | None = None,
+    objective: V7ObjectiveConfig | None = None,
+    integral: bool = False,
+    time_limit: float = 10.0,
+) -> tuple[V7MasterSolution, tuple[V7BayPattern, ...]]:
+    """Micro oracle that exhaustively enumerates only the restricted domain."""
+
+    if atoms is None:
+        atoms, _limits = build_v7_row_atoms(problem)
+    full_atoms = tuple(atoms)
+    restricted_atoms = filter_atoms_by_restricted_areas(
+        full_atoms, restricted_areas_by_group
+    )
+    patterns = build_full_v7_pattern_universe(problem, restricted_atoms)
+    master = V7GlobalPatternMaster(
+        problem,
+        full_atoms,
+        patterns,
+        peak_policy,
+        objective,
+        restricted_areas_by_group=restricted_areas_by_group,
+        integral=integral,
+        time_limit=time_limit,
+    )
+    try:
+        return master.solve(), patterns
+    finally:
+        master.dispose()
+
+
 class V7RootColumnGeneration:
-    """Active-domain CG with mandatory exact full-domain certification."""
+    """Exact Bay-Pattern CG inside one frozen V7.1 restricted area domain."""
 
     def __init__(
         self,
         problem: ProblemData,
         peak_policy: V7PeakUtilizationPolicy,
-        active_areas_by_group: Mapping[str, Iterable[str]],
+        restricted_areas_by_group: Mapping[str, Iterable[str]],
         initial_patterns: Sequence[V7BayPattern],
         config: V7RootCgConfig | None = None,
         *,
         atoms: Sequence[V7RowAtom] | None = None,
+        feasibility_proof_patterns: Sequence[V7BayPattern] = (),
     ) -> None:
         self.problem = problem
         self.peak_policy = peak_policy
@@ -1014,45 +1165,76 @@ class V7RootColumnGeneration:
         self.evaluator = V7ModelEvaluator(
             problem, self.atoms, self.config.objective
         )
-        self.active = {
-            str(group_id): {str(area) for area in areas}
-            for group_id, areas in active_areas_by_group.items()
-        }
+        self.restricted_areas_by_group = freeze_restricted_areas(
+            restricted_areas_by_group
+        )
         for group in self.evaluator.groups:
-            if not self.active.get(group.group_id):
-                raise ValueError(f"V7 root has no active area for {group.group_id}")
-        self.patterns = list(normalize_v7_pattern_ids(initial_patterns))
+            if not self.restricted_areas_by_group.get(group.group_id):
+                raise ValueError(
+                    f"V7.1 root has no restricted area for {group.group_id}"
+                )
+        search_patterns = normalize_v7_pattern_ids(initial_patterns)
+        proof_patterns = normalize_v7_pattern_ids(feasibility_proof_patterns)
+        self.feasibility_proof_pattern_signatures = frozenset(
+            pattern.signature for pattern in proof_patterns
+        )
+        self.patterns = list(
+            normalize_v7_pattern_ids([*search_patterns, *proof_patterns])
+        )
         if not self.patterns:
-            raise ValueError("V7 root requires explicit feasible initial patterns")
+            raise ValueError("V7 root requires explicit initial patterns")
+        validate_patterns_in_restricted_domain(
+            problem,
+            search_patterns,
+            self.restricted_areas_by_group,
+            source="V7.1 initial search patterns",
+        )
+        self.initial_search_pattern_count = len(search_patterns)
+        self.initial_proof_pattern_count = len(
+            self.feasibility_proof_pattern_signatures
+        )
+        self.outside_domain_proof_pattern_count = sum(
+            not pattern_is_in_restricted_domain(
+                problem, pattern, self.restricted_areas_by_group
+            )
+            for pattern in proof_patterns
+        )
         self.pricing = V7ExactBayPricing(
             problem,
             self.atoms,
             columns_per_bay=self.config.columns_per_bay_per_round,
             reduced_cost_tolerance=self.config.reduced_cost_tolerance,
         )
+        all_anchors = sorted({atom.anchor_bay_key for atom in self.atoms})
+        self.allowed_groups_by_anchor = {
+            anchor: frozenset(self._allowed_groups_uncached(anchor))
+            for anchor in all_anchors
+        }
+        self.pricing_anchors = tuple(
+            anchor
+            for anchor in all_anchors
+            if self.allowed_groups_by_anchor[anchor]
+        )
 
-    def _allowed_groups(self, anchor: str, full_domain: bool) -> set[str] | None:
-        if full_domain:
-            return None
+    def _allowed_groups_uncached(self, anchor: str) -> set[str]:
         area = str(self.problem.bays[anchor].area_no)
         return {
             group.group_id
             for group in self.evaluator.groups
-            if area in self.active[group.group_id]
+            if area in self.restricted_areas_by_group[group.group_id]
         }
+
+    def _allowed_groups(self, anchor: str) -> frozenset[str]:
+        return self.allowed_groups_by_anchor.get(str(anchor), frozenset())
 
     def solve(self) -> V7RootCgResult:
         started = perf_counter()
         initial_count = len(self.patterns)
         iterations = 0
-        expansions = 0
-        activated_pairs: set[tuple[str, str]] = set()
-        certification_count = 0
-        certification_seconds = 0.0
         pricing_rows: list[dict[str, object]] = []
         iteration_rows: list[dict[str, object]] = []
         master_solve_seconds = 0.0
-        active_pricing_seconds = 0.0
+        restricted_pricing_seconds = 0.0
         final_minimum = math.inf
         solution: V7MasterSolution | None = None
         master = V7GlobalPatternMaster(
@@ -1061,6 +1243,10 @@ class V7RootColumnGeneration:
             self.patterns,
             self.peak_policy,
             self.config.objective,
+            restricted_areas_by_group=self.restricted_areas_by_group,
+            restricted_domain_exempt_pattern_signatures=(
+                self.feasibility_proof_pattern_signatures
+            ),
             integral=False,
             time_limit=self.config.root_time_limit,
             solver_threads=self.config.solver_threads,
@@ -1070,21 +1256,69 @@ class V7RootColumnGeneration:
 
         def incomplete_diagnostics() -> dict[str, object]:
             return {
-                "root_closed": False,
-                "iterations": iterations,
+                "restricted_root_closed": False,
+                "global_root_certified": False,
+                "restricted_pricing_rounds": iterations,
                 "pattern_count": len(master.patterns),
-                "last_root_objective": (
+                "last_restricted_lp_bound": (
                     float(solution.objective) if solution is not None else None
                 ),
-                "root_total_seconds": perf_counter() - started,
+                "restricted_root_closure_seconds": perf_counter() - started,
                 "master_solve_seconds": master_solve_seconds,
-                "active_pricing_seconds": active_pricing_seconds,
-                "full_domain_certification_count": certification_count,
-                "full_domain_certification_seconds": certification_seconds,
+                "restricted_pricing_seconds": restricted_pricing_seconds,
+                "full_domain_certification_count": 0,
+                "active_area_expansion_count": 0,
+                "production_global_expansion_enabled": False,
+                "initial_search_pattern_count": self.initial_search_pattern_count,
+                "feasibility_proof_pattern_count": self.initial_proof_pattern_count,
+                "outside_restricted_domain_proof_pattern_count": (
+                    self.outside_domain_proof_pattern_count
+                ),
+                "proof_columns_expand_pricing_domain": False,
+                "pricing_anchor_count": len(self.pricing_anchors),
+                "anchor_atom_index_used": True,
+                "existing_signatures_indexed_by_anchor": True,
+                "pricing_state_total": sum(
+                    int(row.get("pricing_state_total", 0))
+                    for row in pricing_rows
+                ),
+                "pricing_state_screened_by_lower_bound": sum(
+                    int(row.get("pricing_state_screened_by_lower_bound", 0))
+                    for row in pricing_rows
+                ),
+                "pricing_state_mip_solved": sum(
+                    int(row.get("pricing_state_count", 0))
+                    for row in pricing_rows
+                ),
+                "persistent_pricing_state_build_count": sum(
+                    int(row.get("persistent_pricing_state_build_count", 0))
+                    for row in pricing_rows
+                ),
+                "persistent_pricing_state_reuse_count": sum(
+                    int(row.get("persistent_pricing_state_reuse_count", 0))
+                    for row in pricing_rows
+                ),
+                "restricted_areas_by_group": {
+                    group_id: sorted(areas)
+                    for group_id, areas in self.restricted_areas_by_group.items()
+                },
                 "iteration_summaries": list(iteration_rows),
             }
 
         try:
+            existing_signatures_by_anchor: defaultdict[
+                str, set[tuple[int, ...]]
+            ] = defaultdict(set)
+            existing_master_columns_by_anchor: defaultdict[
+                str, set[tuple[object, ...]]
+            ] = defaultdict(set)
+            for pattern in master.patterns:
+                existing_signatures_by_anchor[pattern.anchor_bay_key].add(
+                    pattern.signature
+                )
+                existing_master_columns_by_anchor[
+                    pattern.anchor_bay_key
+                ].add(pattern.master_column_signature)
             while iterations < int(self.config.maximum_iterations):
                 if perf_counter() - started > float(self.config.root_time_limit):
                     raise V7RootCgIncompleteError(
@@ -1106,11 +1340,10 @@ class V7RootColumnGeneration:
                 master_solve_seconds += float(
                     solution.diagnostics.get("wall_seconds", 0.0)
                 )
-                existing = {pattern.signature for pattern in master.patterns}
                 new_patterns: list[V7BayPattern] = []
-                active_minimum = math.inf
-                active_started = perf_counter()
-                for anchor in sorted({atom.anchor_bay_key for atom in self.atoms}):
+                restricted_minimum = math.inf
+                pricing_started = perf_counter()
+                for anchor in self.pricing_anchors:
                     result = self.pricing.price_bay_exact_mip(
                         anchor,
                         lambda atom, m=master, d=solution.duals: m.pattern_atom_reduced_cost(atom, d),
@@ -1119,29 +1352,48 @@ class V7RootColumnGeneration:
                             bay, size, height, group, physical, d
                         ),
                         verify_reduced_cost=lambda pattern, m=master, d=solution.duals: m.pattern_reduced_cost(pattern, d),
-                        allowed_groups=self._allowed_groups(anchor, False),
-                        excluded_signatures=existing,
+                        allowed_groups=self._allowed_groups(anchor),
+                        excluded_signatures=(
+                            existing_signatures_by_anchor[anchor]
+                        ),
+                        excluded_master_column_signatures=(
+                            existing_master_columns_by_anchor[anchor]
+                        ),
                         solver_threads=self.config.solver_threads,
+                        excluded_signatures_are_dual_feasible=True,
                     )
                     if result.minimum_reduced_cost is not None:
-                        active_minimum = min(active_minimum, result.minimum_reduced_cost)
+                        restricted_minimum = min(
+                            restricted_minimum, result.minimum_reduced_cost
+                        )
                     new_patterns.extend(result.returned_patterns)
                     pricing_rows.append(
-                        {"iteration": iterations, "domain": "active", **result.diagnostics}
+                        {
+                            "iteration": iterations,
+                            "domain": "restricted",
+                            **result.diagnostics,
+                        }
                     )
-                active_pricing_seconds += perf_counter() - active_started
+                restricted_pricing_seconds += perf_counter() - pricing_started
                 if new_patterns:
                     added = master.add_patterns(new_patterns)
+                    for pattern in added:
+                        existing_signatures_by_anchor[
+                            pattern.anchor_bay_key
+                        ].add(pattern.signature)
+                        existing_master_columns_by_anchor[
+                            pattern.anchor_bay_key
+                        ].add(pattern.master_column_signature)
                     self.patterns = list(master.patterns)
                     iteration_rows.append(
                         {
                             "iteration": iterations,
-                            "domain": "active",
+                            "domain": "restricted",
                             "objective": float(solution.objective),
                             "minimum_reduced_cost": (
                                 None
-                                if not math.isfinite(active_minimum)
-                                else float(active_minimum)
+                                if not math.isfinite(restricted_minimum)
+                                else float(restricted_minimum)
                             ),
                             "columns_added": len(added),
                             "pattern_count": len(master.patterns),
@@ -1149,63 +1401,11 @@ class V7RootColumnGeneration:
                         }
                     )
                     continue
-
-                certification_count += 1
-                certification_started = perf_counter()
-                full_new: list[V7BayPattern] = []
-                full_minimum = math.inf
-                for anchor in sorted({atom.anchor_bay_key for atom in self.atoms}):
-                    result = self.pricing.price_bay_exact_mip(
-                        anchor,
-                        lambda atom, m=master, d=solution.duals: m.pattern_atom_reduced_cost(atom, d),
-                        lambda bay, m=master, d=solution.duals: m.pattern_bay_reduced_cost(bay, d),
-                        lambda bay, size, height, group, physical, m=master, d=solution.duals: m.pattern_group_support_reduced_cost(
-                            bay, size, height, group, physical, d
-                        ),
-                        verify_reduced_cost=lambda pattern, m=master, d=solution.duals: m.pattern_reduced_cost(pattern, d),
-                        allowed_groups=None,
-                        excluded_signatures=existing,
-                        solver_threads=self.config.solver_threads,
-                    )
-                    if result.minimum_reduced_cost is not None:
-                        full_minimum = min(full_minimum, result.minimum_reduced_cost)
-                    full_new.extend(result.returned_patterns)
-                    pricing_rows.append(
-                        {"iteration": iterations, "domain": "full", **result.diagnostics}
-                    )
-                certification_seconds += perf_counter() - certification_started
-                final_minimum = min(active_minimum, full_minimum)
-                if full_new:
-                    for pattern in full_new:
-                        area = str(self.problem.bays[pattern.anchor_bay_key].area_no)
-                        for group_id in pattern.active_groups:
-                            pair = (group_id, area)
-                            if area not in self.active[group_id]:
-                                self.active[group_id].add(area)
-                                activated_pairs.add(pair)
-                                expansions += 1
-                    added = master.add_patterns(full_new)
-                    self.patterns = list(master.patterns)
-                    iteration_rows.append(
-                        {
-                            "iteration": iterations,
-                            "domain": "full",
-                            "objective": float(solution.objective),
-                            "minimum_reduced_cost": (
-                                None
-                                if not math.isfinite(full_minimum)
-                                else float(full_minimum)
-                            ),
-                            "columns_added": len(added),
-                            "pattern_count": len(master.patterns),
-                            "seconds": perf_counter() - iteration_started,
-                        }
-                    )
-                    continue
+                final_minimum = restricted_minimum
                 iteration_rows.append(
                     {
                         "iteration": iterations,
-                        "domain": "full_certified",
+                        "domain": "restricted_certified",
                         "objective": float(solution.objective),
                         "minimum_reduced_cost": (
                             0.0
@@ -1217,7 +1417,6 @@ class V7RootColumnGeneration:
                         "seconds": perf_counter() - iteration_started,
                     }
                 )
-                root_closed = True
                 break
             else:
                 raise V7RootCgIncompleteError(
@@ -1227,53 +1426,225 @@ class V7RootColumnGeneration:
             assert solution is not None
             self.patterns = list(master.patterns)
             diagnostics = {
-                "algorithm": "v7_active_area_global_bay_pattern_cg",
+                "algorithm": V7_1_ALGORITHM_VERSION,
                 "model_schema_version": V7_MODEL_SCHEMA_VERSION,
-                "root_objective": float(solution.objective),
-                "root_iterations": iterations,
-                "root_total_seconds": perf_counter() - started,
+                "restricted_lp_bound": float(solution.objective),
+                "restricted_pricing_rounds": iterations,
+                "restricted_root_closure_seconds": perf_counter() - started,
                 "master_solve_seconds": master_solve_seconds,
-                "active_pricing_seconds": active_pricing_seconds,
+                "restricted_pricing_seconds": restricted_pricing_seconds,
                 "initial_pattern_count": initial_count,
+                "initial_search_pattern_count": self.initial_search_pattern_count,
+                "feasibility_proof_pattern_count": self.initial_proof_pattern_count,
+                "outside_restricted_domain_proof_pattern_count": (
+                    self.outside_domain_proof_pattern_count
+                ),
+                "proof_columns_expand_pricing_domain": False,
+                "pricing_anchor_count": len(self.pricing_anchors),
+                "anchor_atom_index_used": True,
+                "existing_signatures_indexed_by_anchor": True,
+                "pricing_state_total": sum(
+                    int(row.get("pricing_state_total", 0))
+                    for row in pricing_rows
+                ),
+                "pricing_state_screened_by_lower_bound": sum(
+                    int(row.get("pricing_state_screened_by_lower_bound", 0))
+                    for row in pricing_rows
+                ),
+                "pricing_state_mip_solved": sum(
+                    int(row.get("pricing_state_count", 0))
+                    for row in pricing_rows
+                ),
+                "persistent_pricing_state_build_count": sum(
+                    int(row.get("persistent_pricing_state_build_count", 0))
+                    for row in pricing_rows
+                ),
+                "persistent_pricing_state_reuse_count": sum(
+                    int(row.get("persistent_pricing_state_reuse_count", 0))
+                    for row in pricing_rows
+                ),
                 "final_pattern_count": len(self.patterns),
-                "active_area_expansion_count": expansions,
-                "group_area_pairs_activated_by_global_pricing": [
-                    list(pair) for pair in sorted(activated_pairs)
-                ],
-                "full_domain_certification_count": certification_count,
-                "full_domain_certification_seconds": certification_seconds,
-                "final_minimum_reduced_cost": (
+                "patterns_added": len(self.patterns) - initial_count,
+                "minimum_restricted_reduced_cost": (
                     0.0 if not math.isfinite(final_minimum) else float(final_minimum)
                 ),
-                "root_closed": root_closed,
+                "restricted_root_closed": True,
+                "global_root_certified": False,
                 "stage1_quota_fixed": False,
-                "full_domain_exact_pricing_required": True,
+                "full_domain_certification_count": 0,
+                "full_domain_certification_seconds": 0.0,
+                "active_area_expansion_count": 0,
+                "group_area_pairs_activated_by_global_pricing": [],
+                "production_global_expansion_enabled": False,
+                "full_domain_pricing_role": "optional_diagnostic_audit_only",
+                "restricted_areas_by_group": {
+                    group_id: sorted(areas)
+                    for group_id, areas in self.restricted_areas_by_group.items()
+                },
                 "incremental_master_column_addition": True,
                 "iteration_summaries": iteration_rows,
                 "pricing_iterations": pricing_rows,
             }
             return V7RootCgResult(
-                objective=float(solution.objective),
+                restricted_lp_bound=float(solution.objective),
                 patterns=tuple(self.patterns),
+                feasibility_proof_pattern_signatures=(
+                    self.feasibility_proof_pattern_signatures
+                ),
                 solution=solution,
-                active_areas_by_group={
-                    group_id: frozenset(areas) for group_id, areas in self.active.items()
-                },
+                restricted_areas_by_group=self.restricted_areas_by_group,
                 diagnostics=diagnostics,
             )
         finally:
             master.dispose()
+            self.pricing.dispose()
+
+
+def not_executed_global_pricing_audit() -> V7GlobalPricingAudit:
+    return V7GlobalPricingAudit(
+        executed=False,
+        minimum_reduced_cost=None,
+        negative_pattern_count=0,
+        affected_groups=(),
+        affected_areas=(),
+        affected_group_area_pairs=(),
+        globally_root_certified=False,
+        diagnostics={"mutates_production_state": False},
+    )
+
+
+def audit_full_domain_pricing(
+    problem: ProblemData,
+    peak_policy: V7PeakUtilizationPolicy,
+    root: V7RootCgResult,
+    config: V7RootCgConfig | None = None,
+    *,
+    atoms: Sequence[V7RowAtom] | None = None,
+) -> V7GlobalPricingAudit:
+    """Audit excluded areas with exact pricing without changing the V7.1 solve."""
+
+    cfg = config or V7RootCgConfig()
+    cfg.validate()
+    if atoms is None:
+        atoms, _limits = build_v7_row_atoms(problem)
+    atoms = tuple(atoms)
+    restricted_snapshot = freeze_restricted_areas(
+        root.restricted_areas_by_group
+    )
+    pattern_signatures_before = tuple(pattern.signature for pattern in root.patterns)
+    master = V7GlobalPatternMaster(
+        problem,
+        atoms,
+        root.patterns,
+        peak_policy,
+        cfg.objective,
+        restricted_areas_by_group=restricted_snapshot,
+        restricted_domain_exempt_pattern_signatures=(
+            root.feasibility_proof_pattern_signatures
+        ),
+        integral=False,
+        time_limit=cfg.root_time_limit,
+        solver_threads=cfg.solver_threads,
+        solver_seed=cfg.solver_seed,
+        verbose=cfg.verbose,
+    )
+    pricing = V7ExactBayPricing(
+        problem,
+        atoms,
+        columns_per_bay=cfg.columns_per_bay_per_round,
+        reduced_cost_tolerance=cfg.reduced_cost_tolerance,
+    )
+    started = perf_counter()
+    minimum = math.inf
+    negative: dict[tuple[int, ...], V7BayPattern] = {}
+    pricing_rows: list[dict[str, object]] = []
+    existing_by_anchor: defaultdict[str, set[tuple[int, ...]]] = defaultdict(set)
+    existing_master_columns_by_anchor: defaultdict[
+        str, set[tuple[object, ...]]
+    ] = defaultdict(set)
+    for pattern in root.patterns:
+        existing_by_anchor[pattern.anchor_bay_key].add(pattern.signature)
+        existing_master_columns_by_anchor[pattern.anchor_bay_key].add(
+            pattern.master_column_signature
+        )
+    duals = root.solution.duals
+    for anchor in sorted({atom.anchor_bay_key for atom in atoms}):
+        result = pricing.price_bay_exact_mip(
+            anchor,
+            lambda atom, m=master, d=duals: m.pattern_atom_reduced_cost(atom, d),
+            lambda bay, m=master, d=duals: m.pattern_bay_reduced_cost(bay, d),
+            lambda bay, size, height, group, physical, m=master, d=duals: m.pattern_group_support_reduced_cost(
+                bay, size, height, group, physical, d
+            ),
+            verify_reduced_cost=lambda pattern, m=master, d=duals: m.pattern_reduced_cost(
+                pattern, d
+            ),
+            allowed_groups=None,
+            excluded_signatures=existing_by_anchor[anchor],
+            excluded_master_column_signatures=(
+                existing_master_columns_by_anchor[anchor]
+            ),
+            solver_threads=cfg.solver_threads,
+            excluded_signatures_are_dual_feasible=True,
+        )
+        if result.minimum_reduced_cost is not None:
+            minimum = min(minimum, float(result.minimum_reduced_cost))
+        for pattern in result.returned_patterns:
+            negative.setdefault(pattern.signature, pattern)
+        pricing_rows.append(dict(result.diagnostics))
+
+    affected_pairs: set[tuple[str, str]] = set()
+    for pattern in negative.values():
+        area = str(problem.bays[pattern.anchor_bay_key].area_no)
+        for group_id in pattern.active_groups:
+            if area not in restricted_snapshot.get(group_id, frozenset()):
+                affected_pairs.add((group_id, area))
+    if tuple(pattern.signature for pattern in root.patterns) != pattern_signatures_before:
+        raise RuntimeError("V7.1 global audit mutated the production pattern pool")
+    minimum_value = None if not math.isfinite(minimum) else float(minimum)
+    certified = not negative and (
+        minimum_value is None
+        or minimum_value >= -float(cfg.reduced_cost_tolerance)
+    )
+    audit_seconds = perf_counter() - started
+    pricing.dispose()
+    master.dispose()
+    return V7GlobalPricingAudit(
+        executed=True,
+        minimum_reduced_cost=minimum_value,
+        negative_pattern_count=len(negative),
+        affected_groups=tuple(sorted({pair[0] for pair in affected_pairs})),
+        affected_areas=tuple(sorted({pair[1] for pair in affected_pairs})),
+        affected_group_area_pairs=tuple(sorted(affected_pairs)),
+        globally_root_certified=certified,
+        diagnostics={
+            "algorithm": "v7_1_read_only_full_domain_pricing_audit",
+            "mutates_production_state": False,
+            "production_pattern_count_before": len(pattern_signatures_before),
+            "production_pattern_count_after": len(root.patterns),
+            "anchor_sweep_count": len(pricing_rows),
+            "audit_seconds": audit_seconds,
+            "pricing": pricing_rows,
+        },
+    )
 
 
 __all__ = [
+    "V7_1_ALGORITHM_VERSION",
+    "V7GlobalPricingAudit",
     "V7GlobalPatternMaster",
     "V7MasterSolution",
     "V7RootCgConfig",
     "V7RootCgIncompleteError",
     "V7RootCgResult",
     "V7RootColumnGeneration",
+    "audit_full_domain_pricing",
     "build_full_v7_pattern_universe",
     "normalize_v7_pattern_ids",
+    "not_executed_global_pricing_audit",
+    "pattern_is_in_restricted_domain",
     "patterns_from_atom_solution",
     "solve_full_pattern_oracle",
+    "solve_restricted_pattern_oracle",
+    "validate_patterns_in_restricted_domain",
 ]

@@ -1,0 +1,42 @@
+{
+  "complete_mip_rerun": false,
+  "configuration": {
+    "algorithm_time_limit": 120.0,
+    "stage1_additional_candidate_area_cap": 5,
+    "stage1_maximum_pool_candidate_areas": 1,
+    "root_time_limit": 60.0,
+    "solver_threads": 1,
+    "solver_seed": 0
+  },
+  "cases": [
+    {
+      "case_id": "scale_g048_s601",
+      "status": "completed",
+      "restricted_group_area_edges": 297,
+      "root_rounds": 44,
+      "root_seconds": 39.22162724999362,
+      "root_pattern_count": 3823,
+      "restricted_lp_bound": 0.07095431350455841,
+      "v7_upper_bound": 0.07930866244687615,
+      "restricted_mip_gap": 0.057474433033044205,
+      "saved_complete_mip_upper_bound": 0.07795797133587853,
+      "v7_relative_to_saved_mip": 0.017325888396687805,
+      "v7_improvement_from_prior_v7": 0.05204220344452837
+    },
+    {
+      "case_id": "scale_g096_s801",
+      "status": "failed_root_cg",
+      "restricted_group_area_edges": 601,
+      "root_rounds": 34,
+      "root_seconds": 61.66690737500903,
+      "root_pattern_count": 7105,
+      "last_restricted_rmp_value": 0.10248441744463538,
+      "last_minimum_reduced_cost": -0.00014515629048251707,
+      "last_round_columns_added": 53,
+      "v7_upper_bound": null,
+      "restricted_mip_gap": null,
+      "saved_complete_mip_upper_bound": 0.1062291040051638,
+      "v7_relative_to_saved_mip": null
+    }
+  ]
+}

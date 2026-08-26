@@ -27,18 +27,30 @@ def parse_args() -> argparse.Namespace:
         default=ROOT / "preexperiment_outputs" / "v7_scale_24_48_96",
     )
     parser.add_argument("--cases", nargs="+", default=None)
+    parser.add_argument("--algorithm-time-limit", type=float, default=120.0)
+    parser.add_argument("--minimum-integer-time", type=float, default=5.0)
     parser.add_argument("--peak-feasibility-time-limit", type=float, default=10.0)
     parser.add_argument("--stage1-time-limit", type=float, default=10.0)
     parser.add_argument("--stage1-pool-solutions", type=int, default=8)
     parser.add_argument("--stage1-pool-gap", type=float, default=0.10)
-    parser.add_argument("--initial-candidate-area-cap", type=int, default=4)
+    parser.add_argument("--additional-candidate-area-cap", type=int, default=5)
+    parser.add_argument("--maximum-pool-candidate-areas", type=int, default=1)
     parser.add_argument("--root-time-limit", type=float, default=60.0)
     parser.add_argument("--root-maximum-iterations", type=int, default=100)
     parser.add_argument("--columns-per-bay-per-round", type=int, default=3)
-    parser.add_argument("--integer-time-limit", type=float, default=40.0)
+    parser.add_argument(
+        "--integer-time-limit",
+        type=float,
+        default=None,
+        help=(
+            "Optional diagnostic ceiling; by default the integer master uses "
+            "all time remaining in --algorithm-time-limit."
+        ),
+    )
     parser.add_argument("--integer-mip-gap", type=float, default=0.0)
     parser.add_argument("--complete-mip-time-limit", type=float, default=120.0)
     parser.add_argument("--complete-mip-gap", type=float, default=0.0)
+    parser.add_argument("--enable-global-pricing-audit", action="store_true")
     parser.add_argument("--solver-threads", type=int, default=1)
     parser.add_argument("--solver-seed", type=int, default=0)
     parser.add_argument(
@@ -54,11 +66,14 @@ def main() -> None:
         args.suite,
         args.output_root,
         case_ids=args.cases,
+        algorithm_time_limit=args.algorithm_time_limit,
+        minimum_integer_time=args.minimum_integer_time,
         peak_feasibility_time_limit=args.peak_feasibility_time_limit,
         stage1_time_limit=args.stage1_time_limit,
         stage1_pool_solutions=args.stage1_pool_solutions,
         stage1_pool_gap=args.stage1_pool_gap,
-        initial_candidate_area_cap=args.initial_candidate_area_cap,
+        additional_candidate_area_cap=args.additional_candidate_area_cap,
+        maximum_pool_candidate_areas=args.maximum_pool_candidate_areas,
         root_time_limit=args.root_time_limit,
         root_maximum_iterations=args.root_maximum_iterations,
         columns_per_bay_per_round=args.columns_per_bay_per_round,
@@ -66,6 +81,7 @@ def main() -> None:
         integer_mip_gap=args.integer_mip_gap,
         complete_mip_time_limit=args.complete_mip_time_limit,
         complete_mip_gap=args.complete_mip_gap,
+        enable_global_pricing_audit=args.enable_global_pricing_audit,
         solver_threads=args.solver_threads,
         solver_seed=args.solver_seed,
         peak_utilization_headroom_fraction=(

@@ -38,6 +38,24 @@ class V7BayPattern:
     def signature(self) -> tuple[int, ...]:
         return tuple(self.candidate_indices)
 
+    @property
+    def master_column_signature(self) -> tuple[object, ...]:
+        """Return the coefficient-equivalence class used by the master.
+
+        ``group_rows`` and atom indices are recovery details.  Two patterns
+        with the same values below produce identical coefficients in every
+        master row and can therefore share one deterministic representative.
+        """
+
+        return (
+            self.anchor_bay_key,
+            self.size_mode,
+            self.height_mode,
+            self.group_capacities,
+            self.physical_resources,
+            self.physical_bays,
+        )
+
     def capacity_for(self, group_id: str) -> int:
         return int(dict(self.group_capacities).get(str(group_id), 0))
 
@@ -49,6 +67,18 @@ class V7PricingResult:
     minimum_pattern: V7BayPattern | None
     returned_patterns: tuple[V7BayPattern, ...]
     diagnostics: Mapping[str, object]
+
+
+@dataclass
+class _V7PersistentPricingState:
+    """One structurally fixed pricing MIP reused across CG iterations."""
+
+    model: GurobiModel
+    atom_selected: Mapping[int, object]
+    group_used: Mapping[str, object]
+    bay_constant: object
+    variable_count: int
+    constraint_count: int
 
 
 def _pattern_from_atoms(
@@ -252,6 +282,26 @@ class V7ExactBayPricing:
         self.atoms = tuple(atoms)
         self.columns_per_bay = int(columns_per_bay)
         self.tolerance = float(reduced_cost_tolerance)
+        atoms_by_anchor: defaultdict[str, list[V7RowAtom]] = defaultdict(list)
+        for atom in self.atoms:
+            atoms_by_anchor[str(atom.anchor_bay_key)].append(atom)
+        self.atoms_by_anchor = {
+            anchor: tuple(values)
+            for anchor, values in sorted(atoms_by_anchor.items())
+        }
+        self.atoms_by_index = {
+            int(atom.candidate_index): atom for atom in self.atoms
+        }
+        self._persistent_mip_states: dict[
+            tuple[object, ...], _V7PersistentPricingState
+        ] = {}
+
+    def dispose(self) -> None:
+        """Release persistent native pricing models."""
+
+        for state in self._persistent_mip_states.values():
+            state.model.dispose()
+        self._persistent_mip_states.clear()
 
     def price_bay(
         self,
@@ -269,16 +319,16 @@ class V7ExactBayPricing:
             if allowed_groups is None
             else {str(value) for value in allowed_groups}
         )
+        anchor_atoms = self.atoms_by_anchor.get(str(anchor_bay_key), ())
         local_groups = {
             atom.group_id
-            for atom in self.atoms
-            if atom.anchor_bay_key == str(anchor_bay_key)
-            and (allowed is None or atom.group_id in allowed)
+            for atom in anchor_atoms
+            if allowed is None or atom.group_id in allowed
         }
         generator = exhaustive_v7_bay_patterns if exhaustive else enumerate_v7_bay_patterns
         patterns = generator(
             self.problem,
-            self.atoms,
+            anchor_atoms,
             str(anchor_bay_key),
             allowed_groups=allowed,
         )
@@ -347,9 +397,8 @@ class V7ExactBayPricing:
         excluded = {tuple(value) for value in excluded_signatures}
         local = tuple(
             atom
-            for atom in self.atoms
-            if atom.anchor_bay_key == anchor
-            and (allowed is None or atom.group_id in allowed)
+            for atom in self.atoms_by_anchor.get(anchor, ())
+            if allowed is None or atom.group_id in allowed
         )
         local_indices = {atom.candidate_index for atom in local}
         local_excluded_count = sum(
@@ -544,16 +593,26 @@ class V7ExactBayPricing:
         verify_reduced_cost: Callable[[V7BayPattern], float] | None = None,
         allowed_groups: Iterable[str] | None = None,
         excluded_signatures: Iterable[tuple[int, ...]] = (),
+        excluded_master_column_signatures: Iterable[
+            tuple[object, ...]
+        ] = (),
         solver_threads: int = 1,
+        excluded_signatures_are_dual_feasible: bool = False,
     ) -> V7PricingResult:
         """Solve exact per-state 0-1 pricing MIPs and return global top-K.
 
         The formulation chooses at most three groups and assigns each physical
-        row to at most one of them.  Already generated local patterns are
-        removed by exact no-good rows.  Gurobi's systematic solution-pool mode
+        row to at most one of them.  Gurobi's systematic solution-pool mode
         proves the requested best alternatives for every size/height state;
         every recovered column is then checked against the master reduced
         cost when ``verify_reduced_cost`` is supplied.
+
+        In a column-generation loop, signatures already present in an optimal
+        RMP are dual-feasible by construction.  When
+        ``excluded_signatures_are_dual_feasible`` is true, those signatures
+        are filtered after pricing instead of being converted into an
+        ever-growing family of no-good rows.  A materially negative existing
+        column raises an error rather than allowing a false root closure.
         """
 
         started = perf_counter()
@@ -564,13 +623,12 @@ class V7ExactBayPricing:
             else {str(value) for value in allowed_groups}
         )
         excluded = {tuple(sorted(value)) for value in excluded_signatures}
+        excluded_master_columns = set(excluded_master_column_signatures)
         local = tuple(
             atom
-            for atom in self.atoms
-            if atom.anchor_bay_key == anchor
-            and (allowed is None or atom.group_id in allowed)
+            for atom in self.atoms_by_anchor.get(anchor, ())
+            if allowed is None or atom.group_id in allowed
         )
-        atoms_by_index = {atom.candidate_index: atom for atom in local}
         by_state: defaultdict[tuple[str, str], list[V7RowAtom]] = defaultdict(list)
         for atom in local:
             by_state[(atom.size, atom.height)].append(atom)
@@ -582,6 +640,11 @@ class V7ExactBayPricing:
         total_constraints = 0
         excluded_local_count = 0
         solved_states = 0
+        screened_states = 0
+        state_lower_bounds: list[float] = []
+        persistent_state_build_count = 0
+        persistent_state_reuse_count = 0
+        bay_cost = float(bay_reduced_cost(anchor))
         for (size, height), state_atoms in sorted(by_state.items()):
             groups = sorted({atom.group_id for atom in state_atoms})
             if not groups:
@@ -597,90 +660,176 @@ class V7ExactBayPricing:
             ]
             excluded_local_count += len(state_excluded)
 
-            model = GurobiModel(f"v7_price_{anchor}_{size}_{height}")
-            model.hideOutput()
-            model.setMinimize()
-            model.setParam("Threads", max(1, int(solver_threads)))
-            model.setParam("MIPGap", 0.0)
-            model.setParam("PoolSearchMode", 2)
-            model.setParam("PoolSolutions", self.columns_per_bay)
-            atom_selected = {
-                atom.candidate_index: model.addVar(
-                    vtype="B",
-                    obj=float(atom_reduced_cost(atom)),
-                    name=f"z_{atom.candidate_index}",
-                )
+            # Exact safe screening.  This lower bound relaxes the links
+            # between selected groups and rows, the positive-pattern
+            # requirement, and the capacity limit.  It can therefore only be
+            # more optimistic than the pricing MIP.  A nonnegative bound
+            # proves that this size/height state cannot contain an improving
+            # column and avoids constructing a Gurobi model altogether.
+            atom_costs = {
+                atom.candidate_index: float(atom_reduced_cost(atom))
                 for atom in state_atoms
             }
-            group_used = {
-                group_id: model.addVar(
-                    vtype="B",
-                    obj=float(
-                        group_support_reduced_cost(
-                            anchor,
-                            size,
-                            height,
-                            group_id,
-                            physical_bays,
-                        )
-                    ),
-                    name=f"u_{index}",
+            group_costs = {
+                group_id: float(
+                    group_support_reduced_cost(
+                        anchor,
+                        size,
+                        height,
+                        group_id,
+                        physical_bays,
+                    )
                 )
-                for index, group_id in enumerate(groups)
+                for group_id in groups
             }
-            gp = model._gp
-            quicksum = gp.quicksum
-            by_row: defaultdict[str, list[object]] = defaultdict(list)
-            by_group: defaultdict[str, list[object]] = defaultdict(list)
+            atoms_by_row: defaultdict[str, list[V7RowAtom]] = defaultdict(list)
             for atom in state_atoms:
-                variable = atom_selected[atom.candidate_index]
-                by_row[atom.row_no].append(variable)
-                by_group[atom.group_id].append(variable)
-                model.addConstr(variable <= group_used[atom.group_id])
-            for variables in by_row.values():
-                model.addConstr(quicksum(variables) <= 1)
-            for group_id, variables in by_group.items():
-                model.addConstr(group_used[group_id] <= quicksum(variables))
-            model.addConstr(quicksum(group_used.values()) >= 1)
-            model.addConstr(quicksum(group_used.values()) <= 3)
-            capacity_limit = min(
-                int(self.problem.bays[anchor].cap_by_size.get(size, 0)),
-                *(int(self.problem.bays[physical].physical_capacity) for physical in physical_bays),
+                atoms_by_row[atom.row_no].append(atom)
+            optimistic_group_cost = sum(
+                value
+                for value in sorted(group_costs.values())[:3]
+                if value < 0.0
             )
-            model.addConstr(
-                quicksum(
-                    atom.capacity * atom_selected[atom.candidate_index]
-                    for atom in state_atoms
+            optimistic_row_cost = sum(
+                min(
+                    0.0,
+                    min(atom_costs[atom.candidate_index] for atom in row_atoms),
                 )
-                <= capacity_limit
+                for row_atoms in atoms_by_row.values()
             )
-            for signature in state_excluded:
-                selected = set(signature)
+            state_lower_bound = (
+                bay_cost + optimistic_group_cost + optimistic_row_cost
+            )
+            state_lower_bounds.append(float(state_lower_bound))
+            if state_lower_bound >= -self.tolerance:
+                screened_states += 1
+                continue
+
+            pool_solution_limit = self.columns_per_bay * (
+                4 if excluded_signatures_are_dual_feasible else 1
+            )
+            cache_key = (
+                anchor,
+                size,
+                height,
+                tuple(sorted(state_indices)),
+                max(1, int(solver_threads)),
+                pool_solution_limit,
+            )
+            persistent_state = (
+                self._persistent_mip_states.get(cache_key)
+                if excluded_signatures_are_dual_feasible
+                else None
+            )
+            ephemeral_model = not excluded_signatures_are_dual_feasible
+            if persistent_state is None:
+                model = GurobiModel(f"v7_price_{anchor}_{size}_{height}")
+                model.hideOutput()
+                model.setMinimize()
+                model.setParam("Threads", max(1, int(solver_threads)))
+                model.setParam("MIPGap", 0.0)
+                model.setParam("PoolSearchMode", 2)
+                model.setParam("PoolSolutions", pool_solution_limit)
+                atom_selected = {
+                    atom.candidate_index: model.addVar(
+                        vtype="B",
+                        obj=0.0,
+                        name=f"z_{atom.candidate_index}",
+                    )
+                    for atom in state_atoms
+                }
+                group_used = {
+                    group_id: model.addVar(
+                        vtype="B",
+                        obj=0.0,
+                        name=f"u_{index}",
+                    )
+                    for index, group_id in enumerate(groups)
+                }
+                gp = model._gp
+                quicksum = gp.quicksum
+                by_row: defaultdict[str, list[object]] = defaultdict(list)
+                by_group: defaultdict[str, list[object]] = defaultdict(list)
+                for atom in state_atoms:
+                    variable = atom_selected[atom.candidate_index]
+                    by_row[atom.row_no].append(variable)
+                    by_group[atom.group_id].append(variable)
+                    model.addConstr(variable <= group_used[atom.group_id])
+                for variables in by_row.values():
+                    model.addConstr(quicksum(variables) <= 1)
+                for group_id, variables in by_group.items():
+                    model.addConstr(group_used[group_id] <= quicksum(variables))
+                model.addConstr(quicksum(group_used.values()) >= 1)
+                model.addConstr(quicksum(group_used.values()) <= 3)
+                capacity_limit = min(
+                    int(self.problem.bays[anchor].cap_by_size.get(size, 0)),
+                    *(
+                        int(self.problem.bays[physical].physical_capacity)
+                        for physical in physical_bays
+                    ),
+                )
                 model.addConstr(
                     quicksum(
-                        atom_selected[index] for index in selected
+                        atom.capacity * atom_selected[atom.candidate_index]
+                        for atom in state_atoms
                     )
-                    - quicksum(
-                        atom_selected[index]
-                        for index in sorted(state_indices - selected)
-                    )
-                    <= len(selected) - 1
+                    <= capacity_limit
                 )
-            model.addVar(
-                lb=1.0,
-                ub=1.0,
-                obj=float(bay_reduced_cost(anchor)),
-                name="bay_constant",
-            )
+                if not excluded_signatures_are_dual_feasible:
+                    for signature in state_excluded:
+                        selected = set(signature)
+                        model.addConstr(
+                            quicksum(
+                                atom_selected[index] for index in selected
+                            )
+                            - quicksum(
+                                atom_selected[index]
+                                for index in sorted(state_indices - selected)
+                            )
+                            <= len(selected) - 1
+                        )
+                bay_constant = model.addVar(
+                    lb=1.0,
+                    ub=1.0,
+                    obj=0.0,
+                    name="bay_constant",
+                )
+                model.update()
+                constraint_count = (
+                    len(state_atoms)
+                    + len(by_row)
+                    + len(by_group)
+                    + (
+                        0
+                        if excluded_signatures_are_dual_feasible
+                        else len(state_excluded)
+                    )
+                    + 3
+                )
+                persistent_state = _V7PersistentPricingState(
+                    model=model,
+                    atom_selected=atom_selected,
+                    group_used=group_used,
+                    bay_constant=bay_constant,
+                    variable_count=len(model.getVars()),
+                    constraint_count=constraint_count,
+                )
+                if excluded_signatures_are_dual_feasible:
+                    self._persistent_mip_states[cache_key] = persistent_state
+                    persistent_state_build_count += 1
+            else:
+                persistent_state_reuse_count += 1
+            model = persistent_state.model
+            atom_selected = persistent_state.atom_selected
+            group_used = persistent_state.group_used
+            for index, variable in atom_selected.items():
+                model.setVarObjective(variable, atom_costs[index])
+            for group_id, variable in group_used.items():
+                model.setVarObjective(variable, group_costs[group_id])
+            model.setVarObjective(persistent_state.bay_constant, bay_cost)
             model.update()
-            total_variables += len(model.getVars())
-            total_constraints += (
-                len(state_atoms)
-                + len(by_row)
-                + len(by_group)
-                + len(state_excluded)
-                + 3
-            )
+            total_variables += persistent_state.variable_count
+            total_constraints += persistent_state.constraint_count
             try:
                 model.optimize()
                 status = model.getStatusName()
@@ -700,7 +849,7 @@ class V7ExactBayPricing:
                 total_solver_seconds += model.getRuntime()
                 total_nodes += model.getNodeCount()
                 solution_count = min(
-                    model.getSolutionCount(), self.columns_per_bay
+                    model.getSolutionCount(), pool_solution_limit
                 )
                 for solution_number in range(solution_count):
                     signature = tuple(
@@ -710,11 +859,11 @@ class V7ExactBayPricing:
                             if model.getPoolValue(variable, solution_number) > 0.5
                         )
                     )
-                    if not signature or signature in excluded:
+                    if not signature:
                         continue
                     pattern = build_v7_pattern_from_atom_indices(
                         self.problem,
-                        atoms_by_index,
+                        self.atoms_by_index,
                         signature,
                         pattern_id=0,
                     )
@@ -729,15 +878,44 @@ class V7ExactBayPricing:
                             "V7 pricing MIP objective disagrees with the master "
                             f"reduced cost: mip={pool_value}, master={value}"
                         )
+                    if signature in excluded:
+                        if (
+                            excluded_signatures_are_dual_feasible
+                            and value < -self.tolerance
+                        ):
+                            raise V7PricingIncompleteError(
+                                "An existing RMP column has materially negative "
+                                "reduced cost under the returned master duals: "
+                                f"anchor={anchor}, value={value}"
+                            )
+                        continue
+                    if pattern.master_column_signature in excluded_master_columns:
+                        if (
+                            excluded_signatures_are_dual_feasible
+                            and value < -self.tolerance
+                        ):
+                            raise V7PricingIncompleteError(
+                                "A master-equivalent existing RMP column has "
+                                "materially negative reduced cost under the "
+                                f"returned master duals: anchor={anchor}, "
+                                f"value={value}"
+                            )
+                        continue
                     priced.append((value, pattern))
             finally:
-                model.dispose()
+                if ephemeral_model:
+                    model.dispose()
 
-        unique_priced: dict[tuple[int, ...], tuple[float, V7BayPattern]] = {}
+        unique_priced: dict[tuple[object, ...], tuple[float, V7BayPattern]] = {}
         for value, pattern in priced:
-            previous = unique_priced.get(pattern.signature)
+            key = (
+                pattern.master_column_signature
+                if excluded_signatures_are_dual_feasible
+                else pattern.signature
+            )
+            previous = unique_priced.get(key)
             if previous is None or value < previous[0]:
-                unique_priced[pattern.signature] = (value, pattern)
+                unique_priced[key] = (value, pattern)
         ranked = sorted(
             unique_priced.values(), key=lambda item: (item[0], item[1].signature)
         )
@@ -760,6 +938,20 @@ class V7ExactBayPricing:
                 "pricing_solver_seconds": total_solver_seconds,
                 "pricing_node_count": total_nodes,
                 "pricing_state_count": solved_states,
+                "pricing_state_total": len(by_state),
+                "pricing_state_screened_by_lower_bound": screened_states,
+                "persistent_pricing_state_build_count": (
+                    persistent_state_build_count
+                ),
+                "persistent_pricing_state_reuse_count": (
+                    persistent_state_reuse_count
+                ),
+                "persistent_pricing_enabled": bool(
+                    excluded_signatures_are_dual_feasible
+                ),
+                "minimum_state_relaxation_lower_bound": (
+                    min(state_lower_bounds) if state_lower_bounds else None
+                ),
                 "pricing_variable_count": total_variables,
                 "pricing_constraint_count": total_constraints,
                 "min_reduced_cost": minimum_value,
@@ -767,6 +959,26 @@ class V7ExactBayPricing:
                 "exact": True,
                 "method": "exact_support_cardinality_row_assignment_mip",
                 "excluded_local_signature_count": excluded_local_count,
+                "excluded_master_column_signature_count": len(
+                    excluded_master_columns
+                ),
+                "excluded_signature_mode": (
+                    "dual_feasible_filter"
+                    if excluded_signatures_are_dual_feasible
+                    else "exact_no_good_constraints"
+                ),
+                "no_good_constraint_count": (
+                    0
+                    if excluded_signatures_are_dual_feasible
+                    else excluded_local_count
+                ),
+                "solution_pool_oversampling_factor": (
+                    4 if excluded_signatures_are_dual_feasible else 1
+                ),
+                "master_equivalent_pool_columns_removed": (
+                    len(priced) - len(unique_priced)
+                ),
+                "anchor_atom_index_used": True,
             },
         )
 
