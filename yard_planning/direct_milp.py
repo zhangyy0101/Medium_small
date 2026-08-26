@@ -64,19 +64,20 @@ class DirectMilpPlanner(YardPlanningBase):
             "big_m_tightening": self._big_m_diagnostics(),
             "import_capacity_reservation": {
                 "source_quantity_field": "new_qty",
-                "role": "anonymous_size_compatible_capacity_only",
+                "role": "anonymous_bay_capacity_reservation",
                 "area_policy": (
                     "weighted_l1_deviation_from_big_plan_reference"
                 ),
                 "constraint_scope": [
                     "area_function",
-                    "bay_size",
+                    "bay_size_state",
                     "physical_capacity",
+                    "export_import_bay_exclusivity",
                 ],
                 "excluded_constraints": [
-                    "bay_no_mix",
-                    "row_no_mix",
-                    "container_group_attributes",
+                    "export_height_state",
+                    "export_row_group_assignment",
+                    "export_group_objectives",
                 ],
                 "import_boxes": int(
                     sum(self.import_area_size_reference.values())
@@ -263,6 +264,9 @@ class DirectMilpPlanner(YardPlanningBase):
         coefficient_rows: defaultdict[
             str, defaultdict[object, list[tuple[int, float]]]
         ] = defaultdict(lambda: defaultdict(list))
+        group_resource_columns: defaultdict[
+            tuple[str, str, str], list[tuple[int, float]]
+        ] = defaultdict(list)
         group_columns: defaultdict[str, list[int]] = defaultdict(list)
         group_area_columns: defaultdict[tuple[tuple[str, ...], str], list[int]] = (
             defaultdict(list)
@@ -290,6 +294,11 @@ class DirectMilpPlanner(YardPlanningBase):
             group_row_columns[
                 (column.group_key, column.bay_key, anchor_row)
             ].append(index)
+            for footprint_key, row_no, row_quantity in column.row_allocation:
+                if int(row_quantity) > 0:
+                    group_resource_columns[
+                        (column.group_id, str(footprint_key), str(row_no))
+                    ].append((index, float(row_quantity)))
             for section, values in self._placement_master_coefficients(
                 column
             ).items():
@@ -300,7 +309,12 @@ class DirectMilpPlanner(YardPlanningBase):
                         )
 
         import_by_bay: defaultdict[str, list] = defaultdict(list)
-        import_by_bay_size: defaultdict[tuple[str, str], list] = defaultdict(list)
+        import_by_anchor_bay_size: defaultdict[tuple[str, str], list] = (
+            defaultdict(list)
+        )
+        import_by_physical_bay_size: defaultdict[tuple[str, str], list] = (
+            defaultdict(list)
+        )
         import_by_flow_size: defaultdict[tuple[str, str], list] = defaultdict(list)
         import_by_flow_area_size: defaultdict[tuple[str, str, str], list] = (
             defaultdict(list)
@@ -309,9 +323,43 @@ class DirectMilpPlanner(YardPlanningBase):
             area_no = self.bays[bay_key].area_no
             for footprint_key in self._placement_footprint_keys(bay_key, size):
                 import_by_bay[footprint_key].append(variable)
-            import_by_bay_size[(bay_key, size)].append(variable)
+                import_by_physical_bay_size[(footprint_key, size)].append(
+                    variable
+                )
+            import_by_anchor_bay_size[(bay_key, size)].append(variable)
             import_by_flow_size[(flow, size)].append(variable)
             import_by_flow_area_size[(flow, area_no, size)].append(variable)
+
+        export_by_bay = coefficient_rows["bay_capacity_limit"]
+        allocation_bay_keys = sorted(set(export_by_bay) | set(import_by_bay))
+        export_bay_use = {
+            bay_key: model.addVar(
+                vtype="B",
+                name=f"export_bay_use_{self._key_name((bay_key,))}",
+            )
+            for bay_key in allocation_bay_keys
+        }
+        import_bay_use = {
+            bay_key: model.addVar(
+                vtype="B",
+                name=f"import_bay_use_{self._key_name((bay_key,))}",
+            )
+            for bay_key in allocation_bay_keys
+        }
+        import_size_state = {
+            key: model.addVar(
+                vtype="B",
+                name=f"import_size_state_{self._key_name(key)}",
+            )
+            for key in sorted(import_by_physical_bay_size)
+        }
+        group_row_owner = {
+            key: model.addVar(
+                vtype="B",
+                name=f"group_row_owner_{self._key_name(key)}",
+            )
+            for key in sorted(group_resource_columns)
+        }
 
         constraints: dict[str, dict] = defaultdict(dict)
         for group in self.groups:
@@ -343,7 +391,7 @@ class DirectMilpPlanner(YardPlanningBase):
                     coefficient * columns[index]
                     for index, coefficient in items
                 )
-                + quicksum(import_by_bay_size.get(key, []))
+                + quicksum(import_by_anchor_bay_size.get(key, []))
                 <= int(self.bays[bay_key].cap_by_size.get(size, 0)),
                 name=f"bay_size_{self._key_name(key)}",
             )
@@ -377,6 +425,97 @@ class DirectMilpPlanner(YardPlanningBase):
                     )
                 ),
                 name=f"row_size_{self._key_name(key)}",
+            )
+
+        owners_by_resource: defaultdict[tuple[str, str], list] = defaultdict(list)
+        for key, owner in group_row_owner.items():
+            _group_id, bay_key, row_no = key
+            resource = (bay_key, row_no)
+            owners_by_resource[resource].append(owner)
+            items = group_resource_columns[key]
+            load = quicksum(
+                coefficient * columns[index]
+                for index, coefficient in items
+            )
+            capacity = int(
+                self.bays[bay_key].row_physical_capacity.get(
+                    row_no,
+                    self.bays[bay_key].physical_capacity,
+                )
+            )
+            constraints["group_row_owner_link"][key] = model.addConstr(
+                load <= max(1, capacity) * owner,
+                name=f"group_row_owner_link_{self._key_name(key)}",
+            )
+            constraints["group_row_owner_presence"][key] = model.addConstr(
+                owner <= load,
+                name=f"group_row_owner_presence_{self._key_name(key)}",
+            )
+        for resource, owners in sorted(owners_by_resource.items()):
+            constraints["physical_row_single_group"][resource] = model.addConstr(
+                quicksum(owners) <= 1,
+                name=f"physical_row_single_group_{self._key_name(resource)}",
+            )
+
+        import_sizes_by_bay: defaultdict[str, list] = defaultdict(list)
+        for (bay_key, size), state_variable in import_size_state.items():
+            import_sizes_by_bay[bay_key].append(state_variable)
+            size_load = quicksum(
+                import_by_physical_bay_size[(bay_key, size)]
+            )
+            capacity = max(1, int(self.bays[bay_key].physical_capacity))
+            constraints["import_size_state_link"][(bay_key, size)] = (
+                model.addConstr(
+                    size_load <= capacity * state_variable,
+                    name=(
+                        "import_size_state_link_"
+                        f"{self._key_name((bay_key, size))}"
+                    ),
+                )
+            )
+            constraints["import_size_state_presence"][(bay_key, size)] = (
+                model.addConstr(
+                    state_variable <= size_load,
+                    name=(
+                        "import_size_state_presence_"
+                        f"{self._key_name((bay_key, size))}"
+                    ),
+                )
+            )
+        for bay_key in allocation_bay_keys:
+            export_load = quicksum(
+                coefficient * columns[index]
+                for index, coefficient in export_by_bay.get(bay_key, [])
+            )
+            import_load = quicksum(import_by_bay.get(bay_key, []))
+            capacity = max(1, int(self.bays[bay_key].physical_capacity))
+            constraints["export_bay_use_link"][bay_key] = model.addConstr(
+                export_load <= capacity * export_bay_use[bay_key],
+                name=f"export_bay_use_link_{self._key_name((bay_key,))}",
+            )
+            constraints["export_bay_use_presence"][bay_key] = model.addConstr(
+                export_bay_use[bay_key] <= export_load,
+                name=f"export_bay_use_presence_{self._key_name((bay_key,))}",
+            )
+            constraints["import_bay_use_link"][bay_key] = model.addConstr(
+                import_load <= capacity * import_bay_use[bay_key],
+                name=f"import_bay_use_link_{self._key_name((bay_key,))}",
+            )
+            constraints["import_bay_use_presence"][bay_key] = model.addConstr(
+                import_bay_use[bay_key] <= import_load,
+                name=f"import_bay_use_presence_{self._key_name((bay_key,))}",
+            )
+            constraints["export_import_bay_exclusive"][bay_key] = model.addConstr(
+                export_bay_use[bay_key] + import_bay_use[bay_key] <= 1,
+                name=(
+                    "export_import_bay_exclusive_"
+                    f"{self._key_name((bay_key,))}"
+                ),
+            )
+            constraints["import_bay_single_size"][bay_key] = model.addConstr(
+                quicksum(import_sizes_by_bay.get(bay_key, []))
+                <= import_bay_use[bay_key],
+                name=f"import_bay_single_size_{self._key_name((bay_key,))}",
             )
 
         stack_variables_by_bay_size: defaultdict[tuple[str, str], list] = (
@@ -542,20 +681,16 @@ class DirectMilpPlanner(YardPlanningBase):
             coefficient_rows["bay_attr_link"],
             relax=False,
         )
-        row_compatibility = self._add_row_compatibility_constraints(
-            quicksum,
-            model,
-            columns,
-            coefficient_rows["row_attr_link"],
-            relax=False,
-        )
         constraints.update(bay_compatibility)
-        constraints.update(row_compatibility)
 
         model.update()
         model_stats = {
             "row_location_variable_count": len(columns),
             "import_reservation_variable_count": len(import_reserve),
+            "group_row_owner_variable_count": len(group_row_owner),
+            "export_bay_use_variable_count": len(export_bay_use),
+            "import_bay_use_variable_count": len(import_bay_use),
+            "import_size_state_variable_count": len(import_size_state),
             "model_variable_count": len(model.getVars()),
             "constraint_count_by_family": {
                 key: len(values)
@@ -566,6 +701,10 @@ class DirectMilpPlanner(YardPlanningBase):
         return model, {
             "column": columns,
             "import_reserve": import_reserve,
+            "group_row_owner": group_row_owner,
+            "export_bay_use": export_bay_use,
+            "import_bay_use": import_bay_use,
+            "import_size_state": import_size_state,
         }, model_stats
 
 

@@ -11,7 +11,13 @@ from pathlib import Path
 from time import perf_counter
 from typing import Iterable
 
-from .models import EXPORT_VOYAGE_ROW_NO_MIX_ATTR, Bay, ExportGroup, ProblemData
+from .models import (
+    EXPORT_GROUP_IDENTITY_ATTRIBUTES,
+    EXPORT_VOYAGE_ROW_NO_MIX_ATTR,
+    Bay,
+    ExportGroup,
+    ProblemData,
+)
 
 SIZE_ORDER = {"45": 0, "20": 1, "40": 2}
 EXPORT_FLOWS = frozenset({"OF"})
@@ -90,11 +96,11 @@ class YardPlanningBase:
         self.config = config or ColumnGenerationConfig()
         self.demand_stats: dict[str, int | str] = {}
         self.export_voyages = self._infer_export_voyages(problem)
+        self.attribute_rules = problem.attribute_rules
         self.groups = sorted(self._build_planning_groups(), key=self._group_sort_key)
         self._validate_unique_operational_groups()
         self.groups_by_id = {group.group_id: group for group in self.groups}
         self.bays = problem.bays
-        self.attribute_rules = problem.attribute_rules
         self.bays_by_area: dict[str, list[str]] = defaultdict(list)
         self.area_edge_bays: dict[str, set[str]] = defaultdict(set)
         self.quota_by_key: Counter[tuple[str, str, str, str]] = Counter()
@@ -200,7 +206,7 @@ class YardPlanningBase:
         return groups
 
     def _validate_unique_operational_groups(self) -> None:
-        """Keep both formulations on one operational group definition."""
+        """Enforce the fixed V6 export-group identity contract."""
         group_ids: set[str] = set()
         operational_keys: dict[tuple[str, ...], str] = {}
         for group in self.groups:
@@ -216,6 +222,20 @@ class YardPlanningBase:
                     f"groups={previous},{group.group_id}, key={key}"
                 )
             operational_keys[key] = group.group_id
+
+        # Size and height are bay-level no-mix attributes; voyage and discharge
+        # port are row-level no-mix attributes.  Therefore every pair of
+        # distinct fixed export groups must be incompatible on one physical
+        # row.  Fail at the input boundary if a future configuration weakens
+        # that invariant silently.
+        for first_index, first in enumerate(self.groups):
+            for second in self.groups[first_index + 1 :]:
+                if not self._groups_are_incompatible_on_one_row(first, second):
+                    raise ValueError(
+                        "V6 requires different export groups to be mutually "
+                        "exclusive on every physical row: "
+                        f"groups={first.group_id},{second.group_id}"
+                    )
 
     def _assemble_result(
         self,
@@ -1604,6 +1624,13 @@ class YardPlanningBase:
     def _remaining_import_reservation_capacity(self, bay_key: str, size: str, state: dict) -> int:
         capacity = self._import_reservation_capacity(bay_key, size)
         footprint = self._placement_footprint_keys(bay_key, size)
+        if any(key in state["export_used_bays"] for key in footprint):
+            return 0
+        if any(
+            state["import_used_size"].get(key, size) != size
+            for key in footprint
+        ):
+            return 0
         for key in footprint:
             capacity = min(
                 capacity,
@@ -1629,6 +1656,8 @@ class YardPlanningBase:
         state["area_slot_load"][self.bays[bay_key].area_no] += int(quantity) * len(footprint)
         for key in footprint:
             state["bay_load"][key] += int(quantity)
+            state["import_used_bays"].add(key)
+            state["import_used_size"][key] = size
         state["bay_size_load"][(bay_key, size)] += int(quantity)
 
     def _apply_import_reservation_to_state(
@@ -1700,8 +1729,12 @@ class YardPlanningBase:
             "row_size_load": Counter(),
             "area_slot_load": Counter(),
             "row_used_attrs": {},
+            "row_used_group": {},
             "bay_used_size": {},
             "bay_used_attrs": {},
+            "export_used_bays": set(),
+            "import_used_bays": set(),
+            "import_used_size": {},
             "used_group_area": set(),
             "used_voyage_area": set(),
             "big_plan_quota_used": Counter(),
@@ -1747,6 +1780,9 @@ class YardPlanningBase:
                 return False
             if not self._row_existing_attrs_allow_group(bay, row_no, group):
                 return False
+            row_owner = state["row_used_group"].get(row_key, col.group_id)
+            if row_owner != col.group_id:
+                return False
             for attr in self._row_no_mix_attrs_for_group(group):
                 value = self._column_attr_value(col, attr)
                 state_key = self._row_state_attr_key(footprint_key, row_no, attr, col.voyage_id)
@@ -1768,6 +1804,8 @@ class YardPlanningBase:
         footprint = self._placement_footprint_keys(bay_key, group.size)
         if not footprint:
             return 0
+        if any(key in state["import_used_bays"] for key in footprint):
+            return 0
         if not self._bay_state_attrs_allow_group(group, footprint, state):
             return 0
         capacity = int(remaining)
@@ -1783,6 +1821,7 @@ class YardPlanningBase:
         state["area_slot_load"][col.area_no] += col.quantity * len(footprint)
         for key in footprint:
             state["bay_load"][key] += col.quantity
+            state["export_used_bays"].add(key)
             state["bay_used_size"][key] = col.size
             for attr in self._bay_no_mix_attrs_for_column(col):
                 state_key = self._bay_state_attr_key(key, attr, col.voyage_id)
@@ -1797,6 +1836,7 @@ class YardPlanningBase:
                 continue
             state["row_load"][(footprint_key, row_no)] += qty
             state["row_size_load"][(footprint_key, row_no, col.size)] += qty
+            state["row_used_group"][(footprint_key, row_no)] = col.group_id
             for attr in self._row_no_mix_attrs_for_column(col):
                 state_key = self._row_state_attr_key(footprint_key, row_no, attr, col.voyage_id)
                 state["row_used_attrs"][state_key] = self._column_attr_value(col, attr)
@@ -1927,13 +1967,22 @@ class YardPlanningBase:
             self.import_reservation_candidates[(flow, size)] = candidates
 
     def _import_reservation_capacity(self, bay_key: str, size: str) -> int:
-        """Capacity using only physical footprint and enabled bay size."""
+        """Return anonymous import capacity under the V6 bay-size contract."""
         bay = self.bays.get(bay_key)
         if bay is None or size not in {"20", "40"}:
             return 0
         footprint = self._placement_footprint_keys(bay_key, size)
         if not footprint:
             return 0
+        # Anonymous imports still activate a physical size state on every bay
+        # in their footprint.  They may only enter a residual bay whose
+        # existing size state is empty or already matches that size.
+        for key in footprint:
+            existing_modes = {
+                str(mode) for mode in self.bays[key].existing_size_modes if str(mode)
+            }
+            if existing_modes and existing_modes != {str(size)}:
+                return 0
         return max(
             0,
             min(
@@ -1979,8 +2028,10 @@ class YardPlanningBase:
         return group.voyage_id, group.status, area_no, self._big_plan_size(group.size)
 
     def _operational_group_key(self, group: ExportGroup) -> tuple[str, ...]:
-        attrs = tuple(self.problem.attribute_rules.group_attributes or MANDATORY_BAY_NO_MIX_ATTRS)
-        return self._attribute_cluster_key(group, attrs)
+        return self._attribute_cluster_key(
+            group,
+            EXPORT_GROUP_IDENTITY_ATTRIBUTES,
+        )
 
     def _attribute_cluster_key(self, group: ExportGroup, attrs: tuple[str, ...]) -> tuple[str, ...]:
         scope = str(group.voyage_id) if self._is_export_voyage(group.voyage_id) else "IMPORT"

@@ -11,7 +11,7 @@ from .input_adapter_gd import InputAdapterGd
 
 from yard_planning.models import (
     AttributeRules, Bay, BigPlanRow, DeclaredExportDemand, EXPORT_VOYAGE_ROW_NO_MIX_ATTR,
-    ExportGroup, PlanningInputs, ProblemData,
+    EXPORT_GROUP_IDENTITY_ATTRIBUTES, ExportGroup, PlanningInputs, ProblemData,
 )
 
 
@@ -190,8 +190,13 @@ def export_groupby_columns(attribute_rules: AttributeRules, voyage_id: str) -> t
 
 
 def operational_group_attributes(attribute_rules: AttributeRules, voyage_id: str) -> tuple[str, ...]:
-    attrs: list[str] = []
-    attrs.extend(attribute_rules.group_for(voyage_id))
+    """Return the fixed V6 export-group identity attributes.
+
+    ``attribute_rules`` and ``voyage_id`` remain in the signature for input
+    adapter compatibility, but neither may redefine group identity.
+    """
+    del attribute_rules, voyage_id
+    attrs: list[str] = list(EXPORT_GROUP_IDENTITY_ATTRIBUTES)
     out: list[str] = []
     for attr in attrs:
         name = attribute_output_name(attr)

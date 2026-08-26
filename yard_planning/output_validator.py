@@ -156,6 +156,10 @@ def validate_output_files(
     bay_heights: defaultdict[str, set[str]] = defaultdict(set)
     row_voyages: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
     row_ports: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+    row_groups: defaultdict[tuple[str, str], set[str]] = defaultdict(set)
+    export_used_bays: set[str] = set()
+    import_used_bays: set[str] = set()
+    import_sizes_by_physical_bay: defaultdict[str, set[str]] = defaultdict(set)
     bay_attribute_values: defaultdict[tuple[str, str, str], set[str]] = defaultdict(set)
     row_attribute_values: defaultdict[tuple[str, str, str, str], set[str]] = defaultdict(set)
 
@@ -289,12 +293,14 @@ def validate_output_files(
                     f"existing={sorted(existing_voyages)}, new={voyage}"
                 )
             bay_load[key] += qty
+            export_used_bays.add(key)
             row_load[(key, row_no)] += qty
             row_size_load[(key, row_no, size)] += qty
             bay_sizes[key].add(size)
             bay_heights[key].add(height)
             row_voyages[(key, row_no)].add(voyage)
             row_ports[(key, row_no)].add(port)
+            row_groups[(key, row_no)].add(group_id)
             for attribute in _bay_no_mix_attributes(problem, group.voyage_id):
                 scope = _attribute_scope(attribute, str(group.voyage_id))
                 value = _group_attribute_value(group, attribute)
@@ -403,7 +409,20 @@ def validate_output_files(
             )
         import_reserved[(flow, size)] += qty
         for key in footprint:
+            footprint_bay = problem.bays[key]
+            existing_modes = {
+                str(mode)
+                for mode in footprint_bay.existing_size_modes
+                if str(mode)
+            }
+            if existing_modes and existing_modes != {size}:
+                errors.append(
+                    f"import incumbent size conflict: {key}, "
+                    f"existing={sorted(existing_modes)}, new={size}"
+                )
             bay_load[key] += qty
+            import_used_bays.add(key)
+            import_sizes_by_physical_bay[key].add(size)
         bay_size_load[(bay_key, size)] += qty
 
     for group_id, qty in demand.items():
@@ -450,6 +469,23 @@ def validate_output_files(
     for key, values in row_ports.items():
         if len(values) > 1:
             errors.append(f"row port mixing: {key}, values={sorted(values)}")
+    for key, values in row_groups.items():
+        if len(values) > 1:
+            errors.append(
+                f"physical row assigned to different groups: "
+                f"{key}, groups={sorted(values)}"
+            )
+    shared_direction_bays = sorted(export_used_bays & import_used_bays)
+    if shared_direction_bays:
+        errors.append(
+            "import and export share physical bays: "
+            f"bays={shared_direction_bays}"
+        )
+    for bay_key, values in import_sizes_by_physical_bay.items():
+        if len(values) > 1:
+            errors.append(
+                f"anonymous import size mixing: {bay_key}, values={sorted(values)}"
+            )
     for (bay_key, attribute, scope), values in bay_attribute_values.items():
         if len(values) > 1:
             errors.append(
@@ -474,5 +510,7 @@ def validate_output_files(
         "import_reserved_boxes_checked": int(sum(import_reserved.values())),
         "bay_attribute_states_checked": len(bay_attribute_values),
         "row_attribute_states_checked": len(row_attribute_values),
+        "physical_row_group_states_checked": len(row_groups),
+        "import_size_states_checked": len(import_sizes_by_physical_bay),
         "row_footprints_checked": len(plan),
     }

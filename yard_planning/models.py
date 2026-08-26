@@ -1,7 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-DEFAULT_GROUP_ATTRIBUTES = ("IYC_CSZ_CSIZECD", "IYC_POT_UNLDPORT", "IYC_CHEIGHTCD")
+
+
+# V6 fixes the export-group identity.  This is deliberately no longer a
+# runtime modelling choice: one group is exactly one
+# (voyage, size, height, discharge-port) combination.
+EXPORT_GROUP_IDENTITY_ATTRIBUTES = (
+    "IYC_CSZ_CSIZECD",
+    "IYC_POT_UNLDPORT",
+    "IYC_CHEIGHTCD",
+)
+DEFAULT_GROUP_ATTRIBUTES = EXPORT_GROUP_IDENTITY_ATTRIBUTES
 DEFAULT_BAY_NO_MIX_ATTRIBUTES = ("IYC_CHEIGHTCD",)
 DEFAULT_ROW_NO_MIX_ATTRIBUTES = ("IYC_POT_UNLDPORT",)
 EXPORT_VOYAGE_ROW_NO_MIX_ATTR = "__EXPORT_VOYAGE_ID"
@@ -12,6 +22,23 @@ class AttributeRules:
     group_attributes: tuple[str, ...] = DEFAULT_GROUP_ATTRIBUTES
     bay_no_mix_attributes: tuple[str, ...] = DEFAULT_BAY_NO_MIX_ATTRIBUTES
     row_no_mix_attributes: tuple[str, ...] = DEFAULT_ROW_NO_MIX_ATTRIBUTES
+
+    def __post_init__(self) -> None:
+        expected = {
+            "group_attributes": EXPORT_GROUP_IDENTITY_ATTRIBUTES,
+            "bay_no_mix_attributes": DEFAULT_BAY_NO_MIX_ATTRIBUTES,
+            "row_no_mix_attributes": DEFAULT_ROW_NO_MIX_ATTRIBUTES,
+        }
+        actual = {
+            "group_attributes": tuple(self.group_attributes),
+            "bay_no_mix_attributes": tuple(self.bay_no_mix_attributes),
+            "row_no_mix_attributes": tuple(self.row_no_mix_attributes),
+        }
+        if actual != expected:
+            raise ValueError(
+                "V6 attribute rules are fixed and cannot be reconfigured: "
+                f"expected={expected}, actual={actual}"
+            )
 
     def as_dict(self) -> dict[str, list[str]]:
         return {
