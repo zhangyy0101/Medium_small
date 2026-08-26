@@ -1,1 +1,1 @@
-"""V6 exact root CG, compact primal coverage, and frozen V5 references."""
+"""Active V7 two-stage bay-pattern solver and frozen V6/V5 references."""
