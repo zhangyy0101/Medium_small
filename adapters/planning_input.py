@@ -10,7 +10,9 @@ import pandas as pd
 from .input_adapter_gd import InputAdapterGd
 
 from yard_planning.models import (
-    AttributeRules, Bay, BigPlanRow, DeclaredExportDemand, EXPORT_VOYAGE_ROW_NO_MIX_ATTR,
+    AttributeRules, Bay, BigPlanRow, DeclaredExportDemand,
+    EXISTING_EXPORT_GROUP_SCOPE, EXISTING_IMPORT_GROUP_SCOPE,
+    EXISTING_UNKNOWN_GROUP_SCOPE, EXPORT_VOYAGE_ROW_NO_MIX_ATTR,
     EXPORT_GROUP_IDENTITY_ATTRIBUTES, ExportGroup, PlanningInputs, ProblemData,
 )
 
@@ -882,6 +884,15 @@ def build_bays(
                 }
                 for row_no, row_voyage_attrs in attrs.get("attributes_by_row_by_voyage", {}).items()
             },
+            existing_group_keys_by_row={
+                str(row_no): {
+                    tuple(str(part) for part in group_key)
+                    for group_key in group_keys
+                }
+                for row_no, group_keys in attrs.get(
+                    "group_keys_by_row", {}
+                ).items()
+            },
         )
     return bays
 
@@ -1297,6 +1308,7 @@ def existing_bay_attributes(
                     "attributes_by_row": {},
                     "attributes_by_voyage": {},
                     "attributes_by_row_by_voyage": {},
+                    "group_keys_by_row": {},
                 },
             )
             attrs["sizes"].add(size)
@@ -1306,6 +1318,43 @@ def existing_bay_attributes(
             row_attrs = attrs["attributes_by_row"].setdefault(row_no, {}) if row_no else {}
             if row_no and row_voyages:
                 row_attrs.setdefault(EXPORT_VOYAGE_ROW_NO_MIX_ATTR, set()).update(row_voyages)
+            if row_no:
+                exact_groups = attrs["group_keys_by_row"].setdefault(
+                    row_no, set()
+                )
+                normalized_port = port or "UNK"
+                export_voyage = normalize_voyage(export_voyages[position])
+                import_voyage = normalize_voyage(import_voyages[position])
+                if export_voyage:
+                    exact_groups.add(
+                        (
+                            EXISTING_EXPORT_GROUP_SCOPE,
+                            export_voyage,
+                            size,
+                            height,
+                            normalized_port,
+                        )
+                    )
+                if import_voyage:
+                    exact_groups.add(
+                        (
+                            EXISTING_IMPORT_GROUP_SCOPE,
+                            import_voyage,
+                            size,
+                            height,
+                            normalized_port,
+                        )
+                    )
+                if not export_voyage and not import_voyage:
+                    exact_groups.add(
+                        (
+                            EXISTING_UNKNOWN_GROUP_SCOPE,
+                            "",
+                            size,
+                            height,
+                            normalized_port,
+                        )
+                    )
             for attr in dynamic_attrs:
                 value = normalized_dynamic_values[attr]
                 if value:

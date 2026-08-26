@@ -63,7 +63,15 @@ def summarize(diagnostics: dict) -> dict:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Solve and benchmark the contiguous storage-zone model."
+        description="Run the frozen V5 contiguous-zone implementation."
+    )
+    parser.add_argument(
+        "--allow-legacy-v5-model",
+        action="store_true",
+        help=(
+            "Acknowledge that this runner uses the old fixed-row-strip V5 "
+            "model and does not produce V6-comparable results."
+        ),
     )
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--voyages", nargs="+", default=None)
@@ -154,6 +162,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if not args.allow_legacy_v5_model:
+        raise SystemExit(
+            "This entry point is frozen on the legacy V5 model. "
+            "Pass --allow-legacy-v5-model only for historical reproduction; "
+            "the complete V6 MIP runner has not been implemented yet."
+        )
     adapter = InputAdapterGd.load_from_json(str(args.input.resolve()))
     voyages = resolve_voyages(adapter, args.voyages)
     planning_time = pd.Timestamp(

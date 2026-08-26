@@ -1,0 +1,58 @@
+{
+  "report_schema_version": 1,
+  "model_schema_version": "row_aware_bay_zone_v6",
+  "experiment_role": "single_seed_30s_primal_30s_rim_pipeline_diagnostic",
+  "solver_threads": 1,
+  "solver_seed": 0,
+  "budgets_seconds": {
+    "root": 60.0,
+    "compact_primal": 30.0,
+    "final_rim": 30.0
+  },
+  "rim_warm_start_repair": {
+    "mapping": "row_atom_signature_not_transient_zone_id",
+    "complete_auxiliary_state_start": true,
+    "all_cases_preserved_source_incumbent": true
+  },
+  "cases": [
+    {
+      "case_id": "scale_g024_s401",
+      "export_groups": 24,
+      "root_seconds": 5.411242417001631,
+      "root_lp_lower_bound": 0.042911849757157804,
+      "compact_primal_upper_bound": 0.07027656930101027,
+      "final_integer_upper_bound": 0.07027656930101027,
+      "rim_improvement_fraction": 0.0,
+      "absolute_root_gap": 0.027364719543852466,
+      "incumbent_relative_root_gap": 0.38938610430232085,
+      "rim_time_to_first_solution": 0.0014739036560058594,
+      "warm_start_objective_preserved": true
+    },
+    {
+      "case_id": "scale_g048_s601",
+      "export_groups": 48,
+      "root_seconds": 15.686062541994033,
+      "root_lp_lower_bound": 0.08315040406603073,
+      "compact_primal_upper_bound": 0.11590294092216141,
+      "final_integer_upper_bound": 0.11259109757860002,
+      "rim_improvement_fraction": 0.028574282215889397,
+      "absolute_root_gap": 0.029440693512569283,
+      "incumbent_relative_root_gap": 0.2614833156948016,
+      "rim_time_to_first_solution": 0.003309011459350586,
+      "warm_start_objective_preserved": true
+    },
+    {
+      "case_id": "scale_g096_s801",
+      "export_groups": 96,
+      "root_seconds": 41.4412677079963,
+      "root_lp_lower_bound": 0.10582753827961638,
+      "compact_primal_upper_bound": 0.21849124356481295,
+      "final_integer_upper_bound": 0.18633384310633844,
+      "rim_improvement_fraction": 0.1471793557206579,
+      "absolute_root_gap": 0.08050630482672205,
+      "incumbent_relative_root_gap": 0.4320541211656226,
+      "rim_time_to_first_solution": 0.006922006607055664,
+      "warm_start_objective_preserved": true
+    }
+  ]
+}

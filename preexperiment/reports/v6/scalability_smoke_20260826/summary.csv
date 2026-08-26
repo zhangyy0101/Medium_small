@@ -1,0 +1,6 @@
+case_id,export_groups,export_boxes,anonymous_import_boxes,row_atoms,peak_seconds,peak_status,root_seconds,root_status,coverage_seconds,coverage_status,rim_seconds,rim_status,rho_or_incumbent,root_lb,final_ub,absolute_root_gap,incumbent_relative_root_gap
+pilot_s_101,4,80,168,3460,0.989426,optimal,5.119691,closed,30.292672,timelimit,0.363861,optimal,0.0109375,-0.004853539,0.012023020,0.016876558,1.403687153
+pilot_m_201,16,360,332,13840,8.198756,optimal,31.739404,closed,30.608386,timelimit,0.888060,optimal,0.037383178,0.009444483,0.030950672,0.021506190,0.694853711
+pilot_l_301,24,640,498,18474,2.521498,optimal,49.951348,closed,30.790642,timelimit,2.496076,optimal,0.073717949,0.076903214,0.103076869,0.026173655,0.253923655
+scale_g048_s601,48,1280,499,36946,26.596499,optimal,60.238258,timelimit,,,,0.151685393,,,,
+scale_g096_s801,96,2560,497,73890,61.710593,timelimit,,,,,,0.352030948,,,,

@@ -1,4 +1,10 @@
-"""Contiguous-zone generation and objective-guided Fix-and-Optimize.
+"""Legacy V5 fixed-row-strip algorithm retained for reproducibility.
+
+This module does **not** implement the V6 row-aware bay-zone model.  In
+particular, its zone, objective, peak proxy, primal pool, and recourse belong
+to the frozen V5 experiment line.  V6 code must use ``row_aware_zones`` and
+``v6_model`` and may only port an algorithmic component after model-equivalence
+tests exist.
 
 The model represents concentration through dedicated contiguous zones. A hard
 export group reserves one or more contiguous runs of compatible physical

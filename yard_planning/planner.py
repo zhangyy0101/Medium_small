@@ -68,10 +68,8 @@ class ColumnGenerationConfig:
     solver_seed: int = 0
     solver_threads: int = 0
     verbose: bool = True
-    # Business-policy weights. Every component is first mapped to a natural
-    # dimensionless scale. The baseline is calibrated against realized
-    # component contributions and reachable-anchor coverage, while retaining
-    # the declared policy hierarchy.
+    # Legacy V5 row-location objective weights.  These are intentionally not
+    # the V6 three-category objective; new V6 solvers consume V6ObjectiveConfig.
     area_dispersion_weight: float = 0.290
     row_dispersion_weight: float = 0.240
     existing_group_proximity_weight: float = 0.070
@@ -89,7 +87,11 @@ class ColumnGenerationResult:
 
 
 class YardPlanningBase:
-    """Shared model layer for the paper algorithm and the M0 baseline."""
+    """Shared legacy V5 row-location layer and V6 input primitives.
+
+    This class is not the V6 zone formulation.  New V6 solvers must use the
+    contract and evaluator in :mod:`yard_planning.v6_model`.
+    """
 
     def __init__(self, problem: ProblemData, config: ColumnGenerationConfig | None = None) -> None:
         self.problem = problem

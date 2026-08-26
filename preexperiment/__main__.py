@@ -12,6 +12,14 @@ ROOT = Path(__file__).resolve().parent.parent
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate and validate deterministic preliminary experiment cases.")
+    parser.add_argument(
+        "--allow-legacy-v5-model",
+        action="store_true",
+        help=(
+            "Allow a positive --paper-time-limit to run the frozen V5 model. "
+            "Generated input-only cases do not require this flag."
+        ),
+    )
     parser.add_argument("--suite", type=Path, default=ROOT / "preexperiment" / "pilot_suite.json")
     parser.add_argument("--output-root", type=Path, default=ROOT / "preexperiment_outputs" / "pilot_v1")
     parser.add_argument("--cases", nargs="+", default=None)
@@ -58,6 +66,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.paper_time_limit > 0.0 and not args.allow_legacy_v5_model:
+        raise SystemExit(
+            "The preexperiment paper runner is still V5. Pass "
+            "--allow-legacy-v5-model only for historical reproduction; "
+            "do not treat its UB/LB/gap as V6 results."
+        )
     summary = run_suite(
         args.suite,
         args.output_root,

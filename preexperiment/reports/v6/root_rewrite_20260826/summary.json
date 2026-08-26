@@ -1,0 +1,65 @@
+{
+  "report_schema_version": 1,
+  "model_schema_version": "row_aware_bay_zone_v6",
+  "experiment_role": "single_seed_exact_root_rewrite_scalability_not_ub_experiment",
+  "solver_threads": 1,
+  "solver_seed": 0,
+  "root_time_limit_seconds": 60.0,
+  "configuration": {
+    "phase_one_columns_per_group": 512,
+    "business_columns_per_group": 512,
+    "maximum_patterns_per_interval": 8,
+    "pricing_method": "exact_k_best_bay_knapsack_and_contiguous_interval_dp",
+    "pricing_mip_count": 0,
+    "feasible_witness_seeded": true
+  },
+  "comparable_pilot_l_301": {
+    "old_root_seconds": 50.57354949999717,
+    "new_root_seconds": 6.972701000020606,
+    "old_business_iterations": 64,
+    "new_business_iterations": 13,
+    "old_root_lp_lower_bound": 0.07691384507862174,
+    "new_root_lp_lower_bound": 0.07691384507862174
+  },
+  "cases": [
+    {
+      "case_id": "scale_g024_s401",
+      "export_groups": 24,
+      "row_atoms": 18474,
+      "phase_one_iterations": 0,
+      "business_iterations": 10,
+      "generated_zones": 9961,
+      "root_seconds": 5.476802124991082,
+      "pricing_seconds": 4.254863165988354,
+      "master_seconds": 0.3557838330161758,
+      "root_lp_lower_bound": 0.042911849757157804,
+      "closed_by_exact_pricing": true
+    },
+    {
+      "case_id": "scale_g048_s601",
+      "export_groups": 48,
+      "row_atoms": 36946,
+      "phase_one_iterations": 0,
+      "business_iterations": 14,
+      "generated_zones": 25653,
+      "root_seconds": 15.951241666974965,
+      "pricing_seconds": 12.76377650842187,
+      "master_seconds": 1.1335988340142649,
+      "root_lp_lower_bound": 0.08315040406603073,
+      "closed_by_exact_pricing": true
+    },
+    {
+      "case_id": "scale_g096_s801",
+      "export_groups": 96,
+      "row_atoms": 73890,
+      "phase_one_iterations": 0,
+      "business_iterations": 17,
+      "generated_zones": 61323,
+      "root_seconds": 41.84850908300723,
+      "pricing_seconds": 32.15368061585468,
+      "master_seconds": 4.566890750982566,
+      "root_lp_lower_bound": 0.10582753827961638,
+      "closed_by_exact_pricing": true
+    }
+  ]
+}

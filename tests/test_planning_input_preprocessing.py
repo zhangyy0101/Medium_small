@@ -14,7 +14,7 @@ from adapters.planning_input import (
     existing_operational_group_loads,
     normalize_code,
 )
-from yard_planning.models import AttributeRules
+from yard_planning.models import AttributeRules, EXISTING_EXPORT_GROUP_SCOPE
 
 
 class PlanningInputPreprocessingTests(unittest.TestCase):
@@ -102,6 +102,18 @@ class PlanningInputPreprocessingTests(unittest.TestCase):
             self.assertEqual({"40"}, attrs[key]["sizes"])
             self.assertEqual({"96"}, attrs[key]["heights"])
             self.assertEqual({"P1"}, attrs[key]["ports_by_row"]["01"])
+            self.assertEqual(
+                {
+                    (
+                        EXISTING_EXPORT_GROUP_SCOPE,
+                        "V1",
+                        "40",
+                        "96",
+                        "P1",
+                    )
+                },
+                attrs[key]["group_keys_by_row"]["01"],
+            )
 
     def test_operational_group_anchor_scan_deduplicates_container_slots(self) -> None:
         adapter = InputAdapterGd()

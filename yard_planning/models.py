@@ -15,6 +15,10 @@ DEFAULT_GROUP_ATTRIBUTES = EXPORT_GROUP_IDENTITY_ATTRIBUTES
 DEFAULT_BAY_NO_MIX_ATTRIBUTES = ("IYC_CHEIGHTCD",)
 DEFAULT_ROW_NO_MIX_ATTRIBUTES = ("IYC_POT_UNLDPORT",)
 EXPORT_VOYAGE_ROW_NO_MIX_ATTR = "__EXPORT_VOYAGE_ID"
+EXISTING_EXPORT_GROUP_SCOPE = "E"
+EXISTING_IMPORT_GROUP_SCOPE = "I"
+EXISTING_UNKNOWN_GROUP_SCOPE = "U"
+ExistingRowGroupKey = tuple[str, str, str, str, str]
 
 
 @dataclass(frozen=True)
@@ -77,6 +81,12 @@ class Bay:
     existing_attrs_by_row: dict[str, dict[str, set[str]]] = field(default_factory=dict)
     existing_attrs_by_voyage: dict[str, dict[str, set[str]]] = field(default_factory=dict)
     existing_attrs_by_row_by_voyage: dict[str, dict[str, dict[str, set[str]]]] = field(default_factory=dict)
+    # Exact historical row groups.  The leading scope distinguishes export
+    # groups from import/unknown states so a new export group cannot
+    # accidentally match a non-export container with the same voyage code.
+    existing_group_keys_by_row: dict[str, set[ExistingRowGroupKey]] = field(
+        default_factory=dict
+    )
 
 
 @dataclass(frozen=True)
@@ -101,6 +111,18 @@ class ExportGroup:
     height: str
     demand: int
     attributes: dict[str, str] = field(default_factory=dict)
+
+
+def existing_export_group_key(group: ExportGroup) -> ExistingRowGroupKey:
+    """Return the exact historical-row key matched by one new export group."""
+
+    return (
+        EXISTING_EXPORT_GROUP_SCOPE,
+        str(group.voyage_id),
+        str(group.size),
+        str(group.height),
+        str(group.port),
+    )
 
 
 @dataclass(frozen=True)

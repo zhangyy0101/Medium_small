@@ -11,6 +11,7 @@ from .models import (
     EXPORT_VOYAGE_ROW_NO_MIX_ATTR,
     ExportGroup,
     ProblemData,
+    existing_export_group_key,
 )
 
 
@@ -268,7 +269,10 @@ def validate_output_files(
         assigned[group_id] += qty
         for key in footprint:
             footprint_bay = problem.bays[key]
-            if footprint_bay.existing_size_modes and size not in footprint_bay.existing_size_modes:
+            if (
+                footprint_bay.existing_size_modes
+                and footprint_bay.existing_size_modes != {size}
+            ):
                 errors.append(
                     f"incumbent size conflict: {key}, existing={sorted(footprint_bay.existing_size_modes)}, new={size}"
                 )
@@ -277,21 +281,31 @@ def validate_output_files(
                     f"incumbent height conflict: {key}, existing={sorted(footprint_bay.existing_heights)}, new={height}"
                 )
             existing_ports = footprint_bay.existing_ports_by_row.get(row_no, set())
-            if existing_ports and port not in existing_ports:
-                errors.append(
-                    f"incumbent row-port conflict: {key}, row={row_no}, "
-                    f"existing={sorted(existing_ports)}, new={port}"
-                )
             existing_voyages = (
                 footprint_bay.existing_attrs_by_row.get(row_no, {}).get(
                     EXPORT_VOYAGE_ROW_NO_MIX_ATTR, set()
                 )
             )
-            if existing_voyages and existing_voyages != {voyage}:
-                errors.append(
-                    f"incumbent row-voyage conflict: {key}, row={row_no}, "
-                    f"existing={sorted(existing_voyages)}, new={voyage}"
-                )
+            exact_groups = footprint_bay.existing_group_keys_by_row.get(
+                row_no, set()
+            )
+            if exact_groups:
+                if existing_export_group_key(group) not in exact_groups:
+                    errors.append(
+                        f"incumbent adds row group: {key}, row={row_no}, "
+                        f"new={existing_export_group_key(group)}"
+                    )
+            else:
+                if existing_ports and port not in existing_ports:
+                    errors.append(
+                        f"incumbent row-port conflict: {key}, row={row_no}, "
+                        f"existing={sorted(existing_ports)}, new={port}"
+                    )
+                if existing_voyages and voyage not in existing_voyages:
+                    errors.append(
+                        f"incumbent row-voyage conflict: {key}, row={row_no}, "
+                        f"existing={sorted(existing_voyages)}, new={voyage}"
+                    )
             bay_load[key] += qty
             export_used_bays.add(key)
             row_load[(key, row_no)] += qty
@@ -310,7 +324,11 @@ def validate_output_files(
                     attribute,
                     str(group.voyage_id),
                 )
-                if existing_values and existing_values != {value}:
+                if existing_values and (
+                    value not in existing_values
+                    if str(attribute).strip().upper() in HEIGHT_ATTRIBUTES
+                    else existing_values != {value}
+                ):
                     errors.append(
                         f"incumbent bay-attribute conflict: bay={key}, "
                         f"attribute={attribute}, existing={sorted(existing_values)}, new={value}"
@@ -325,10 +343,7 @@ def validate_output_files(
                     attribute,
                     str(group.voyage_id),
                 )
-                if attribute == EXPORT_VOYAGE_ROW_NO_MIX_ATTR:
-                    compatible = not existing_values or existing_values == {value}
-                else:
-                    compatible = not existing_values or value in existing_values
+                compatible = not existing_values or value in existing_values
                 if not compatible:
                     errors.append(
                         f"incumbent row-attribute conflict: bay={key}, row={row_no}, "

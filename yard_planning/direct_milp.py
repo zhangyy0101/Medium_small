@@ -1,4 +1,9 @@
-"""Complete compact M0 MILP used as an exact algorithmic baseline."""
+"""Legacy V5 row-location M0 retained as a structural reference.
+
+Its row-level concentration objective is not the V6 zone objective, so this
+class must not be reported as the complete V6 MIP baseline.  The latter will
+be implemented on the shared contract in :mod:`yard_planning.v6_model`.
+"""
 
 from __future__ import annotations
 
@@ -15,7 +20,7 @@ from .planner import (
 
 
 class DirectMilpPlanner(YardPlanningBase):
-    """M0 baseline: solve the complete row-location formulation directly."""
+    """Legacy M0: solve the frozen V5 row-location formulation directly."""
 
     def solve(self) -> ColumnGenerationResult:
         self._prepare_master_index_sets()

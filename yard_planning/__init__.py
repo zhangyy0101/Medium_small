@@ -1,1 +1,1 @@
-"""TRE-oriented export yard-planning model and Gurobi solver."""
+"""V6 exact root CG, compact primal coverage, and frozen V5 references."""

@@ -1,0 +1,4 @@
+case_id,export_groups,row_atoms,old_exact_peak_seconds,old_exact_peak_proven,new_peak_preparation_seconds,analytic_lower_bound,epsilon_cap,witness_peak,root_seconds,root_closed,root_phase,root_iterations,root_zones,final_ub
+pilot_l_301,24,18474,2.521498,true,0.757974,0.07061503516856378,0.5353075175842819,0.3605769230769231,50.573550,true,business,68,1497,0.10326315627538281
+scale_g048_s601,48,36946,26.5965,true,1.874571,0.14062500099999845,0.5703125004999993,0.5697115384615384,60.233392,false,business,28,1680,
+scale_g096_s801,96,73890,61.71,false,3.837951,0.28042328142327516,0.6402116407116376,0.6394230769230769,60.449046,false,phase_one,18,1728,

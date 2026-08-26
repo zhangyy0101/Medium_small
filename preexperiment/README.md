@@ -1,5 +1,44 @@
 # 预实验数据生成与校验
 
+> V6 边界：默认 `python -m preexperiment` 仍是输入校验/冻结 V5 runner；
+> V6 使用独立的 `benchmark_v6_scalability.py`，不会调用 V5 planner。
+> 当前模型契约为 V6.1；下列 2026-08-26 报告由旧 V6.0 历史状态兼容规则生成，
+> 只可用于实现追溯，必须在 V6.1 上复跑后才能作为当前 LB/UB/gap 证据。
+> V6 已把生产峰值流程改为解析 cap＋compact feasibility witness；旧的
+> exact-`rho*` smoke 只保留为诊断。24/48/96 单种子复测已经确认 peak
+> 准备不再是瓶颈；根节点重写后 24/48/96 的 exact root closure gate 均已
+> 在 60 秒内通过。下一 gate 是恢复合理的 primal/RIM 预算并验证 UB 与 gap。
+
+## V6 分阶段 scalability runner
+
+下列命令依次运行解析 cap 与可行性认证、exact root CG、compact primal coverage
+和 final RIM，并在每个阶段后写入 checkpoint。任何必需证明超时都会立即
+停止，不会继续产生口径不合法的 LB/UB：
+
+```bash
+python benchmark_v6_scalability.py \
+  --suite preexperiment/scale_suite.json \
+  --cases scale_g048_s601 \
+  --output-root preexperiment_outputs/v6_scalability_g048 \
+  --peak-feasibility-time-limit 10 \
+  --root-total-time-limit 60 \
+  --pricing-time-limit 10 \
+  --coverage-time-limit 30 \
+  --integer-time-limit 30 \
+  --solver-threads 1 \
+  --solver-seed 0
+```
+
+结果包含 feasibility/compact MIP 与 final RIM 的 incumbent/bound trajectory、root CG
+逐轮 reduced cost、列池规模、LB/UB 和三类目标实际贡献。旧体检见
+`preexperiment/reports/v6/scalability_smoke_20260826/`，根节点重写结果见
+`preexperiment/reports/v6/root_rewrite_20260826/`，恢复 30 秒 primal/RIM 预算及
+RIM warm-start 修复结果见
+`preexperiment/reports/v6/full_pipeline_30s_20260826/`。
+
+只测 exact root 时增加 `--root-only`；runner 会在根闭合后把算例标记为成功，
+不再用极短的 primal/RIM 预算制造无关的全流程失败状态。
+
 这里保存的是可复现的“场景配方”，而不是重复六份约 178 MB 的堆场快照。每个场景由经过 SHA-256 固定的基础输入、参数和随机种子唯一确定；运行时只物化一个 `InputAdapterGd` 对象并直接交给集成论文模型，不再生成或读取大计划 CSV。
 
 ## Pilot v1

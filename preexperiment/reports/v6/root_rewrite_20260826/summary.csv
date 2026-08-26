@@ -1,0 +1,4 @@
+case_id,export_groups,row_atoms,phase_one_iterations,business_iterations,generated_zones,root_seconds,pricing_seconds,master_seconds,root_lp_lower_bound,closed_by_exact_pricing
+scale_g024_s401,24,18474,0,10,9961,5.476802125,4.254863166,0.355783833,0.042911849757157804,true
+scale_g048_s601,48,36946,0,14,25653,15.951241667,12.763776508,1.133598834,0.08315040406603073,true
+scale_g096_s801,96,73890,0,17,61323,41.848509083,32.153680616,4.566890751,0.10582753827961638,true

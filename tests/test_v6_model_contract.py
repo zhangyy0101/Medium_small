@@ -3,15 +3,33 @@ from __future__ import annotations
 import importlib.util
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from yard_planning.direct_milp import DirectMilpPlanner
-from yard_planning.models import AttributeRules, Bay, ExportGroup, ProblemData
+from yard_planning.models import (
+    AttributeRules,
+    Bay,
+    ExportGroup,
+    ProblemData,
+    existing_export_group_key,
+)
 from yard_planning.planner import ColumnGenerationConfig, PlacementColumn
 from yard_planning.output_validator import validate_output_files
 from yard_planning.planner import write_rows
 from yard_planning.row_aware_zones import (
+    RowAwareZone,
     build_complete_row_aware_zone_universe,
+    build_complete_v6_zone_universe,
+    build_v6_row_aware_bay_atoms,
+)
+from yard_planning.v6_model import (
+    V6ModelEvaluator,
+    V6ObjectiveConfig,
+    V6PeakUtilizationPolicy,
+    derive_v6_analytic_peak_policy,
+    v6_export_group_key,
+    v6_model_contract,
 )
 
 
@@ -152,6 +170,389 @@ class V6ModelContractTests(unittest.TestCase):
         )
         self.assertTrue(all(zone.capacity <= 4 for zone in zones))
 
+    def test_self_contained_v6_zone_universe_uses_problem_rows_directly(self) -> None:
+        problem = make_problem(
+            [make_group("G1", port="P1", demand=2)],
+            [make_bay("01"), make_bay("03")],
+        )
+
+        zones = build_complete_v6_zone_universe(problem)
+
+        self.assertTrue(
+            any(
+                dict(zone.rows_by_anchor_bay)
+                == {"A|01": ("1",), "A|03": ("2",)}
+                for zone in zones
+            )
+        )
+
+    def test_v6_zone_universe_has_no_unproved_demand_plus_atom_cap(self) -> None:
+        locations = [
+            make_location(0, "01", "1"),
+            make_location(1, "01", "2"),
+            make_location(2, "03", "1"),
+            make_location(3, "03", "2"),
+        ]
+        zones = build_complete_row_aware_zone_universe(
+            locations,
+            {index: 2 for index in range(len(locations))},
+            {"A|01": 1, "A|03": 3},
+            {"G1": 1},
+        )
+
+        largest = max(zones, key=lambda zone: zone.capacity)
+        self.assertEqual(8, largest.capacity)
+        self.assertEqual(
+            (("A|01", 4), ("A|03", 4)),
+            largest.anchor_bay_capacities,
+        )
+
+    def test_v6_objective_has_three_categories_and_expected_primitives(self) -> None:
+        config = V6ObjectiveConfig()
+        config.validate()
+
+        self.assertEqual(
+            {
+                "spatial_concentration",
+                "berth_transport",
+                "reserved_capacity_efficiency",
+            },
+            set(config.category_weights()),
+        )
+        expected = {
+            "zone_dispersion": 0.35,
+            "voyage_area_dispersion": 0.15,
+            "existing_group_proximity": 0.125,
+            "berth_distance": 0.1625,
+            "unused_capacity": 0.2125,
+        }
+        actual = config.primitive_weights()
+        self.assertEqual(set(expected), set(actual))
+        for key, value in expected.items():
+            self.assertAlmostEqual(value, actual[key])
+
+    def test_v6_contract_excludes_all_known_old_model_terms(self) -> None:
+        contract = v6_model_contract()
+        forbidden = set(contract["forbidden_inputs_or_terms"])
+
+        self.assertIn("fixed_row_strip_zone", forbidden)
+        self.assertIn("demand_plus_one_atom_zone_capacity_cap", forbidden)
+        self.assertIn("row_dispersion_objective", forbidden)
+        self.assertIn("upstream_large_plan_area_target", forbidden)
+        self.assertNotIn("shortage_variable", contract["decision_families"])
+
+    def test_v6_evaluator_independently_rejects_noncontiguous_zone(self) -> None:
+        group = make_group("G1", port="P1", demand=2)
+        bays = [
+            make_bay("01", rows=("1",), row_capacity=1),
+            make_bay("05", rows=("1",), row_capacity=1),
+        ]
+        forged = RowAwareZone(
+            zone_id=0,
+            group_id="G1",
+            area_no="A",
+            anchor_bay_keys=("A|01", "A|05"),
+            anchor_bay_capacities=(("A|01", 1), ("A|05", 1)),
+            candidate_indices=(0, 1),
+            rows_by_anchor_bay=(("A|01", ("1",)), ("A|05", ("1",))),
+            capacity=2,
+            resources=(("A|01", "1"), ("A|05", "1")),
+            physical_bay_keys=("A|01", "A|05"),
+        )
+
+        with self.assertRaisesRegex(ValueError, "not contiguous"):
+            V6ModelEvaluator(make_problem([group], bays), [forged])
+
+    def test_v6_selected_zone_cannot_use_an_empty_bridge_bay(self) -> None:
+        group = make_group("G1", port="P1", demand=1)
+        bays = [
+            make_bay("01", rows=("1",)),
+            make_bay("03", rows=("1",)),
+        ]
+        zones = build_complete_row_aware_zone_universe(
+            [make_location(0, "01", "1"), make_location(1, "03", "1")],
+            {0: 1, 1: 1},
+            {"A|01": 1, "A|03": 3},
+            {"G1": 1},
+        )
+        combined = next(zone for zone in zones if len(zone.anchor_bay_keys) == 2)
+        evaluator = V6ModelEvaluator(make_problem([group], bays), zones)
+
+        with self.assertRaisesRegex(ValueError, "positive flow in every bay"):
+            evaluator.evaluate(
+                {combined.zone_id},
+                {(combined.zone_id, "A|01"): 1},
+                {},
+                V6PeakUtilizationPolicy(0.5, 0.5),
+            )
+
+    def test_v6_rejects_upstream_large_plan_targets(self) -> None:
+        problem = make_problem([], [make_bay("01")])
+        problem.area_guidance_target = {("V1", "OF", "A", "20"): 1}
+
+        with self.assertRaisesRegex(ValueError, "large-plan"):
+            V6ModelEvaluator(problem, [])
+
+    def test_v6_large_box_zone_uses_complete_footprints_and_can_change_rows(self) -> None:
+        group = ExportGroup(
+            group_id="G1",
+            voyage_id="V1",
+            status="OF",
+            port="P1",
+            size="40",
+            height="96",
+            demand=2,
+        )
+        bays = [
+            make_bay(code, rows=("1", "2"))
+            for code in ("01", "03", "05", "07")
+        ]
+        for bay in bays:
+            bay.cap_by_size = {"40": 2}
+            bay.row_cap_by_size = {"40": {"1": 1, "2": 1}}
+        bays[0].large_bay_partner_key = bays[1].bay_key
+        bays[2].large_bay_partner_key = bays[3].bay_key
+
+        def large_location(
+            index: int,
+            anchor: Bay,
+            partner: Bay,
+            row_no: str,
+        ) -> PlacementColumn:
+            return PlacementColumn(
+                column_id=f"L{index}",
+                group_id="G1",
+                voyage_id="V1",
+                flow="OF",
+                port="P1",
+                size="40",
+                big_plan_size="40",
+                height="96",
+                attributes={},
+                area_no="A",
+                bay_key=anchor.bay_key,
+                bay_no=anchor.bay_no,
+                quantity=1,
+                stack_units=1,
+                row_allocation=(
+                    (anchor.bay_key, row_no, 1),
+                    (partner.bay_key, row_no, 1),
+                ),
+                quota_key=("V1", "OF", "A", "40"),
+                group_key=("V1", "40", "96", "P1"),
+                intrinsic_cost=0.0,
+            )
+
+        locations = [
+            large_location(0, bays[0], bays[1], "1"),
+            large_location(1, bays[2], bays[3], "2"),
+        ]
+        zones = build_complete_row_aware_zone_universe(
+            locations,
+            {0: 1, 1: 1},
+            {bay.bay_key: bay.bay_order for bay in bays},
+            {"G1": 2},
+        )
+        combined = next(
+            zone for zone in zones if zone.candidate_indices == (0, 1)
+        )
+        evaluator = V6ModelEvaluator(make_problem([group], bays), zones)
+
+        certificate = evaluator.evaluate(
+            {combined.zone_id},
+            {
+                (combined.zone_id, bays[0].bay_key): 1,
+                (combined.zone_id, bays[2].bay_key): 1,
+            },
+            {},
+            V6PeakUtilizationPolicy(1.0, 0.5),
+        )
+
+        self.assertEqual(
+            {bay.bay_key for bay in bays},
+            set(combined.physical_bay_keys),
+        )
+        self.assertEqual(0.0, certificate["objective"])
+
+    def test_v6_45ft_atoms_only_use_edge_large_bays(self) -> None:
+        group = ExportGroup(
+            group_id="G1",
+            voyage_id="V1",
+            status="OF",
+            port="P1",
+            size="45",
+            height="96",
+            demand=1,
+        )
+        bays = [
+            make_bay(code, rows=("1",))
+            for code in ("01", "03", "05", "07", "09", "11")
+        ]
+        for bay in bays:
+            bay.cap_by_size = {"45": 1}
+            bay.row_cap_by_size = {"45": {"1": 1}}
+        for left, right in ((0, 1), (2, 3), (4, 5)):
+            bays[left].large_bay_partner_key = bays[right].bay_key
+
+        zones = build_complete_v6_zone_universe(make_problem([group], bays))
+
+        anchors = {
+            bay_key
+            for zone in zones
+            for bay_key in zone.anchor_bay_keys
+        }
+        self.assertEqual({"A|01", "A|09"}, anchors)
+
+    def test_v6_objective_scores_true_disconnected_bay_zones(self) -> None:
+        group = make_group("G1", port="P1", demand=2)
+        bays = [
+            make_bay("01", rows=("1",), row_capacity=1),
+            make_bay("05", rows=("1",), row_capacity=1),
+        ]
+        locations = [
+            make_location(0, "01", "1"),
+            make_location(1, "05", "1"),
+        ]
+        zones = build_complete_row_aware_zone_universe(
+            locations,
+            {0: 1, 1: 1},
+            {"A|01": 1, "A|05": 5},
+            {"G1": 2},
+        )
+        evaluator = V6ModelEvaluator(make_problem([group], bays), zones)
+        zone_by_bay = {
+            zone.anchor_bay_keys[0]: zone.zone_id for zone in zones
+        }
+        selected = set(zone_by_bay.values())
+        flow = {
+            (zone_by_bay["A|01"], "A|01"): 1,
+            (zone_by_bay["A|05"], "A|05"): 1,
+        }
+
+        certificate = evaluator.evaluate(
+            selected,
+            flow,
+            {},
+            V6PeakUtilizationPolicy(1.0, 0.5),
+        )
+
+        self.assertAlmostEqual(0.35, certificate["objective"])
+        self.assertEqual(1.0, certificate["raw"]["extra_contiguous_zones"])
+        self.assertEqual(0.0, certificate["raw"]["extra_voyage_areas"])
+        self.assertEqual(0.0, certificate["raw"]["unused_reserved_capacity_boxes"])
+        self.assertTrue(certificate["validation"]["passed"])
+
+    def test_v6_unused_capacity_uses_selected_row_resource_capacity(self) -> None:
+        group = make_group("G1", port="P1", demand=1)
+        bay = make_bay("01", rows=("1", "2"), row_capacity=1)
+        locations = [
+            make_location(0, "01", "1"),
+            make_location(1, "01", "2"),
+        ]
+        zones = build_complete_row_aware_zone_universe(
+            locations,
+            {0: 1, 1: 1},
+            {"A|01": 1},
+            {"G1": 1},
+        )
+        two_row_zone = next(
+            zone for zone in zones if zone.candidate_indices == (0, 1)
+        )
+        evaluator = V6ModelEvaluator(make_problem([group], [bay]), zones)
+
+        certificate = evaluator.evaluate(
+            {two_row_zone.zone_id},
+            {(two_row_zone.zone_id, "A|01"): 1},
+            {},
+            V6PeakUtilizationPolicy(0.5, 0.5),
+        )
+
+        self.assertEqual(1.0, certificate["raw"]["unused_reserved_capacity_boxes"])
+        self.assertAlmostEqual(0.2125, certificate["objective"])
+
+    def test_v6_reconstructs_area_anchor_and_berth_contributions(self) -> None:
+        group = make_group("G1", port="P1", demand=2)
+        bay_a = make_bay("01", rows=("1",))
+        bay_b = make_bay("01", rows=("1",))
+        bay_b.area_no = "B"
+        bay_b.bay_key = "B|01"
+        location_a = make_location(0, "01", "1")
+        location_b = replace(
+            make_location(1, "01", "1"),
+            area_no="B",
+            bay_key="B|01",
+            row_allocation=(("B|01", "1", 1),),
+        )
+        problem = ProblemData(
+            export_groups=[group],
+            bays={bay_a.bay_key: bay_a, bay_b.bay_key: bay_b},
+            area_functions={"A": {"OF"}, "B": {"OF"}},
+            target_voyages=["V1"],
+            export_voyages={"V1"},
+            existing_group_bay_load={
+                v6_export_group_key(group) + ("A", "A|01"): 1
+            },
+            berth_distances={("A", "Q1"): 1.0, ("B", "Q1"): 3.0},
+            berth_by_voyage={"V1": "Q1"},
+        )
+        zones = build_complete_row_aware_zone_universe(
+            [location_a, location_b],
+            {0: 1, 1: 1},
+            {"A|01": 1, "B|01": 1},
+            {"G1": 2},
+        )
+        zone_by_area = {zone.area_no: zone.zone_id for zone in zones}
+        evaluator = V6ModelEvaluator(problem, zones)
+
+        certificate = evaluator.evaluate(
+            set(zone_by_area.values()),
+            {
+                (zone_by_area["A"], "A|01"): 1,
+                (zone_by_area["B"], "B|01"): 1,
+            },
+            {},
+            V6PeakUtilizationPolicy(1.0, 0.5),
+        )
+
+        self.assertEqual(1.0, certificate["raw"]["extra_contiguous_zones"])
+        self.assertEqual(1.0, certificate["raw"]["extra_voyage_areas"])
+        self.assertEqual(
+            1.0,
+            certificate["raw"]["existing_group_normalized_distance_sum"],
+        )
+        self.assertEqual(1.0, certificate["raw"]["berth_normalized_distance_sum"])
+        self.assertAlmostEqual(0.64375, certificate["objective"])
+
+    def test_v6_peak_policy_marks_exact_minmax_reference(self) -> None:
+        policy = V6PeakUtilizationPolicy(
+            minimum_feasible_utilization=0.4,
+            headroom_fraction=0.5,
+        )
+
+        self.assertAlmostEqual(0.7, policy.epsilon_cap)
+        self.assertEqual(
+            "auxiliary_full_v6_minmax_mip",
+            policy.as_dict()["minimum_source"],
+        )
+        self.assertTrue(
+            policy.as_dict()["minimum_feasible_utilization_proven"]
+        )
+
+    def test_v6_analytic_peak_policy_is_not_mislabeled_rho_star(self) -> None:
+        problem = make_problem(
+            [make_group("G1", port="P1", demand=1)],
+            [make_bay("01")],
+        )
+
+        policy, diagnostics = derive_v6_analytic_peak_policy(problem)
+
+        self.assertEqual("analytic_workload_lower_bound", policy.reference_role)
+        self.assertFalse(
+            policy.as_dict()["minimum_feasible_utilization_proven"]
+        )
+        self.assertFalse(diagnostics["minmax_mip_solved"])
+        self.assertGreaterEqual(policy.epsilon_cap, 0.5)
+
     def test_bay_gap_breaks_zone_contiguity(self) -> None:
         locations = [
             make_location(0, "01", "1"),
@@ -176,6 +577,106 @@ class V6ModelContractTests(unittest.TestCase):
         )
 
         self.assertEqual([], planner.import_reservation_candidates[("IF", "20")])
+
+    def test_mixed_existing_heights_allow_only_an_existing_height(self) -> None:
+        height_96 = make_group("G96", port="P1")
+        height_86 = replace(height_96, group_id="G86", height="86")
+        new_height = replace(height_96, group_id="G106", height="106")
+        bay = make_bay("01", rows=("1",))
+        bay.existing_size_modes = {"20"}
+        bay.existing_heights = {"86", "96"}
+
+        atoms, _limits = build_v6_row_aware_bay_atoms(
+            make_problem([height_96, height_86, new_height], [bay])
+        )
+
+        self.assertEqual(
+            {"G86", "G96"},
+            {atom.group_id for atom in atoms},
+        )
+
+    def test_mixed_existing_row_allows_only_an_exact_existing_group(self) -> None:
+        first = make_group("G1", port="P1")
+        second = replace(
+            first,
+            group_id="G2",
+            voyage_id="V2",
+            port="P2",
+        )
+        nonexistent_cross = replace(
+            first,
+            group_id="G3",
+            port="P2",
+        )
+        bay = make_bay("01", rows=("1",))
+        bay.existing_size_modes = {"20"}
+        bay.existing_heights = {"96"}
+        bay.existing_group_keys_by_row = {
+            "1": {
+                existing_export_group_key(first),
+                existing_export_group_key(second),
+            }
+        }
+
+        atoms, _limits = build_v6_row_aware_bay_atoms(
+            make_problem([first, second, nonexistent_cross], [bay])
+        )
+
+        self.assertEqual(
+            {"G1", "G2"},
+            {atom.group_id for atom in atoms},
+        )
+
+    def test_existing_mixed_size_state_remains_strictly_closed(self) -> None:
+        group = make_group("G1", port="P1")
+        bay = make_bay("01", rows=("1",))
+        bay.existing_size_modes = {"20", "40"}
+        bay.existing_heights = {"96"}
+        bay.existing_group_keys_by_row = {
+            "1": {existing_export_group_key(group)}
+        }
+
+        atoms, _limits = build_v6_row_aware_bay_atoms(
+            make_problem([group], [bay])
+        )
+
+        self.assertEqual((), atoms)
+
+    def test_new_boxes_still_cannot_mix_heights_in_one_bay(self) -> None:
+        first = make_group("G1", port="P1")
+        second = replace(
+            first,
+            group_id="G2",
+            port="P2",
+            height="86",
+        )
+        bay = make_bay("01", rows=("1", "2"))
+        bay.existing_size_modes = {"20"}
+        bay.existing_heights = {"86", "96"}
+        problem = make_problem([first, second], [bay])
+        zones = build_complete_v6_zone_universe(problem)
+        first_zone = next(
+            zone
+            for zone in zones
+            if zone.group_id == "G1" and zone.resources == (("A|01", "1"),)
+        )
+        second_zone = next(
+            zone
+            for zone in zones
+            if zone.group_id == "G2" and zone.resources == (("A|01", "2"),)
+        )
+        evaluator = V6ModelEvaluator(problem, zones)
+
+        with self.assertRaisesRegex(ValueError, "size/height mixing"):
+            evaluator.evaluate(
+                {first_zone.zone_id, second_zone.zone_id},
+                {
+                    (first_zone.zone_id, "A|01"): 1,
+                    (second_zone.zone_id, "A|01"): 1,
+                },
+                {},
+                V6PeakUtilizationPolicy(0.5, 0.5),
+            )
 
     def test_large_import_checks_every_footprint_bay_size_state(self) -> None:
         anchor = make_bay("02", rows=("1",), row_capacity=1)
